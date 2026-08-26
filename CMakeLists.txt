@@ -1,19 +1,19 @@
 cmake_minimum_required(VERSION 3.24)
 
-set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
-
 project(
     LBCube
     VERSION 0.1.0
     DESCRIPTION "C++23/CUDA Lattice Boltzmann Method solver"
-    LANGUAGES CXX CUDA
+    LANGUAGES CXX
 )
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(CUDAToolkit REQUIRED)
+option(LB_CUBE_ENABLE_CUDA "Build the CUDA backend" ON)
+set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
+
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(GTest REQUIRED)
 
@@ -38,36 +38,41 @@ target_link_libraries(
         Eigen3::Eigen
 )
 
-add_library(lbm_cuda STATIC src/lattice_cuda.cu)
-add_library(lbm::cuda ALIAS lbm_cuda)
+if(LB_CUBE_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
 
-target_link_libraries(
-    lbm_cuda
-    PUBLIC
-        lbm::core
-        CUDA::cudart
-)
+    add_library(lbm_cuda STATIC src/lattice_cuda.cu)
+    add_library(lbm::cuda ALIAS lbm_cuda)
 
-target_compile_features(
-    lbm_cuda
-    PUBLIC
-        cxx_std_23
-)
+    target_link_libraries(
+        lbm_cuda
+        PUBLIC
+            lbm::core
+            CUDA::cudart
+    )
 
-set_target_properties(
-    lbm_cuda
-    PROPERTIES
-        CXX_STANDARD 23
-        CXX_STANDARD_REQUIRED YES
-        CXX_EXTENSIONS NO
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED YES
-        CUDA_EXTENSIONS NO
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-        CUDA_ARCHITECTURES native
-        POSITION_INDEPENDENT_CODE ON
-)
+    target_compile_features(
+        lbm_cuda
+        PUBLIC
+            cxx_std_23
+    )
+
+    set_target_properties(
+        lbm_cuda
+        PROPERTIES
+            CXX_STANDARD 23
+            CXX_STANDARD_REQUIRED YES
+            CXX_EXTENSIONS NO
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED YES
+            CUDA_EXTENSIONS NO
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+            CUDA_ARCHITECTURES native
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 add_executable(lbm_sim src/main.cpp)
 
@@ -75,8 +80,14 @@ target_link_libraries(
     lbm_sim
     PRIVATE
         lbm::core
-        lbm::cuda
 )
+
+if(LB_CUBE_ENABLE_CUDA)
+    target_link_libraries(lbm_sim PRIVATE lbm::cuda)
+    target_compile_definitions(lbm_sim PRIVATE LB_CUBE_ENABLE_CUDA=1)
+else()
+    target_compile_definitions(lbm_sim PRIVATE LB_CUBE_ENABLE_CUDA=0)
+endif()
 
 target_compile_features(
     lbm_sim

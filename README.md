@@ -23,12 +23,12 @@ Recommended toolchain:
 
 - CMake 3.24 or newer.
 - C++23-compatible host compiler, such as GCC 13+ or a recent Clang.
-- CUDA Toolkit 12.2 or newer.
+- CUDA Toolkit 12.2 or newer for GPU builds.
 - CUDA-capable NVIDIA GPU for GPU execution.
 - Eigen3.
 - GoogleTest for validation tests.
 
-The project uses CMake targets for Eigen, GoogleTest, and the CUDA runtime. On HPC systems, these dependencies are typically provided through environment modules.
+The project uses CMake targets for Eigen, GoogleTest, and, when enabled, the CUDA runtime. On HPC systems, these dependencies are typically provided through environment modules.
 
 ## Compilation & Installation
 
@@ -41,6 +41,28 @@ cd LB-Cube
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+### CPU-Only Build Without `nvcc`
+
+If the machine does not provide the NVIDIA CUDA compiler (`nvcc`) or CUDA Toolkit, disable the CUDA backend at configure time:
+
+```bash
+cmake -S . -B build-cpu \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLB_CUBE_ENABLE_CUDA=OFF
+
+cmake --build build-cpu -j
+```
+
+This builds the CPU executable and validation tests without including `cuda_runtime.h`, compiling `.cu` files, or requiring `nvcc`.
+
+Run the CPU-only executable with `-cpu`:
+
+```bash
+./build-cpu/lbm_sim -nx 64 -ny 64 -nz 64 -steps 1000 -out_freq 100 -cpu
+```
+
+In a CPU-only build, the `-gpu` runtime option is unavailable and will report an error.
 
 Run the validation tests:
 
@@ -75,6 +97,7 @@ Command-line options:
 - `-nz <N>`: number of grid points in the z direction. Default: `64`.
 - `-steps <N>`: total number of time steps. Default: `1000`.
 - `-out_freq <N>`: output frequency in time steps. Default: `100`.
+- `-init <name>`: initial condition. Options are `tgv` and `rest`. Default: `tgv`.
 - `-cpu`: use the CPU backend.
 - `-gpu`: use the CUDA backend. This is the default.
 
@@ -89,6 +112,8 @@ Example CPU run:
 ```bash
 ./build/lbm_sim -nx 64 -ny 64 -nz 64 -steps 1000 -out_freq 100 -cpu
 ```
+
+The default `tgv` initial condition is a small-amplitude Taylor-Green-style vortex, so the diagnostic kinetic energy and velocity field are non-zero. Use `-init rest` only for a uniform equilibrium sanity check; in that case `total_kinetic_energy` and `max_velocity_magnitude` will remain zero and ParaView will show a uniform field.
 
 At startup, the executable prints the grid size, selected backend, relaxation parameter, and requested number of steps. At shutdown, it reports elapsed wall time and throughput in MLUPS, meaning million lattice updates per second.
 
@@ -138,7 +163,7 @@ Adjust resource requests, module names, and CUDA architecture settings to match 
 LB-Cube writes two primary output types:
 
 - `diagnostics.csv`: integral quantities over time, including total mass, total kinetic energy, and maximum velocity magnitude.
-- `lbm_XXXXXX.vtk`: legacy ASCII VTK files containing density and velocity fields.
+- `lbm_XXXXXX.vtk`: legacy ASCII VTK files containing density, velocity magnitude, and velocity vector fields.
 
 The VTK files use the `STRUCTURED_POINTS` dataset format and can be opened directly in ParaView:
 
@@ -147,6 +172,8 @@ paraview lbm_000000.vtk
 ```
 
 For time-series visualization, open the generated `lbm_*.vtk` sequence in ParaView and enable file-series loading.
+
+If the field appears blank, check which array ParaView is coloring by. Uniform rest-state density has no visible contrast. For vortex runs, color by `velocity_magnitude` or add glyphs/streamlines using the `velocity` vector field.
 
 ## Repository Structure
 

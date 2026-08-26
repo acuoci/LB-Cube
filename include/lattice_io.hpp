@@ -153,6 +153,20 @@ inline void write_vtk(
         }
     }
 
+    vtk << "SCALARS velocity_magnitude double 1\n";
+    vtk << "LOOKUP_TABLE default\n";
+    for (std::size_t z = 0; z < z_extent; ++z) {
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                const MacroState<Lattice, Real> macro =
+                    detail::macro_at<Lattice, Real>(view, x, y, z);
+                vtk << std::format(
+                    "{:.17g}\n",
+                    static_cast<double>(std::sqrt(macro.velocity.squaredNorm())));
+            }
+        }
+    }
+
     vtk << "VECTORS velocity double\n";
     for (std::size_t z = 0; z < z_extent; ++z) {
         for (std::size_t y = 0; y < y_extent; ++y) {
