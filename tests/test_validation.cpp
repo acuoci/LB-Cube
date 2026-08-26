@@ -1,3 +1,12 @@
+/**
+ * @file test_validation.cpp
+ * @brief GoogleTest validation suite for mass conservation and vortex decay.
+ *
+ * These tests exercise the host-side LBM loop using equilibrium initialization,
+ * periodic boundaries, and macroscopic reconstruction from populations. The goal
+ * is to validate numerical invariants before comparing CPU and CUDA backends.
+ */
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -15,6 +24,17 @@
 
 namespace {
 
+/**
+ * @brief Initialize one cell with equilibrium populations.
+ *
+ * @tparam Lattice Lattice traits type satisfying `lbm::IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param view Mutable population view for the current buffer.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @param z Cell z coordinate, ignored for 2D lattices.
+ * @param macro Density and velocity used to evaluate the equilibrium.
+ */
 template <lbm::IsLatticeModel Lattice, std::floating_point Real>
 void initialize_equilibrium_cell(
     typename lbm::LatticeMemory<Lattice, Real>::View view,
@@ -32,6 +52,14 @@ void initialize_equilibrium_cell(
     }
 }
 
+/**
+ * @brief Sum density over the whole domain by summing all populations.
+ *
+ * @tparam Lattice Lattice traits type satisfying `lbm::IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param mem Host population memory whose current buffer is inspected.
+ * @return Total mass accumulated in extended precision.
+ */
 template <lbm::IsLatticeModel Lattice, std::floating_point Real>
 long double total_mass(const lbm::LatticeMemory<Lattice, Real>& mem) {
     const auto view = mem.get_current_view();
@@ -67,6 +95,11 @@ long double total_mass(const lbm::LatticeMemory<Lattice, Real>& mem) {
     return mass;
 }
 
+/**
+ * @brief Initialize a D3Q19 domain with random low-Mach equilibrium states.
+ *
+ * @param mem D3Q19 double-precision memory to initialize.
+ */
 void initialize_random_d3q19(lbm::LatticeMemory<lbm::D3Q19, double>& mem) {
     std::mt19937_64 rng{0x5eed1234ULL};
     std::uniform_real_distribution<double> density_dist{0.95, 1.05};
@@ -90,6 +123,17 @@ void initialize_random_d3q19(lbm::LatticeMemory<lbm::D3Q19, double>& mem) {
     }
 }
 
+/**
+ * @brief Initialize a D2Q9 Taylor-Green vortex for analytical decay validation.
+ *
+ * The density perturbation and velocity field match the weakly compressible
+ * initialization used by the kinetic-energy decay test.
+ *
+ * @param mem D2Q9 double-precision memory to initialize.
+ * @param wave_number Fundamental wave number `2 pi / L`.
+ * @param initial_velocity Velocity amplitude.
+ * @param sound_speed_squared Isothermal lattice sound speed squared.
+ */
 void initialize_taylor_green_d2q9(
     lbm::LatticeMemory<lbm::D2Q9, double>& mem,
     double wave_number,
@@ -117,6 +161,12 @@ void initialize_taylor_green_d2q9(
     }
 }
 
+/**
+ * @brief Compute total kinetic energy from reconstructed D2Q9 macroscopic fields.
+ *
+ * @param mem D2Q9 memory whose current populations are inspected.
+ * @return `0.5 * sum rho |u|^2` over the domain.
+ */
 double kinetic_energy_d2q9(const lbm::LatticeMemory<lbm::D2Q9, double>& mem) {
     const auto view = mem.get_current_view();
     const std::size_t y_extent = view.extent(1);
@@ -142,6 +192,9 @@ double kinetic_energy_d2q9(const lbm::LatticeMemory<lbm::D2Q9, double>& mem) {
 
 } // namespace
 
+/**
+ * @brief Verify that periodic BGK stepping conserves total mass in 3D.
+ */
 TEST(LBMValidation, MassConservationD3Q19Cpu) {
     constexpr std::size_t x_extent = 32;
     constexpr std::size_t y_extent = 32;
@@ -164,6 +217,12 @@ TEST(LBMValidation, MassConservationD3Q19Cpu) {
     EXPECT_NEAR(initial_mass, final_mass, mass_tolerance);
 }
 
+/**
+ * @brief Validate D2Q9 Taylor-Green kinetic-energy decay against theory.
+ *
+ * The analytical decay is `K(t) = K(0) exp(-4 nu k^2 t)` with
+ * `nu = c_s^2 (tau - 0.5)`.
+ */
 TEST(LBMValidation, TaylorGreenVortexD2Q9Decay) {
     constexpr std::size_t domain_size = 64;
     constexpr int iterations = 1000;

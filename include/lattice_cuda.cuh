@@ -1,4 +1,13 @@
 #pragma once
+/**
+ * @file lattice_cuda.cuh
+ * @brief CUDA kernel and launcher declarations for GPU LBM time stepping.
+ *
+ * The CUDA backend operates on raw device pointers laid out in the same SoA order
+ * as the host mdspan views: `[Q, Z, Y, X]` with `X` contiguous. The declarations
+ * are separated from the implementation so host targets can link against the CUDA
+ * backend without compiling device code in ordinary C++ translation units.
+ */
 
 #include <cuda_runtime.h>
 
@@ -11,11 +20,36 @@
 
 namespace lbm {
 
+/**
+ * @brief Default CUDA block dimensions used by the host launcher.
+ *
+ * The shape favors contiguous `x` traversal while leaving the value easy to
+ * override for architecture-specific tuning.
+ *
+ * @return `dim3{16, 8, 1}`.
+ */
 inline dim3 default_cuda_block_size() noexcept {
     return dim3{16, 8, 1};
 }
 
 #ifdef __CUDACC__
+/**
+ * @brief CUDA kernel implementing one fused pull-streaming BGK update.
+ *
+ * Each CUDA thread maps to one spatial lattice node. It gathers all incoming
+ * populations from periodic neighbors in the current buffer, calls the stateless
+ * BGK collision function, and writes post-collision populations to the next
+ * buffer using the same flat SoA layout as the CPU path.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_populations Device pointer to the read-side population buffer.
+ * @param next_populations Device pointer to the write-side population buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, or 1 for 2D lattices.
+ * @param omega BGK relaxation frequency.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 __global__ void kernel_step(
     const Real* current_populations,
@@ -26,6 +60,25 @@ __global__ void kernel_step(
     Real omega);
 #endif
 
+/**
+ * @brief Launch the CUDA fused collision-streaming kernel over a domain.
+ *
+ * The function computes a grid from the supplied block shape, normalizes the z
+ * extent for 2D lattices, enqueues `kernel_step`, and returns the immediate CUDA
+ * launch status without synchronizing. This lets benchmarks control
+ * synchronization explicitly.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_populations Device pointer to the read-side population buffer.
+ * @param next_populations Device pointer to the write-side population buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, or 1 for 2D lattices.
+ * @param omega BGK relaxation frequency.
+ * @param block CUDA block dimensions used for launch tuning.
+ * @return Immediate CUDA error status from validation or kernel launch.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 cudaError_t launch_step_gpu(
     const Real* current_populations,
@@ -36,6 +89,22 @@ cudaError_t launch_step_gpu(
     Real omega,
     dim3 block = default_cuda_block_size());
 
+/**
+ * @brief Launch the CUDA step using extents stored by a host `LatticeMemory`.
+ *
+ * This overload is a convenience bridge while device memory is managed
+ * separately. It does not copy data; callers still provide the raw device
+ * buffers corresponding to current and next populations.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param mem Host memory object used only for domain extents.
+ * @param current_populations Device pointer to the read-side population buffer.
+ * @param next_populations Device pointer to the write-side population buffer.
+ * @param omega BGK relaxation frequency.
+ * @param block CUDA block dimensions used for launch tuning.
+ * @return Immediate CUDA error status from validation or kernel launch.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 cudaError_t launch_step_gpu(
     const LatticeMemory<Lattice, Real>& mem,

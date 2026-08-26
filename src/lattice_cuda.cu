@@ -1,3 +1,12 @@
+/**
+ * @file lattice_cuda.cu
+ * @brief CUDA implementation of fused pull-streaming BGK time steps.
+ *
+ * This translation unit contains device-only indexing helpers, the templated
+ * CUDA kernel, host launch wrappers, and explicit template instantiations for the
+ * supported lattice/precision combinations.
+ */
+
 #include "lattice_cuda.cuh"
 
 #include <array>
@@ -6,6 +15,19 @@ namespace lbm {
 
 namespace detail {
 
+/**
+ * @brief Compute the periodic upstream coordinate for one CUDA thread.
+ *
+ * The kernel uses pull streaming, so the source coordinate for population `i` is
+ * the destination coordinate minus the discrete velocity component. Adding the
+ * extent before modulo implements periodic wrapping for one-cell negative
+ * displacements.
+ *
+ * @param coordinate Destination coordinate along one axis.
+ * @param velocity Discrete velocity component along the same axis.
+ * @param extent Domain size along the axis.
+ * @return Wrapped source coordinate.
+ */
 __device__ inline std::size_t periodic_pull_index(
     std::size_t coordinate,
     int velocity,
@@ -16,6 +38,22 @@ __device__ inline std::size_t periodic_pull_index(
     return static_cast<std::size_t>(signed_index % signed_extent);
 }
 
+/**
+ * @brief Convert `[q, z, y, x]` coordinates into the flat SoA device index.
+ *
+ * The formula mirrors `std::layout_right` host views with `X` contiguous. Keeping
+ * this mapping identical to `LatticeMemory` is essential for host/device
+ * round-trips and CPU/GPU result comparisons.
+ *
+ * @param i Discrete population index.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @param z Cell z coordinate.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z.
+ * @return Flat scalar offset in the population buffer.
+ */
 __host__ __device__ inline std::size_t population_index(
     int i,
     std::size_t x,
@@ -29,6 +67,24 @@ __host__ __device__ inline std::size_t population_index(
 
 } // namespace detail
 
+/**
+ * @brief CUDA kernel for one fused collision-streaming update.
+ *
+ * Each thread owns one destination cell. It gathers populations from neighboring
+ * cells using periodic pull streaming, applies the stateless BGK collision, and
+ * writes the updated populations into the next buffer. No inter-thread
+ * synchronization is required because the scheme only reads from the current
+ * buffer and writes to disjoint locations in the next buffer.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_populations Device pointer to the current SoA buffer.
+ * @param next_populations Device pointer to the next SoA buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z.
+ * @param omega BGK relaxation frequency.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 __global__ void kernel_step(
     const Real* current_populations,
@@ -92,6 +148,23 @@ __global__ void kernel_step(
     }
 }
 
+/**
+ * @brief Validate launch inputs and enqueue the CUDA step kernel.
+ *
+ * The wrapper leaves synchronization to the caller so timing code can measure
+ * kernels in batches or include/exclude host-device transfers explicitly.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_populations Device pointer to the current SoA buffer.
+ * @param next_populations Device pointer to the next SoA buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, overwritten to 1 for 2D lattices.
+ * @param omega BGK relaxation frequency.
+ * @param block CUDA block dimensions.
+ * @return CUDA validation or launch status.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 cudaError_t launch_step_gpu(
     const Real* current_populations,
@@ -135,6 +208,18 @@ cudaError_t launch_step_gpu(
     return cudaGetLastError();
 }
 
+/**
+ * @brief Convenience launcher that reads domain extents from host memory metadata.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param mem Host-side memory object used only for dimensions.
+ * @param current_populations Device pointer to the current SoA buffer.
+ * @param next_populations Device pointer to the next SoA buffer.
+ * @param omega BGK relaxation frequency.
+ * @param block CUDA block dimensions.
+ * @return CUDA validation or launch status.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 cudaError_t launch_step_gpu(
     const LatticeMemory<Lattice, Real>& mem,
@@ -152,6 +237,13 @@ cudaError_t launch_step_gpu(
         block);
 }
 
+/**
+ * @brief Explicit template instantiations for supported lattice/precision pairs.
+ *
+ * Keeping instantiations in this CUDA translation unit prevents ordinary host
+ * targets from compiling device code while still exposing concrete symbols for
+ * the application launcher.
+ */
 template __global__ void kernel_step<D2Q9, float>(
     const float*, float*, std::size_t, std::size_t, std::size_t, float);
 template __global__ void kernel_step<D2Q9, double>(

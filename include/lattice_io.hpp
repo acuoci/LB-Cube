@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * @file lattice_io.hpp
+ * @brief Host-side diagnostics logging and legacy VTK visualization output.
+ *
+ * Output routines reconstruct macroscopic fields directly from the population
+ * buffers via stateless physics functions. This avoids persistent density or
+ * velocity allocations and keeps IO separate from the core stepping algorithms.
+ */
 
 #include <algorithm>
 #include <array>
@@ -19,6 +27,21 @@ namespace lbm {
 
 namespace detail {
 
+/**
+ * @brief Gather all populations of one cell from a dimension-dependent mdspan.
+ *
+ * The returned local array is the format expected by `compute_macro_state`.
+ * Centralizing this indexing keeps diagnostics and VTK export consistent with
+ * the `[Q, Y, X]` and `[Q, Z, Y, X]` memory contracts.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param view Read-only population view for the current time level.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @param z Cell z coordinate, ignored for 2D views.
+ * @return Local population array ordered by lattice direction.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 [[nodiscard]] inline std::array<Real, static_cast<std::size_t>(Lattice::Q)> gather_cell_populations(
     typename LatticeMemory<Lattice, Real>::ConstView view,
@@ -39,6 +62,17 @@ template <IsLatticeModel Lattice, std::floating_point Real>
     return local_pops;
 }
 
+/**
+ * @brief Reconstruct macroscopic state at one grid point.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for populations and macros.
+ * @param view Read-only population view for the current time level.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @param z Cell z coordinate, ignored for 2D views.
+ * @return Density and velocity reconstructed from the cell populations.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 [[nodiscard]] inline MacroState<Lattice, Real> macro_at(
     typename LatticeMemory<Lattice, Real>::ConstView view,
@@ -49,6 +83,18 @@ template <IsLatticeModel Lattice, std::floating_point Real>
         gather_cell_populations<Lattice, Real>(view, x, y, z));
 }
 
+/**
+ * @brief Read a velocity component while padding 2D vectors to 3D for VTK.
+ *
+ * Legacy VTK vector fields require three components. For 2D lattices this helper
+ * returns zero for the z component.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point velocity precision.
+ * @param macro Macroscopic state whose velocity is being written.
+ * @param component Component index in `[0, 2]`.
+ * @return Requested velocity component, or zero for the 2D z component.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 [[nodiscard]] inline Real velocity_component(
     const MacroState<Lattice, Real>& macro,
@@ -62,6 +108,20 @@ template <IsLatticeModel Lattice, std::floating_point Real>
 
 } // namespace detail
 
+/**
+ * @brief Append integral diagnostics for the current population field to a CSV stream.
+ *
+ * The function reconstructs macros at each node and accumulates total mass,
+ * total kinetic energy `0.5 * rho * |u|^2`, and maximum velocity magnitude. The
+ * caller owns the stream so long-running simulations can keep one diagnostics
+ * file open and append at selected output intervals.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param view Read-only view of the current population buffer.
+ * @param time_step Simulation time step to write in the first CSV column.
+ * @param csv_stream Open output stream receiving one diagnostics row.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 inline void log_diagnostics(
     typename LatticeMemory<Lattice, Real>::ConstView view,
@@ -116,6 +176,22 @@ inline void log_diagnostics(
         static_cast<double>(max_velocity_magnitude));
 }
 
+/**
+ * @brief Write density and velocity fields to a legacy ASCII VTK file.
+ *
+ * The exporter creates `lbm_XXXXXX.vtk` files using the `STRUCTURED_POINTS`
+ * dataset. Density, velocity magnitude, and velocity vectors are reconstructed on
+ * demand from the current populations so visualization does not impose separate
+ * macroscopic storage in the solver state.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param mem Host memory object containing the current population buffer.
+ * @param x_extent Number of nodes in x to write.
+ * @param y_extent Number of nodes in y to write.
+ * @param z_extent Number of nodes in z to write; forced to 1 for 2D lattices.
+ * @param time_step Time step encoded into the file name and VTK title.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 inline void write_vtk(
     const LatticeMemory<Lattice, Real>& mem,

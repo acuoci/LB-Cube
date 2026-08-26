@@ -1,3 +1,13 @@
+/**
+ * @file main.cpp
+ * @brief Command-line executable for D3Q19 LBM simulations.
+ *
+ * The executable wires together initialization, CPU or optional CUDA stepping,
+ * periodic diagnostics, VTK output, and simple performance reporting. Solver
+ * components remain reusable through the headers; this file is the orchestration
+ * layer for production runs.
+ */
+
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -31,11 +41,23 @@ namespace {
 using Lattice = lbm::D3Q19;
 using Real = double;
 
+/**
+ * @brief Initial macroscopic field used to populate the simulation domain.
+ */
 enum class InitialCondition {
+    /** @brief Uniform equilibrium with zero velocity. */
     Rest,
+    /** @brief Taylor-Green-style vortex for visible, decaying flow dynamics. */
     TaylorGreen
 };
 
+/**
+ * @brief Parsed command-line configuration for one simulation run.
+ *
+ * Defaults are chosen for a modest D3Q19 run. GPU execution is the default only
+ * when the executable is built with CUDA support; CPU-only builds default to the
+ * CPU backend and reject `-gpu`.
+ */
 struct Config {
     std::size_t nx{64};
     std::size_t ny{64};
@@ -50,6 +72,14 @@ struct Config {
 #endif
 };
 
+/**
+ * @brief Parse a positive grid extent from a command-line option.
+ *
+ * @param args Full argument vector.
+ * @param i Index of the option name; advanced to the value on success.
+ * @return Parsed extent.
+ * @throws std::invalid_argument if the value is missing or zero.
+ */
 [[nodiscard]] std::size_t parse_size_arg(const std::vector<std::string>& args, std::size_t& i) {
     if (i + 1 >= args.size()) {
         throw std::invalid_argument("missing value for " + args[i]);
@@ -63,6 +93,14 @@ struct Config {
     return value;
 }
 
+/**
+ * @brief Parse an integer-valued command-line option.
+ *
+ * @param args Full argument vector.
+ * @param i Index of the option name; advanced to the value on success.
+ * @return Parsed integer.
+ * @throws std::invalid_argument if the value is missing or malformed.
+ */
 [[nodiscard]] int parse_int_arg(const std::vector<std::string>& args, std::size_t& i) {
     if (i + 1 >= args.size()) {
         throw std::invalid_argument("missing value for " + args[i]);
@@ -71,6 +109,14 @@ struct Config {
     return std::stoi(args[++i]);
 }
 
+/**
+ * @brief Parse the `-init` option.
+ *
+ * @param args Full argument vector.
+ * @param i Index of `-init`; advanced to the value on success.
+ * @return Selected initial condition.
+ * @throws std::invalid_argument if the value is missing or unsupported.
+ */
 [[nodiscard]] InitialCondition parse_initial_condition(const std::vector<std::string>& args, std::size_t& i) {
     if (i + 1 >= args.size()) {
         throw std::invalid_argument("missing value for " + args[i]);
@@ -88,6 +134,18 @@ struct Config {
     throw std::invalid_argument("-init must be either 'rest' or 'tgv'");
 }
 
+/**
+ * @brief Parse and validate the full command line.
+ *
+ * Recognized options are `-nx`, `-ny`, `-nz`, `-steps`, `-out_freq`, `-init`,
+ * `-cpu`, and `-gpu`. The function performs validation early so batch jobs fail
+ * before allocating memory or writing output files.
+ *
+ * @param argc Argument count from `main`.
+ * @param argv Argument values from `main`.
+ * @return Validated run configuration.
+ * @throws std::invalid_argument for unknown options or invalid values.
+ */
 [[nodiscard]] Config parse_arguments(int argc, char** argv) {
     Config config{};
     std::vector<std::string> args;
@@ -136,6 +194,12 @@ struct Config {
     return config;
 }
 
+/**
+ * @brief Convert an initial-condition enum to the user-facing option name.
+ *
+ * @param initial_condition Selected initial condition.
+ * @return `"rest"` or `"tgv"`.
+ */
 [[nodiscard]] std::string initial_condition_name(InitialCondition initial_condition) {
     switch (initial_condition) {
     case InitialCondition::Rest:
@@ -148,15 +212,37 @@ struct Config {
 }
 
 #if LB_CUBE_ENABLE_CUDA
+/**
+ * @brief Throw a contextual C++ exception when a CUDA runtime call fails.
+ *
+ * @param error CUDA runtime status code.
+ * @param context Description of the operation being checked.
+ * @throws std::runtime_error if `error != cudaSuccess`.
+ */
 void check_cuda(cudaError_t error, const std::string& context) {
     if (error != cudaSuccess) {
         throw std::runtime_error(context + ": " + cudaGetErrorString(error));
     }
 }
 
+/**
+ * @brief RAII owner for the two raw CUDA population buffers.
+ *
+ * The current GPU backend accepts raw pointers for minimal kernel overhead, while
+ * this wrapper provides exception-safe lifetime management at the executable
+ * boundary. The two buffers mirror the host ping-pong scheme.
+ *
+ * @tparam T Floating-point population type stored on the device.
+ */
 template <typename T>
 class DevicePopulationBuffers {
 public:
+    /**
+     * @brief Allocate current and next device buffers.
+     *
+     * @param count Number of scalar population values per buffer.
+     * @throws std::runtime_error if either allocation fails.
+     */
     explicit DevicePopulationBuffers(std::size_t count)
         : count_(count),
           bytes_(count * sizeof(T)) {
@@ -173,15 +259,22 @@ public:
     DevicePopulationBuffers(const DevicePopulationBuffers&) = delete;
     DevicePopulationBuffers& operator=(const DevicePopulationBuffers&) = delete;
 
+    /**
+     * @brief Release device allocations owned by the wrapper.
+     */
     ~DevicePopulationBuffers() {
         cudaFree(current);
         cudaFree(next);
     }
 
+    /** @return Number of scalar population values in each buffer. */
     [[nodiscard]] std::size_t count() const noexcept { return count_; }
+    /** @return Number of bytes in each buffer. */
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
 
+    /** @brief Device pointer used as the read-side population buffer. */
     T* current{};
+    /** @brief Device pointer used as the write-side population buffer. */
     T* next{};
 
 private:
@@ -190,6 +283,15 @@ private:
 };
 #endif
 
+/**
+ * @brief Fill the domain with uniform equilibrium populations at rest.
+ *
+ * This initialization is useful for conservation smoke tests. With periodic
+ * boundaries and no forcing, the state should remain exactly uniform and have no
+ * visible velocity structure.
+ *
+ * @param mem Host population memory to initialize.
+ */
 void initialize_rest_state(lbm::LatticeMemory<Lattice, Real>& mem) {
     auto view = mem.get_current_view();
 
@@ -209,6 +311,15 @@ void initialize_rest_state(lbm::LatticeMemory<Lattice, Real>& mem) {
     }
 }
 
+/**
+ * @brief Initialize a 2D Taylor-Green-style slice replicated over z.
+ *
+ * This helper is retained for experimentation with planar structures in the
+ * D3Q19 executable. The currently selected default initializer is the 3D variant
+ * below.
+ *
+ * @param mem Host population memory to initialize.
+ */
 void initialize_taylor_green_state_2d(lbm::LatticeMemory<Lattice, Real>& mem) {
     constexpr Real sound_speed_squared = Real{1} / Real{3};
     constexpr Real initial_velocity = Real{0.01};
@@ -244,6 +355,16 @@ void initialize_taylor_green_state_2d(lbm::LatticeMemory<Lattice, Real>& mem) {
     }
 }
 
+/**
+ * @brief Initialize a low-Mach three-dimensional Taylor-Green-style vortex.
+ *
+ * The velocity field gives the default executable a non-zero, ParaView-visible
+ * flow while remaining near incompressible conditions. Populations are initialized
+ * through the same equilibrium function used by tests, keeping initialization
+ * consistent with the BGK model.
+ *
+ * @param mem Host population memory to initialize.
+ */
 void initialize_taylor_green_state_3d(lbm::LatticeMemory<Lattice, Real>& mem) {
     constexpr Real sound_speed_squared = Real{1} / Real{3};
     constexpr Real initial_velocity = Real{0.01};
@@ -267,7 +388,6 @@ void initialize_taylor_green_state_3d(lbm::LatticeMemory<Lattice, Real>& mem) {
             for (std::size_t x = 0; x < mem.x_extent(); ++x) {
                 const Real phase_x = kx * static_cast<Real>(x);
                 
-                // 3D density perturbation
                 const Real density_perturbation =
                     (initial_velocity * initial_velocity) / (Real{16} * sound_speed_squared) *
                     (std::cos(Real{2} * phase_x) + std::cos(Real{2} * phase_y)) * 
@@ -276,7 +396,6 @@ void initialize_taylor_green_state_3d(lbm::LatticeMemory<Lattice, Real>& mem) {
                 lbm::MacroState<Lattice, Real> macro{};
                 macro.density = Real{1} + density_perturbation; 
                 
-                // 3D velocity field
                 macro.velocity << 
                     initial_velocity * std::sin(phase_x) * std::cos(phase_y) * std::cos(phase_z),
                     -initial_velocity * std::cos(phase_x) * std::sin(phase_y) * std::cos(phase_z),
@@ -291,6 +410,12 @@ void initialize_taylor_green_state_3d(lbm::LatticeMemory<Lattice, Real>& mem) {
     }
 }
 
+/**
+ * @brief Dispatch initialization based on the parsed run configuration.
+ *
+ * @param mem Host population memory to initialize.
+ * @param initial_condition Requested initial macroscopic field.
+ */
 void initialize_state(lbm::LatticeMemory<Lattice, Real>& mem, InitialCondition initial_condition) {
     switch (initial_condition) {
     case InitialCondition::Rest:
@@ -302,6 +427,16 @@ void initialize_state(lbm::LatticeMemory<Lattice, Real>& mem, InitialCondition i
     }
 }
 
+/**
+ * @brief Copy the current host mdspan view into a flat SoA staging vector.
+ *
+ * The CUDA launcher expects raw device pointers in `[Q, Z, Y, X]` order. This
+ * helper produces a matching host-side staging buffer before the initial
+ * host-to-device transfer.
+ *
+ * @param mem Host population memory whose active buffer is flattened.
+ * @return Flat population vector in device-compatible SoA order.
+ */
 [[nodiscard]] std::vector<Real> flatten_current_populations(
     const lbm::LatticeMemory<Lattice, Real>& mem) {
     const auto view = mem.get_current_view();
@@ -324,6 +459,12 @@ void initialize_state(lbm::LatticeMemory<Lattice, Real>& mem, InitialCondition i
 }
 
 #if LB_CUBE_ENABLE_CUDA
+/**
+ * @brief Refresh host populations from a flat device-copy staging vector.
+ *
+ * @param mem Host memory whose current buffer is overwritten.
+ * @param flat Flat population data in `[Q, Z, Y, X]` order.
+ */
 void overwrite_current_populations(
     lbm::LatticeMemory<Lattice, Real>& mem,
     const std::vector<Real>& flat) {
@@ -343,6 +484,17 @@ void overwrite_current_populations(
     }
 }
 
+/**
+ * @brief Copy the active GPU buffer back to host memory for diagnostics and VTK.
+ *
+ * GPU runs avoid host-device traffic between output intervals. When output is
+ * due, this function stages the current device populations and updates
+ * `LatticeMemory`, allowing the host-only IO routines to reconstruct macros.
+ *
+ * @param device_buffers CUDA population buffers after the latest pointer swap.
+ * @param mem Host memory object refreshed for output.
+ * @param staging Reusable host transfer buffer.
+ */
 void copy_device_current_to_host(
     DevicePopulationBuffers<Real>& device_buffers,
     lbm::LatticeMemory<Lattice, Real>& mem,
@@ -355,6 +507,15 @@ void copy_device_current_to_host(
 }
 #endif
 
+/**
+ * @brief Print a flushed run summary for interactive and batch execution.
+ *
+ * Explicit flushing helps scheduler logs capture the configuration immediately,
+ * which is useful when jobs fail before the first output interval.
+ *
+ * @param config Parsed simulation settings.
+ * @param omega BGK relaxation frequency.
+ */
 void print_summary(const Config& config, Real omega) {
     std::cout << "LB-Cube D3Q19 simulation\n"
               << "Grid: " << config.nx << " x " << config.ny << " x " << config.nz << '\n'
@@ -368,6 +529,14 @@ void print_summary(const Config& config, Real omega) {
 
 } // namespace
 
+/**
+ * @brief Main simulation entry point.
+ *
+ * @param argc Number of command-line arguments.
+ * @param argv Command-line argument values.
+ * @return `EXIT_SUCCESS` after a completed run, otherwise `EXIT_FAILURE` with an
+ * explanatory message on standard error.
+ */
 int main(int argc, char** argv) {
     try {
         constexpr Real relaxation_time = Real{0.8};

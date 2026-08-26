@@ -1,7 +1,17 @@
 #pragma once
+/**
+ * @file lattice_core.hpp
+ * @brief CPU fused collision-streaming loop for periodic LBM domains.
+ *
+ * This header ties the SoA memory views and stateless physics functions together
+ * for host execution. The update uses a pull-streaming scheme: each destination
+ * cell gathers incoming populations from periodic neighbors, performs local BGK
+ * collision, and writes the result to the next ping-pong buffer.
+ */
 
 #include <array>
 #include <cstddef>
+#include <concepts>
 
 #include "lattice_memory.hpp"
 #include "lattice_physics.hpp"
@@ -11,6 +21,18 @@ namespace lbm {
 
 namespace detail {
 
+/**
+ * @brief Compute a wrapped upstream coordinate for pull streaming.
+ *
+ * For a destination coordinate `x` and lattice velocity component `c`, the
+ * source coordinate is `x - c`. Adding the extent before the modulo operation
+ * handles negative one-cell displacements and implements periodic boundaries.
+ *
+ * @param coordinate Destination coordinate along one axis.
+ * @param velocity Discrete velocity component along the same axis.
+ * @param extent Domain size along the axis.
+ * @return Periodically wrapped source coordinate.
+ */
 [[nodiscard]] constexpr std::size_t periodic_pull_index(
     std::size_t coordinate,
     int velocity,
@@ -23,6 +45,20 @@ namespace detail {
 
 } // namespace detail
 
+/**
+ * @brief Advance the host population buffers by one fused LBM time step.
+ *
+ * The function reads from `mem.get_current_view()`, writes to
+ * `mem.get_next_view()`, and calls `mem.swap_buffers()` when the entire domain
+ * has been updated. The 2D and 3D code paths are selected with `if constexpr` so
+ * each compiled instantiation contains only the relevant loop nest and indexing
+ * rank.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used by the population buffers.
+ * @param mem Host SoA population storage participating in the ping-pong scheme.
+ * @param omega BGK relaxation frequency.
+ */
 template <IsLatticeModel Lattice, std::floating_point Real>
 inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
     auto current_view = mem.get_current_view();
