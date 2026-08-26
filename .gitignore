@@ -3,5 +3,6 @@ build/
 *.csv
 *.swp
 *.vscode
+*.DS_Store
 
 
