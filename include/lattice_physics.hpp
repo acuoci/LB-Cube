@@ -70,9 +70,11 @@ __host__ __device__ inline MacroState<Lattice, Real> compute_macro_state(
  * @brief Compute the second-order isothermal equilibrium population.
  *
  * This implements the standard weakly compressible LBM equilibrium
- * `f_i^eq = w_i rho [1 + 3(c_i.u) + 4.5(c_i.u)^2 - 1.5(u.u)]`, corresponding to
- * `c_s^2 = 1/3`. All constants are explicitly cast to `Real` so the same
- * expression can be instantiated for `float` or `double`.
+ * `f_i^eq = w_i rho [1 + (c_i.u)/c_s^2 + 0.5(c_i.u)^2/c_s^4
+ * - 0.5(u.u)/c_s^2]`. For the fluid lattices currently provided,
+ * `c_s^2 = 1/3`, which recovers the familiar coefficients 3, 4.5, and 1.5.
+ * All constants are explicitly cast to `Real` so the same expression can be
+ * instantiated for `float` or `double`.
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
  * @tparam Real Floating-point precision used for the computation.
@@ -93,14 +95,16 @@ __host__ __device__ inline Real compute_equilibrium(
     }
 
     const Real weight = static_cast<Real>(Lattice::weights[static_cast<std::size_t>(i)]);
+    const Real cs2 = static_cast<Real>(Lattice::cs2);
+    const Real inv_cs2 = static_cast<Real>(1.0) / cs2;
     const Real c_dot_u = direction.dot(macro.velocity);
     const Real u_dot_u = macro.velocity.dot(macro.velocity);
 
     return weight * macro.density *
            (static_cast<Real>(1.0) +
-            static_cast<Real>(3.0) * c_dot_u +
-            static_cast<Real>(4.5) * c_dot_u * c_dot_u -
-           static_cast<Real>(1.5) * u_dot_u);
+            inv_cs2 * c_dot_u +
+            static_cast<Real>(0.5) * inv_cs2 * inv_cs2 * c_dot_u * c_dot_u -
+            static_cast<Real>(0.5) * inv_cs2 * u_dot_u);
 }
 
 /**
@@ -128,6 +132,95 @@ __host__ __device__ inline void collide_bgk(
         const auto index = static_cast<std::size_t>(i);
         const Real equilibrium = compute_equilibrium<Lattice, Real>(i, macro);
         local_pops[index] += omega * (equilibrium - local_pops[index]);
+    }
+}
+
+/**
+ * @brief Reconstruct passive-scalar concentration from local scalar populations.
+ *
+ * For the pure LBM scalar model, concentration is the zeroth moment
+ * `C = sum_i g_i`.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for scalar populations.
+ * @param scalar_pops Scalar populations at one cell.
+ * @return Local scalar concentration.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+__host__ __device__ inline Real compute_concentration(
+    const std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)>& scalar_pops) {
+    Real concentration{};
+    for (int i = 0; i < ScalarLattice::Q; ++i) {
+        concentration += scalar_pops[static_cast<std::size_t>(i)];
+    }
+
+    return concentration;
+}
+
+/**
+ * @brief Compute the advection-diffusion scalar equilibrium population.
+ *
+ * The equilibrium is first order in the advecting fluid velocity:
+ * `g_i^eq = w_i C (1 + (c_i.u) / c_s^2)`. This is the standard passive-scalar
+ * LBM equilibrium for advection by an externally supplied velocity field.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for concentration and velocity.
+ * @param i Scalar lattice direction index.
+ * @param concentration Local scalar concentration.
+ * @param fluid_velocity Fluid velocity reconstructed from the fluid populations.
+ * @return Equilibrium scalar population for direction `i`.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+__host__ __device__ inline Real compute_scalar_equilibrium(
+    int i,
+    Real concentration,
+    const Eigen::Matrix<Real, ScalarLattice::D, 1>& fluid_velocity) {
+    Real c_dot_u{};
+    for (int d = 0; d < ScalarLattice::D; ++d) {
+        const auto direction_index = static_cast<std::size_t>(i * ScalarLattice::D + d);
+        c_dot_u += static_cast<Real>(ScalarLattice::c[direction_index]) * fluid_velocity[d];
+    }
+
+    const Real weight = static_cast<Real>(ScalarLattice::weights[static_cast<std::size_t>(i)]);
+    const Real cs2 = static_cast<Real>(ScalarLattice::cs2);
+
+    return weight * concentration *
+           (static_cast<Real>(1.0) + c_dot_u / cs2);
+}
+
+/**
+ * @brief Apply BGK collision and source forcing to local scalar populations.
+ *
+ * The scalar populations relax toward `compute_scalar_equilibrium` using
+ * `omega_c`, then receive an isotropically distributed local source term
+ * `w_i * source_term`. Setting `source_term = 0` gives pure passive
+ * advection-diffusion.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for scalar populations.
+ * @param scalar_pops Scalar populations gathered at one destination cell. Values
+ * are overwritten with post-collision populations.
+ * @param fluid_velocity Advecting fluid velocity at the destination cell.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Local scalar source added over one time step.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+__host__ __device__ inline void collide_scalar_bgk(
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)>& scalar_pops,
+    const Eigen::Matrix<Real, ScalarLattice::D, 1>& fluid_velocity,
+    Real omega_c,
+    Real source_term) {
+    const Real concentration = compute_concentration<ScalarLattice, Real>(scalar_pops);
+
+    for (int i = 0; i < ScalarLattice::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        const Real weight = static_cast<Real>(ScalarLattice::weights[index]);
+        const Real equilibrium =
+            compute_scalar_equilibrium<ScalarLattice, Real>(i, concentration, fluid_velocity);
+
+        scalar_pops[index] += omega_c * (equilibrium - scalar_pops[index]) +
+                              weight * source_term;
     }
 }
 

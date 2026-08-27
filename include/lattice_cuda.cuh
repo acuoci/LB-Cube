@@ -58,6 +58,40 @@ __global__ void kernel_step(
     std::size_t y_extent,
     std::size_t z_extent,
     Real omega);
+
+/**
+ * @brief CUDA kernel implementing one passive-scalar pull-streaming update.
+ *
+ * Each thread reconstructs the local fluid velocity from the fluid population
+ * buffer at its cell, pulls scalar populations from neighboring scalar cells,
+ * applies scalar BGK relaxation and source forcing, and writes to the scalar
+ * next buffer.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_scalar Device pointer to the read-side scalar population buffer.
+ * @param next_scalar Device pointer to the write-side scalar population buffer.
+ * @param current_fluid Device pointer to the read-side fluid population buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, or 1 for 2D lattices.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Local scalar source contribution applied uniformly here.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+__global__ void kernel_scalar_step(
+    const Real* current_scalar,
+    Real* next_scalar,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real source_term);
 #endif
 
 /**
@@ -87,6 +121,71 @@ cudaError_t launch_step_gpu(
     std::size_t y_extent,
     std::size_t z_extent,
     Real omega,
+    dim3 block = default_cuda_block_size());
+
+/**
+ * @brief Launch the CUDA passive-scalar advection-diffusion kernel.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_scalar Device pointer to the scalar read buffer.
+ * @param next_scalar Device pointer to the scalar write buffer.
+ * @param current_fluid Device pointer to the fluid read buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, or 1 for 2D lattices.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Local scalar source contribution, defaulting to zero.
+ * @param block CUDA block dimensions used for launch tuning.
+ * @return Immediate CUDA error status from validation or kernel launch.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+cudaError_t launch_scalar_step_gpu(
+    const Real* current_scalar,
+    Real* next_scalar,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real source_term = Real{},
+    dim3 block = default_cuda_block_size());
+
+/**
+ * @brief Launch the CUDA scalar step using extents stored by host memory.
+ *
+ * This overload is a metadata convenience only; all population pointers are
+ * expected to point to device memory.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param scalar_mem Host scalar memory object used only for domain extents.
+ * @param fluid_mem Host fluid memory object used only for dimension consistency.
+ * @param current_scalar Device pointer to the scalar read buffer.
+ * @param next_scalar Device pointer to the scalar write buffer.
+ * @param current_fluid Device pointer to the fluid read buffer.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Local scalar source contribution, defaulting to zero.
+ * @param block CUDA block dimensions used for launch tuning.
+ * @return Immediate CUDA error status from validation or kernel launch.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+cudaError_t launch_scalar_step_gpu(
+    const LatticeMemory<ScalarLattice, Real>& scalar_mem,
+    const LatticeMemory<FluidLattice, Real>& fluid_mem,
+    const Real* current_scalar,
+    Real* next_scalar,
+    const Real* current_fluid,
+    Real omega_c,
+    Real source_term = Real{},
     dim3 block = default_cuda_block_size());
 
 /**

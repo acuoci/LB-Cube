@@ -128,4 +128,125 @@ inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
     mem.swap_buffers();
 }
 
+/**
+ * @brief Advance a passive scalar field by one CPU LBM advection-diffusion step.
+ *
+ * The scalar field has its own lattice and ping-pong buffers, while the fluid
+ * field supplies the advecting velocity at the destination cell. The scalar
+ * populations are streamed with a pull scheme using `ScalarLattice::c`, relaxed
+ * toward the first-order scalar equilibrium, and optionally receive a local
+ * source contribution.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision shared by fluid and scalar populations.
+ * @param scalar_mem Scalar SoA population storage participating in its own
+ * ping-pong scheme.
+ * @param fluid_mem Read-only fluid SoA population storage used to reconstruct
+ * the advecting velocity.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Uniform scalar source contribution, defaulting to zero for
+ * pure advection-diffusion.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+inline void step_scalar_cpu(
+    LatticeMemory<ScalarLattice, Real>& scalar_mem,
+    const LatticeMemory<FluidLattice, Real>& fluid_mem,
+    Real omega_c,
+    Real source_term = Real{}) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    auto scalar_current = scalar_mem.get_current_view();
+    auto scalar_next = scalar_mem.get_next_view();
+    auto fluid_current = fluid_mem.get_current_view();
+
+    if constexpr (ScalarLattice::D == 2) {
+        const std::size_t y_extent = scalar_current.extent(1);
+        const std::size_t x_extent = scalar_current.extent(2);
+
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
+                for (int i = 0; i < FluidLattice::Q; ++i) {
+                    fluid_pops[static_cast<std::size_t>(i)] =
+                        fluid_current[static_cast<std::size_t>(i), y, x];
+                }
+                const MacroState<FluidLattice, Real> fluid_macro =
+                    compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+                std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> scalar_pops{};
+                for (int i = 0; i < ScalarLattice::Q; ++i) {
+                    const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+                    const int cx = ScalarLattice::c[direction_offset];
+                    const int cy = ScalarLattice::c[direction_offset + 1];
+                    const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+                    const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+
+                    scalar_pops[static_cast<std::size_t>(i)] =
+                        scalar_current[static_cast<std::size_t>(i), ny, nx];
+                }
+
+                collide_scalar_bgk<ScalarLattice, Real>(
+                    scalar_pops,
+                    fluid_macro.velocity,
+                    omega_c,
+                    source_term);
+
+                for (int i = 0; i < ScalarLattice::Q; ++i) {
+                    scalar_next[static_cast<std::size_t>(i), y, x] =
+                        scalar_pops[static_cast<std::size_t>(i)];
+                }
+            }
+        }
+    } else {
+        const std::size_t z_extent = scalar_current.extent(1);
+        const std::size_t y_extent = scalar_current.extent(2);
+        const std::size_t x_extent = scalar_current.extent(3);
+
+        for (std::size_t z = 0; z < z_extent; ++z) {
+            for (std::size_t y = 0; y < y_extent; ++y) {
+                for (std::size_t x = 0; x < x_extent; ++x) {
+                    std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
+                    for (int i = 0; i < FluidLattice::Q; ++i) {
+                        fluid_pops[static_cast<std::size_t>(i)] =
+                            fluid_current[static_cast<std::size_t>(i), z, y, x];
+                    }
+                    const MacroState<FluidLattice, Real> fluid_macro =
+                        compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+                    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> scalar_pops{};
+                    for (int i = 0; i < ScalarLattice::Q; ++i) {
+                        const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+                        const int cx = ScalarLattice::c[direction_offset];
+                        const int cy = ScalarLattice::c[direction_offset + 1];
+                        const int cz = ScalarLattice::c[direction_offset + 2];
+                        const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+                        const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+                        const std::size_t nz = detail::periodic_pull_index(z, cz, z_extent);
+
+                        scalar_pops[static_cast<std::size_t>(i)] =
+                            scalar_current[static_cast<std::size_t>(i), nz, ny, nx];
+                    }
+
+                    collide_scalar_bgk<ScalarLattice, Real>(
+                        scalar_pops,
+                        fluid_macro.velocity,
+                        omega_c,
+                        source_term);
+
+                    for (int i = 0; i < ScalarLattice::Q; ++i) {
+                        scalar_next[static_cast<std::size_t>(i), z, y, x] =
+                            scalar_pops[static_cast<std::size_t>(i)];
+                    }
+                }
+            }
+        }
+    }
+
+    scalar_mem.swap_buffers();
+}
+
 } // namespace lbm

@@ -220,6 +220,81 @@ void initialize_shear_wave_d2q9(
     }
 }
 
+/**
+ * @brief Run a diffusive-scaling Taylor-Green vortex and return relative L2 error.
+ *
+ * The physical state is kept fixed while the lattice resolution changes. The
+ * lattice velocity, viscosity, relaxation time, and number of time steps are
+ * scaled so the comparison measures spatial convergence rather than a different
+ * physical problem.
+ *
+ * @param n Number of nodes in both x and y directions.
+ * @return Relative L2 error of velocity magnitude at the final physical time.
+ */
+double run_taylor_green_error(int n) {
+    constexpr int base_grid = 16;
+    constexpr double physical_time = 1.0;
+    constexpr double base_velocity = 0.05;
+    constexpr double base_relaxation_time = 0.8;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+
+    const double q = static_cast<double>(n) / static_cast<double>(base_grid);
+    const double lattice_velocity = base_velocity / q;
+    const double lattice_viscosity =
+        sound_speed_squared * (base_relaxation_time - 0.5) / q;
+    const double relaxation_time = lattice_viscosity / sound_speed_squared + 0.5;
+    const double omega = 1.0 / relaxation_time;
+    const int time_steps = static_cast<int>(std::llround(
+        physical_time * static_cast<double>(base_grid * base_grid) * q * q));
+    const double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(n);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> mem{
+        static_cast<std::size_t>(n),
+        static_cast<std::size_t>(n)};
+    initialize_taylor_green_d2q9(mem, wave_number, lattice_velocity, sound_speed_squared);
+
+    for (int step = 0; step < time_steps; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double>(mem, omega);
+    }
+
+    const auto view = mem.get_current_view();
+    const double decay = std::exp(
+        -2.0 * lattice_viscosity * wave_number * wave_number *
+        static_cast<double>(time_steps));
+    long double numerator = 0.0L;
+    long double denominator = 0.0L;
+
+    for (int y = 0; y < n; ++y) {
+        const double phase_y = wave_number * static_cast<double>(y);
+        for (int x = 0; x < n; ++x) {
+            const double phase_x = wave_number * static_cast<double>(x);
+            const double analytical_ux =
+                -lattice_velocity * std::cos(phase_x) * std::sin(phase_y) * decay;
+            const double analytical_uy =
+                lattice_velocity * std::sin(phase_x) * std::cos(phase_y) * decay;
+            const double analytical_speed =
+                std::hypot(analytical_ux, analytical_uy);
+
+            std::array<double, static_cast<std::size_t>(lbm::D2Q9::Q)> local_pops{};
+            for (int i = 0; i < lbm::D2Q9::Q; ++i) {
+                local_pops[static_cast<std::size_t>(i)] =
+                    view[static_cast<std::size_t>(i), static_cast<std::size_t>(y), static_cast<std::size_t>(x)];
+            }
+
+            const lbm::MacroState<lbm::D2Q9, double> macro =
+                lbm::compute_macro_state<lbm::D2Q9, double>(local_pops);
+            const double simulated_speed = macro.velocity.norm();
+            const double error = simulated_speed - analytical_speed;
+
+            numerator += static_cast<long double>(error * error);
+            denominator += static_cast<long double>(analytical_speed * analytical_speed);
+        }
+    }
+
+    return std::sqrt(static_cast<double>(numerator / denominator));
+}
+
 } // namespace
 
 /**
@@ -326,4 +401,19 @@ TEST(LBMValidation, ShearWaveDecayD2Q9Cpu) {
             EXPECT_NEAR(macro.density, 1.0, 1.0e-12);
         }
     }
+}
+
+/**
+ * @brief Verify approximately second-order spatial convergence for D2Q9.
+ */
+TEST(Validation, SpatialConvergence) {
+    const double error_16 = run_taylor_green_error(16);
+    const double error_32 = run_taylor_green_error(32);
+    const double error_64 = run_taylor_green_error(64);
+
+    const double eoc_16_to_32 = std::log2(error_16 / error_32);
+    const double eoc_32_to_64 = std::log2(error_32 / error_64);
+
+    EXPECT_GT(eoc_16_to_32, 1.5);
+    EXPECT_NEAR(eoc_32_to_64, 2.0, 0.15);
 }

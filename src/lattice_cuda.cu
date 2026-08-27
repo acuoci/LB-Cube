@@ -149,6 +149,120 @@ __global__ void kernel_step(
 }
 
 /**
+ * @brief CUDA kernel for one passive-scalar advection-diffusion update.
+ *
+ * The fluid populations are sampled at the destination cell to reconstruct the
+ * advecting velocity, while scalar populations are pulled from upstream scalar
+ * neighbors. The scalar collision is local and includes an optional source term.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_scalar Device pointer to the scalar current SoA buffer.
+ * @param next_scalar Device pointer to the scalar next SoA buffer.
+ * @param current_fluid Device pointer to the fluid current SoA buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Scalar source contribution applied locally.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+__global__ void kernel_scalar_step(
+    const Real* current_scalar,
+    Real* next_scalar,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real source_term) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    const std::size_t x = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    const std::size_t y = static_cast<std::size_t>(blockIdx.y * blockDim.y + threadIdx.y);
+    const std::size_t z = static_cast<std::size_t>(blockIdx.z * blockDim.z + threadIdx.z);
+
+    if (x >= x_extent || y >= y_extent || z >= z_extent) {
+        return;
+    }
+
+    std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> scalar_pops{};
+
+    if constexpr (ScalarLattice::D == 2) {
+        for (int i = 0; i < FluidLattice::Q; ++i) {
+            fluid_pops[static_cast<std::size_t>(i)] =
+                current_fluid[detail::population_index(
+                    i, x, y, 0, x_extent, y_extent, z_extent)];
+        }
+        const MacroState<FluidLattice, Real> fluid_macro =
+            compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+            const int cx = ScalarLattice::c[direction_offset];
+            const int cy = ScalarLattice::c[direction_offset + 1];
+            const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+            const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+
+            scalar_pops[static_cast<std::size_t>(i)] =
+                current_scalar[detail::population_index(
+                    i, nx, ny, 0, x_extent, y_extent, z_extent)];
+        }
+
+        collide_scalar_bgk<ScalarLattice, Real>(
+            scalar_pops,
+            fluid_macro.velocity,
+            omega_c,
+            source_term);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            next_scalar[detail::population_index(
+                i, x, y, 0, x_extent, y_extent, z_extent)] =
+                scalar_pops[static_cast<std::size_t>(i)];
+        }
+    } else {
+        for (int i = 0; i < FluidLattice::Q; ++i) {
+            fluid_pops[static_cast<std::size_t>(i)] =
+                current_fluid[detail::population_index(
+                    i, x, y, z, x_extent, y_extent, z_extent)];
+        }
+        const MacroState<FluidLattice, Real> fluid_macro =
+            compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+            const int cx = ScalarLattice::c[direction_offset];
+            const int cy = ScalarLattice::c[direction_offset + 1];
+            const int cz = ScalarLattice::c[direction_offset + 2];
+            const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+            const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+            const std::size_t nz = detail::periodic_pull_index(z, cz, z_extent);
+
+            scalar_pops[static_cast<std::size_t>(i)] =
+                current_scalar[detail::population_index(
+                    i, nx, ny, nz, x_extent, y_extent, z_extent)];
+        }
+
+        collide_scalar_bgk<ScalarLattice, Real>(
+            scalar_pops,
+            fluid_macro.velocity,
+            omega_c,
+            source_term);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            next_scalar[detail::population_index(
+                i, x, y, z, x_extent, y_extent, z_extent)] =
+                scalar_pops[static_cast<std::size_t>(i)];
+        }
+    }
+}
+
+/**
  * @brief Validate launch inputs and enqueue the CUDA step kernel.
  *
  * The wrapper leaves synchronization to the caller so timing code can measure
@@ -209,6 +323,75 @@ cudaError_t launch_step_gpu(
 }
 
 /**
+ * @brief Validate inputs and enqueue the CUDA passive-scalar step kernel.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_scalar Device pointer to the scalar current SoA buffer.
+ * @param next_scalar Device pointer to the scalar next SoA buffer.
+ * @param current_fluid Device pointer to the fluid current SoA buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, overwritten to 1 for 2D lattices.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Scalar source contribution.
+ * @param block CUDA block dimensions.
+ * @return CUDA validation or launch status.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+cudaError_t launch_scalar_step_gpu(
+    const Real* current_scalar,
+    Real* next_scalar,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real source_term,
+    dim3 block) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    if (current_scalar == nullptr || next_scalar == nullptr || current_fluid == nullptr) {
+        return cudaErrorInvalidDevicePointer;
+    }
+
+    if (block.x == 0 || block.y == 0 || block.z == 0) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    if constexpr (ScalarLattice::D == 2) {
+        z_extent = 1;
+        block.z = 1;
+    }
+
+    if (x_extent == 0 || y_extent == 0 || z_extent == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    const dim3 grid{
+        static_cast<unsigned int>((x_extent + block.x - 1) / block.x),
+        static_cast<unsigned int>((y_extent + block.y - 1) / block.y),
+        static_cast<unsigned int>((z_extent + block.z - 1) / block.z)
+    };
+
+    kernel_scalar_step<FluidLattice, ScalarLattice, Real><<<grid, block>>>(
+        current_scalar,
+        next_scalar,
+        current_fluid,
+        x_extent,
+        y_extent,
+        z_extent,
+        omega_c,
+        source_term);
+
+    return cudaGetLastError();
+}
+
+/**
  * @brief Convenience launcher that reads domain extents from host memory metadata.
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
@@ -234,6 +417,55 @@ cudaError_t launch_step_gpu(
         mem.y_extent(),
         mem.z_extent(),
         omega,
+        block);
+}
+
+/**
+ * @brief Convenience scalar launcher that reads extents from host memory metadata.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param scalar_mem Host scalar memory object used for dimensions.
+ * @param fluid_mem Host fluid memory object used for dimension consistency.
+ * @param current_scalar Device pointer to the scalar current SoA buffer.
+ * @param next_scalar Device pointer to the scalar next SoA buffer.
+ * @param current_fluid Device pointer to the fluid current SoA buffer.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param source_term Scalar source contribution.
+ * @param block CUDA block dimensions.
+ * @return CUDA validation or launch status.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+cudaError_t launch_scalar_step_gpu(
+    const LatticeMemory<ScalarLattice, Real>& scalar_mem,
+    const LatticeMemory<FluidLattice, Real>& fluid_mem,
+    const Real* current_scalar,
+    Real* next_scalar,
+    const Real* current_fluid,
+    Real omega_c,
+    Real source_term,
+    dim3 block) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    if (scalar_mem.x_extent() != fluid_mem.x_extent() ||
+        scalar_mem.y_extent() != fluid_mem.y_extent() ||
+        scalar_mem.z_extent() != fluid_mem.z_extent()) {
+        return cudaErrorInvalidValue;
+    }
+
+    return launch_scalar_step_gpu<FluidLattice, ScalarLattice, Real>(
+        current_scalar,
+        next_scalar,
+        current_fluid,
+        scalar_mem.x_extent(),
+        scalar_mem.y_extent(),
+        scalar_mem.z_extent(),
+        omega_c,
+        source_term,
         block);
 }
 
@@ -282,5 +514,86 @@ template cudaError_t launch_step_gpu<D3Q27, float>(
     const LatticeMemory<D3Q27, float>&, const float*, float*, float, dim3);
 template cudaError_t launch_step_gpu<D3Q27, double>(
     const LatticeMemory<D3Q27, double>&, const double*, double*, double, dim3);
+
+template __global__ void kernel_scalar_step<D2Q9, D2Q5, float>(
+    const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float);
+template __global__ void kernel_scalar_step<D2Q9, D2Q5, double>(
+    const double*, double*, const double*, std::size_t, std::size_t, std::size_t, double, double);
+template __global__ void kernel_scalar_step<D3Q19, D3Q7, float>(
+    const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float);
+template __global__ void kernel_scalar_step<D3Q19, D3Q7, double>(
+    const double*, double*, const double*, std::size_t, std::size_t, std::size_t, double, double);
+template __global__ void kernel_scalar_step<D3Q27, D3Q7, float>(
+    const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float);
+template __global__ void kernel_scalar_step<D3Q27, D3Q7, double>(
+    const double*, double*, const double*, std::size_t, std::size_t, std::size_t, double, double);
+
+template cudaError_t launch_scalar_step_gpu<D2Q9, D2Q5, float>(
+    const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float, dim3);
+template cudaError_t launch_scalar_step_gpu<D2Q9, D2Q5, double>(
+    const double*, double*, const double*, std::size_t, std::size_t, std::size_t, double, double, dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q19, D3Q7, float>(
+    const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float, dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q19, D3Q7, double>(
+    const double*, double*, const double*, std::size_t, std::size_t, std::size_t, double, double, dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q27, D3Q7, float>(
+    const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float, dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q27, D3Q7, double>(
+    const double*, double*, const double*, std::size_t, std::size_t, std::size_t, double, double, dim3);
+
+template cudaError_t launch_scalar_step_gpu<D2Q9, D2Q5, float>(
+    const LatticeMemory<D2Q5, float>&,
+    const LatticeMemory<D2Q9, float>&,
+    const float*,
+    float*,
+    const float*,
+    float,
+    float,
+    dim3);
+template cudaError_t launch_scalar_step_gpu<D2Q9, D2Q5, double>(
+    const LatticeMemory<D2Q5, double>&,
+    const LatticeMemory<D2Q9, double>&,
+    const double*,
+    double*,
+    const double*,
+    double,
+    double,
+    dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q19, D3Q7, float>(
+    const LatticeMemory<D3Q7, float>&,
+    const LatticeMemory<D3Q19, float>&,
+    const float*,
+    float*,
+    const float*,
+    float,
+    float,
+    dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q19, D3Q7, double>(
+    const LatticeMemory<D3Q7, double>&,
+    const LatticeMemory<D3Q19, double>&,
+    const double*,
+    double*,
+    const double*,
+    double,
+    double,
+    dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q27, D3Q7, float>(
+    const LatticeMemory<D3Q7, float>&,
+    const LatticeMemory<D3Q27, float>&,
+    const float*,
+    float*,
+    const float*,
+    float,
+    float,
+    dim3);
+template cudaError_t launch_scalar_step_gpu<D3Q27, D3Q7, double>(
+    const LatticeMemory<D3Q7, double>&,
+    const LatticeMemory<D3Q27, double>&,
+    const double*,
+    double*,
+    const double*,
+    double,
+    double,
+    dim3);
 
 } // namespace lbm
