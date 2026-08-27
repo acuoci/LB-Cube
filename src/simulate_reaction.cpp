@@ -333,41 +333,6 @@ void write_reaction_vtk(
 }
 
 /**
- * @brief Append integral ADR diagnostics to a CSV stream.
- */
-void log_reaction_diagnostics(
-    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
-    const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
-    std::size_t time_step,
-    Real reaction_rate,
-    std::ofstream& csv) {
-    const auto a_view = species_a.get_current_view();
-    const auto b_view = species_b.get_current_view();
-    Real total_a{};
-    Real total_b{};
-    Real max_rate{};
-
-    for (std::size_t y = 0; y < species_a.y_extent(); ++y) {
-        for (std::size_t x = 0; x < species_a.x_extent(); ++x) {
-            const Real concentration_a = concentration_at(a_view, x, y);
-            const Real concentration_b = concentration_at(b_view, x, y);
-            const Real local_rate = reaction_rate * concentration_a * concentration_b;
-
-            total_a += concentration_a;
-            total_b += concentration_b;
-            max_rate = std::max(max_rate, local_rate);
-        }
-    }
-
-    csv << std::format(
-        "{},{:.17g},{:.17g},{:.17g}\n",
-        time_step,
-        static_cast<double>(total_a),
-        static_cast<double>(total_b),
-        static_cast<double>(max_rate));
-}
-
-/**
  * @brief Print a concise, flushed run summary.
  */
 void print_summary(const Config& config, Real omega, Real omega_c) {
@@ -506,7 +471,9 @@ int main(int argc, char** argv) {
         if (!diagnostics) {
             throw std::runtime_error("failed to open reaction_diagnostics.csv");
         }
-        diagnostics << "step,total_A,total_B,max_reaction_rate\n";
+        diagnostics
+            << "step,mean_A,mean_B,var_A,var_B,covariance,"
+            << "segregation_intensity,true_reaction_rate,mixed_reaction_rate\n";
 
         print_summary(config, omega, omega_c);
 
@@ -536,7 +503,13 @@ int main(int argc, char** argv) {
 #endif
 
         write_reaction_vtk(fluid, species_a, species_b, 0, config.reaction_rate);
-        log_reaction_diagnostics(species_a, species_b, 0, config.reaction_rate, diagnostics);
+        lbm::log_reactive_diagnostics(
+            diagnostics,
+            0,
+            lbm::compute_reactive_stats<ScalarLattice, Real>(
+                species_a,
+                species_b,
+                config.reaction_rate));
 
         const auto start = std::chrono::high_resolution_clock::now();
         for (int step = 1; step <= config.steps; ++step) {
@@ -596,12 +569,13 @@ int main(int argc, char** argv) {
                     species_b,
                     static_cast<std::size_t>(step),
                     config.reaction_rate);
-                log_reaction_diagnostics(
-                    species_a,
-                    species_b,
+                lbm::log_reactive_diagnostics(
+                    diagnostics,
                     static_cast<std::size_t>(step),
-                    config.reaction_rate,
-                    diagnostics);
+                    lbm::compute_reactive_stats<ScalarLattice, Real>(
+                        species_a,
+                        species_b,
+                        config.reaction_rate));
                 std::cout << "Step " << step << " / " << config.steps << " complete\n" << std::flush;
             }
         }

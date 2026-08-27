@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <fstream>
 #include <format>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -106,7 +107,63 @@ template <IsLatticeModel Lattice, std::floating_point Real>
     }
 }
 
+/**
+ * @brief Reconstruct scalar concentration at one grid point.
+ *
+ * Scalar diagnostics use the same current-buffer gather path as VTK export, but
+ * reduce the populations with `compute_concentration` rather than constructing a
+ * fluid macroscopic state.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for scalar populations.
+ * @param view Read-only scalar population view for the current time level.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @param z Cell z coordinate, ignored for 2D views.
+ * @return Local scalar concentration.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+[[nodiscard]] inline Real concentration_at(
+    typename LatticeMemory<ScalarLattice, Real>::ConstView view,
+    std::size_t x,
+    std::size_t y,
+    std::size_t z) {
+    return compute_concentration<ScalarLattice, Real>(
+        gather_cell_populations<ScalarLattice, Real>(view, x, y, z));
+}
+
 } // namespace detail
+
+/**
+ * @brief Spatial scalar statistics for reactive-mixing diagnostics.
+ *
+ * These quantities are intended for lightweight, high-frequency logging during
+ * DNS runs where full VTK output would be too expensive. The fields are spatial
+ * expectations or rates, not integrated totals.
+ *
+ * @tparam Real Floating-point precision used for diagnostic values. Production
+ * runs should instantiate this with `double` to reduce cancellation in variance
+ * and covariance calculations.
+ */
+template <std::floating_point Real>
+struct ReactiveDiagnostics {
+    /** @brief Spatial mean of species A concentration, `<C_A>`. */
+    Real mean_A{};
+    /** @brief Spatial mean of species B concentration, `<C_B>`. */
+    Real mean_B{};
+    /** @brief Spatial variance of species A concentration. */
+    Real var_A{};
+    /** @brief Spatial variance of species B concentration. */
+    Real var_B{};
+    /** @brief Spatial covariance `<C_A C_B> - <C_A><C_B>`. */
+    Real covariance{};
+    /** @brief Normalized covariance, measuring scalar segregation. */
+    Real segregation_intensity{};
+    /** @brief Actual mean reaction rate `k_react <C_A C_B>`. */
+    Real true_reaction_rate{};
+    /** @brief Ideal perfectly mixed rate `k_react <C_A><C_B>`. */
+    Real mixed_reaction_rate{};
+};
 
 /**
  * @brief Append integral diagnostics for the current population field to a CSV stream.
@@ -174,6 +231,140 @@ inline void log_diagnostics(
         static_cast<double>(total_mass),
         static_cast<double>(total_kinetic_energy),
         static_cast<double>(max_velocity_magnitude));
+}
+
+/**
+ * @brief Compute spatial reactive scalar statistics from current population buffers.
+ *
+ * This host implementation performs a single-pass reduction over the full
+ * periodic domain and accumulates the five moments needed for reactive-mixing
+ * diagnostics: `sum C_A`, `sum C_B`, `sum C_A^2`, `sum C_B^2`, and
+ * `sum C_A C_B`. For a CUDA-resident production path, the same five-component
+ * reduction should be moved to a parallel backend using a tuple-valued
+ * `thrust::transform_reduce` or a custom CUB block/grid reduction to avoid
+ * device-to-host field transfers.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for scalar populations and
+ * diagnostic math. Prefer `double` for production statistics.
+ * @param memA Current population memory for species A.
+ * @param memB Current population memory for species B.
+ * @param k_react Second-order reaction-rate constant in lattice units.
+ * @return Spatial means, variances, covariance, segregation intensity, and
+ * reaction-rate diagnostics.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+[[nodiscard]] inline ReactiveDiagnostics<Real> compute_reactive_stats(
+    const LatticeMemory<ScalarLattice, Real>& memA,
+    const LatticeMemory<ScalarLattice, Real>& memB,
+    Real k_react) {
+    const auto view_a = memA.get_current_view();
+    const auto view_b = memB.get_current_view();
+
+    Real sum_a{};
+    Real sum_b{};
+    Real sum_a2{};
+    Real sum_b2{};
+    Real sum_ab{};
+    std::size_t cell_count{};
+
+    if constexpr (ScalarLattice::D == 2) {
+        const std::size_t y_extent = view_a.extent(1);
+        const std::size_t x_extent = view_a.extent(2);
+        cell_count = x_extent * y_extent;
+
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                const Real concentration_a =
+                    detail::concentration_at<ScalarLattice, Real>(view_a, x, y, 0);
+                const Real concentration_b =
+                    detail::concentration_at<ScalarLattice, Real>(view_b, x, y, 0);
+
+                sum_a += concentration_a;
+                sum_b += concentration_b;
+                sum_a2 += concentration_a * concentration_a;
+                sum_b2 += concentration_b * concentration_b;
+                sum_ab += concentration_a * concentration_b;
+            }
+        }
+    } else {
+        const std::size_t z_extent = view_a.extent(1);
+        const std::size_t y_extent = view_a.extent(2);
+        const std::size_t x_extent = view_a.extent(3);
+        cell_count = x_extent * y_extent * z_extent;
+
+        for (std::size_t z = 0; z < z_extent; ++z) {
+            for (std::size_t y = 0; y < y_extent; ++y) {
+                for (std::size_t x = 0; x < x_extent; ++x) {
+                    const Real concentration_a =
+                        detail::concentration_at<ScalarLattice, Real>(view_a, x, y, z);
+                    const Real concentration_b =
+                        detail::concentration_at<ScalarLattice, Real>(view_b, x, y, z);
+
+                    sum_a += concentration_a;
+                    sum_b += concentration_b;
+                    sum_a2 += concentration_a * concentration_a;
+                    sum_b2 += concentration_b * concentration_b;
+                    sum_ab += concentration_a * concentration_b;
+                }
+            }
+        }
+    }
+
+    const Real inv_cell_count = Real{1} / static_cast<Real>(cell_count);
+    const Real mean_a = sum_a * inv_cell_count;
+    const Real mean_b = sum_b * inv_cell_count;
+    const Real mean_a2 = sum_a2 * inv_cell_count;
+    const Real mean_b2 = sum_b2 * inv_cell_count;
+    const Real mean_ab = sum_ab * inv_cell_count;
+    const Real mixed_reaction_rate = k_react * mean_a * mean_b;
+    const Real covariance = mean_ab - mean_a * mean_b;
+    const Real mean_product = mean_a * mean_b;
+    const Real segregation_intensity =
+        std::abs(mean_product) > std::numeric_limits<Real>::epsilon()
+            ? covariance / mean_product
+            : Real{};
+
+    ReactiveDiagnostics<Real> diagnostics{};
+    diagnostics.mean_A = mean_a;
+    diagnostics.mean_B = mean_b;
+    diagnostics.var_A = mean_a2 - mean_a * mean_a;
+    diagnostics.var_B = mean_b2 - mean_b * mean_b;
+    diagnostics.covariance = covariance;
+    diagnostics.segregation_intensity = segregation_intensity;
+    diagnostics.true_reaction_rate = k_react * mean_ab;
+    diagnostics.mixed_reaction_rate = mixed_reaction_rate;
+    return diagnostics;
+}
+
+/**
+ * @brief Append reactive scalar statistics to a CSV diagnostics stream.
+ *
+ * A suitable CSV header is:
+ * `step,mean_A,mean_B,var_A,var_B,covariance,segregation_intensity,true_reaction_rate,mixed_reaction_rate`.
+ *
+ * @tparam Real Floating-point precision stored in the diagnostics object.
+ * @param csv_stream Open output stream receiving one CSV row.
+ * @param time_step Simulation time step written in the first column.
+ * @param diagnostics Reactive scalar statistics returned by
+ * `compute_reactive_stats`.
+ */
+template <std::floating_point Real>
+inline void log_reactive_diagnostics(
+    std::ofstream& csv_stream,
+    std::size_t time_step,
+    const ReactiveDiagnostics<Real>& diagnostics) {
+    csv_stream << std::format(
+        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}\n",
+        time_step,
+        static_cast<double>(diagnostics.mean_A),
+        static_cast<double>(diagnostics.mean_B),
+        static_cast<double>(diagnostics.var_A),
+        static_cast<double>(diagnostics.var_B),
+        static_cast<double>(diagnostics.covariance),
+        static_cast<double>(diagnostics.segregation_intensity),
+        static_cast<double>(diagnostics.true_reaction_rate),
+        static_cast<double>(diagnostics.mixed_reaction_rate));
 }
 
 /**
