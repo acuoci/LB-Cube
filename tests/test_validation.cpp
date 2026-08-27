@@ -190,6 +190,36 @@ double kinetic_energy_d2q9(const lbm::LatticeMemory<lbm::D2Q9, double>& mem) {
     return static_cast<double>(energy);
 }
 
+/**
+ * @brief Initialize a periodic D2Q9 shear wave varying only in y.
+ *
+ * The velocity field is `u_x = u_0 sin(k y)` and `u_y = 0` at uniform density.
+ * This is the canonical transverse viscous diffusion benchmark for LBM.
+ *
+ * @param mem D2Q9 double-precision memory to initialize.
+ * @param wave_number Fundamental wave number `2 pi / L_y`.
+ * @param initial_velocity Initial transverse velocity amplitude.
+ */
+void initialize_shear_wave_d2q9(
+    lbm::LatticeMemory<lbm::D2Q9, double>& mem,
+    double wave_number,
+    double initial_velocity) {
+    auto view = mem.get_current_view();
+    const std::size_t y_extent = view.extent(1);
+    const std::size_t x_extent = view.extent(2);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        const double phase_y = wave_number * static_cast<double>(y);
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            lbm::MacroState<lbm::D2Q9, double> macro{};
+            macro.density = 1.0;
+            macro.velocity << initial_velocity * std::sin(phase_y), 0.0;
+
+            initialize_equilibrium_cell<lbm::D2Q9, double>(view, x, y, 0, macro);
+        }
+    }
+}
+
 } // namespace
 
 /**
@@ -248,4 +278,52 @@ TEST(LBMValidation, TaylorGreenVortexD2Q9Decay) {
         initial_energy * std::exp(-4.0 * viscosity * wave_number * wave_number * iterations);
 
     EXPECT_NEAR(final_energy, analytical_energy, 1.0e-5);
+}
+
+/**
+ * @brief Validate viscous decay of a transverse D2Q9 shear wave.
+ *
+ * The analytical solution is `u_x(y,t) = u_0 sin(k y) exp(-nu k^2 t)` with
+ * constant density and vanishing `u_y` in a fully periodic domain.
+ */
+TEST(LBMValidation, ShearWaveDecayD2Q9Cpu) {
+    constexpr std::size_t x_extent = 8;
+    constexpr std::size_t y_extent = 64;
+    constexpr int iterations = 500;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+    constexpr double initial_velocity = 0.05;
+    constexpr double relaxation_time = 0.8;
+    constexpr double omega = 1.0 / relaxation_time;
+    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(y_extent);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> mem{x_extent, y_extent};
+    initialize_shear_wave_d2q9(mem, wave_number, initial_velocity);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double>(mem, omega);
+    }
+
+    const auto view = mem.get_current_view();
+    const double decay = std::exp(-viscosity * wave_number * wave_number * iterations);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        const double analytical_ux =
+            initial_velocity * std::sin(wave_number * static_cast<double>(y)) * decay;
+
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            std::array<double, static_cast<std::size_t>(lbm::D2Q9::Q)> local_pops{};
+            for (int i = 0; i < lbm::D2Q9::Q; ++i) {
+                local_pops[static_cast<std::size_t>(i)] = view[static_cast<std::size_t>(i), y, x];
+            }
+
+            const lbm::MacroState<lbm::D2Q9, double> macro =
+                lbm::compute_macro_state<lbm::D2Q9, double>(local_pops);
+
+            EXPECT_NEAR(macro.velocity[0], analytical_ux, 1.0e-4);
+            EXPECT_LT(std::abs(macro.velocity[1]), 1.0e-7);
+            EXPECT_NEAR(macro.density, 1.0, 1.0e-12);
+        }
+    }
 }
