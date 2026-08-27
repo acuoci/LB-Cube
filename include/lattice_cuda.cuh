@@ -92,6 +92,43 @@ __global__ void kernel_scalar_step(
     std::size_t z_extent,
     Real omega_c,
     Real source_term);
+
+/**
+ * @brief CUDA kernel for fused second-order `A + B -> C` scalar consumption.
+ *
+ * The kernel reconstructs fluid velocity once per destination cell, pulls both
+ * reactant species from their upstream scalar neighbors, computes the exact
+ * one-step batch consumption source, and applies it during scalar collision.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_a Device pointer to species A read buffer.
+ * @param next_a Device pointer to species A write buffer.
+ * @param current_b Device pointer to species B read buffer.
+ * @param next_b Device pointer to species B write buffer.
+ * @param current_fluid Device pointer to fluid read buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, or 1 for 2D lattices.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param k_react Second-order reaction-rate constant.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+__global__ void kernel_reaction_AB(
+    const Real* current_a,
+    Real* next_a,
+    const Real* current_b,
+    Real* next_b,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real k_react);
 #endif
 
 /**
@@ -186,6 +223,42 @@ cudaError_t launch_scalar_step_gpu(
     const Real* current_fluid,
     Real omega_c,
     Real source_term = Real{},
+    dim3 block = default_cuda_block_size());
+
+/**
+ * @brief Launch the CUDA fused `A + B -> C` reaction step.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_a Device pointer to species A read buffer.
+ * @param next_a Device pointer to species A write buffer.
+ * @param current_b Device pointer to species B read buffer.
+ * @param next_b Device pointer to species B write buffer.
+ * @param current_fluid Device pointer to fluid read buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, or 1 for 2D lattices.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param k_react Second-order reaction-rate constant.
+ * @param block CUDA block dimensions used for launch tuning.
+ * @return Immediate CUDA error status from validation or kernel launch.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+cudaError_t launch_reaction_AB_gpu(
+    const Real* current_a,
+    Real* next_a,
+    const Real* current_b,
+    Real* next_b,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real k_react,
     dim3 block = default_cuda_block_size());
 
 /**

@@ -103,6 +103,35 @@ set_target_properties(
         CXX_EXTENSIONS NO
 )
 
+add_executable(lbm_reaction_sim src/simulate_reaction.cpp)
+
+target_link_libraries(
+    lbm_reaction_sim
+    PRIVATE
+        lbm::core
+)
+
+if(LB_CUBE_ENABLE_CUDA)
+    target_link_libraries(lbm_reaction_sim PRIVATE lbm::cuda)
+    target_compile_definitions(lbm_reaction_sim PRIVATE LB_CUBE_ENABLE_CUDA=1)
+else()
+    target_compile_definitions(lbm_reaction_sim PRIVATE LB_CUBE_ENABLE_CUDA=0)
+endif()
+
+target_compile_features(
+    lbm_reaction_sim
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_reaction_sim
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
 enable_testing()
 
 add_executable(lbm_validation_tests tests/test_validation.cpp)

@@ -14,6 +14,8 @@
 #include <array>
 #include <concepts>
 #include <cstddef>
+#include <cmath>
+#include <limits>
 
 #include "lattice_memory.hpp"
 #include "lattice_traits.hpp"
@@ -222,6 +224,55 @@ __host__ __device__ inline void collide_scalar_bgk(
         scalar_pops[index] += omega_c * (equilibrium - scalar_pops[index]) +
                               weight * source_term;
     }
+}
+
+/**
+ * @brief Compute the exact local source increment for `A + B -> C` over one step.
+ *
+ * The scalar collision accepts a source increment integrated over one lattice
+ * time step. For the second-order batch reaction
+ * `dC_A/dt = dC_B/dt = -k C_A C_B`, the concentration difference
+ * `C_B - C_A` is invariant. This helper uses that closed-form solution to
+ * avoid the time-discretization error of an explicit Euler source term while
+ * preserving the fused no-extra-storage reaction update.
+ *
+ * @tparam Real Floating-point precision used for concentrations and rate.
+ * @param concentration_a Local concentration of reactant A before reaction.
+ * @param concentration_b Local concentration of reactant B before reaction.
+ * @param k_react Second-order reaction-rate constant in lattice units.
+ * @return Negative concentration increment to apply to both reactants.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline Real compute_reaction_ab_source(
+    Real concentration_a,
+    Real concentration_b,
+    Real k_react) {
+    const Real abs_a = concentration_a < Real{} ? -concentration_a : concentration_a;
+    const Real abs_b = concentration_b < Real{} ? -concentration_b : concentration_b;
+    const Real difference = concentration_b - concentration_a;
+    const Real abs_difference = difference < Real{} ? -difference : difference;
+    const Real tolerance =
+        static_cast<Real>(64.0) * std::numeric_limits<Real>::epsilon() *
+        (static_cast<Real>(1.0) + abs_a + abs_b);
+
+    Real concentration_a_after{};
+    if (abs_difference <= tolerance) {
+        concentration_a_after =
+            concentration_a /
+            (static_cast<Real>(1.0) + k_react * concentration_a);
+    } else {
+#if defined(__CUDA_ARCH__)
+        const Real attenuation = exp(-k_react * difference);
+#else
+        using std::exp;
+        const Real attenuation = exp(-k_react * difference);
+#endif
+        concentration_a_after =
+            concentration_a * difference * attenuation /
+            (concentration_b - concentration_a * attenuation);
+    }
+
+    return concentration_a_after - concentration_a;
 }
 
 } // namespace lbm

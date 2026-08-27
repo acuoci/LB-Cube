@@ -221,6 +221,171 @@ void initialize_shear_wave_d2q9(
 }
 
 /**
+ * @brief Initialize a uniform D2Q9 fluid field used to advect a passive scalar.
+ *
+ * @param mem Fluid population memory to initialize.
+ * @param velocity_x Uniform x velocity.
+ * @param velocity_y Uniform y velocity.
+ */
+void initialize_uniform_fluid_d2q9(
+    lbm::LatticeMemory<lbm::D2Q9, double>& mem,
+    double velocity_x,
+    double velocity_y) {
+    auto view = mem.get_current_view();
+    const std::size_t y_extent = view.extent(1);
+    const std::size_t x_extent = view.extent(2);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            lbm::MacroState<lbm::D2Q9, double> macro{};
+            macro.density = 1.0;
+            macro.velocity << velocity_x, velocity_y;
+
+            initialize_equilibrium_cell<lbm::D2Q9, double>(view, x, y, 0, macro);
+        }
+    }
+}
+
+/**
+ * @brief Initialize D2Q5 scalar populations from a sinusoidal concentration field.
+ *
+ * @param mem Scalar population memory to initialize.
+ * @param wave_number Fundamental x wave number.
+ * @param base_concentration Mean scalar concentration.
+ * @param amplitude Scalar-wave amplitude.
+ * @param fluid_velocity Uniform advecting velocity used in scalar equilibrium.
+ */
+void initialize_scalar_sine_d2q5(
+    lbm::LatticeMemory<lbm::D2Q5, double>& mem,
+    double wave_number,
+    double base_concentration,
+    double amplitude,
+    const Eigen::Matrix<double, lbm::D2Q5::D, 1>& fluid_velocity) {
+    auto view = mem.get_current_view();
+    const std::size_t y_extent = view.extent(1);
+    const std::size_t x_extent = view.extent(2);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            const double concentration =
+                base_concentration + amplitude *
+                std::sin(wave_number * static_cast<double>(x));
+
+            for (int i = 0; i < lbm::D2Q5::Q; ++i) {
+                view[static_cast<std::size_t>(i), y, x] =
+                    lbm::compute_scalar_equilibrium<lbm::D2Q5, double>(
+                        i,
+                        concentration,
+                        fluid_velocity);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Reconstruct concentration from the current D2Q5 scalar populations.
+ *
+ * @param view Read-only scalar population view.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @return Local scalar concentration.
+ */
+double concentration_d2q5(
+    typename lbm::LatticeMemory<lbm::D2Q5, double>::ConstView view,
+    std::size_t x,
+    std::size_t y) {
+    std::array<double, static_cast<std::size_t>(lbm::D2Q5::Q)> scalar_pops{};
+    for (int i = 0; i < lbm::D2Q5::Q; ++i) {
+        scalar_pops[static_cast<std::size_t>(i)] =
+            view[static_cast<std::size_t>(i), y, x];
+    }
+
+    return lbm::compute_concentration<lbm::D2Q5, double>(scalar_pops);
+}
+
+/**
+ * @brief Initialize D2Q5 scalar populations from a uniform concentration.
+ *
+ * @param mem Scalar population memory to initialize.
+ * @param concentration Uniform concentration over the whole domain.
+ * @param fluid_velocity Uniform advecting velocity used in scalar equilibrium.
+ */
+void initialize_uniform_scalar_d2q5(
+    lbm::LatticeMemory<lbm::D2Q5, double>& mem,
+    double concentration,
+    const Eigen::Matrix<double, lbm::D2Q5::D, 1>& fluid_velocity) {
+    auto view = mem.get_current_view();
+    const std::size_t y_extent = view.extent(1);
+    const std::size_t x_extent = view.extent(2);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            for (int i = 0; i < lbm::D2Q5::Q; ++i) {
+                view[static_cast<std::size_t>(i), y, x] =
+                    lbm::compute_scalar_equilibrium<lbm::D2Q5, double>(
+                        i,
+                        concentration,
+                        fluid_velocity);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Initialize D2Q5 scalar populations from a left/right concentration step.
+ *
+ * @param mem Scalar population memory to initialize.
+ * @param left_concentration Concentration assigned for `x < split_x`.
+ * @param right_concentration Concentration assigned for `x >= split_x`.
+ * @param split_x Interface location separating the two plateaus.
+ * @param fluid_velocity Uniform advecting velocity used in scalar equilibrium.
+ */
+void initialize_split_scalar_d2q5(
+    lbm::LatticeMemory<lbm::D2Q5, double>& mem,
+    double left_concentration,
+    double right_concentration,
+    std::size_t split_x,
+    const Eigen::Matrix<double, lbm::D2Q5::D, 1>& fluid_velocity) {
+    auto view = mem.get_current_view();
+    const std::size_t y_extent = view.extent(1);
+    const std::size_t x_extent = view.extent(2);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            const double concentration = x < split_x ? left_concentration : right_concentration;
+            for (int i = 0; i < lbm::D2Q5::Q; ++i) {
+                view[static_cast<std::size_t>(i), y, x] =
+                    lbm::compute_scalar_equilibrium<lbm::D2Q5, double>(
+                        i,
+                        concentration,
+                        fluid_velocity);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Sum D2Q5 concentration over the current scalar field.
+ *
+ * @param mem Scalar memory whose current buffer is inspected.
+ * @return Total concentration over the domain.
+ */
+double total_concentration_d2q5(const lbm::LatticeMemory<lbm::D2Q5, double>& mem) {
+    const auto view = mem.get_current_view();
+    const std::size_t y_extent = view.extent(1);
+    const std::size_t x_extent = view.extent(2);
+
+    long double total = 0.0L;
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            total += static_cast<long double>(concentration_d2q5(view, x, y));
+        }
+    }
+
+    return static_cast<double>(total);
+}
+
+/**
  * @brief Run a diffusive-scaling Taylor-Green vortex and return relative L2 error.
  *
  * The physical state is kept fixed while the lattice resolution changes. The
@@ -399,6 +564,184 @@ TEST(LBMValidation, ShearWaveDecayD2Q9Cpu) {
             EXPECT_NEAR(macro.velocity[0], analytical_ux, 1.0e-4);
             EXPECT_LT(std::abs(macro.velocity[1]), 1.0e-7);
             EXPECT_NEAR(macro.density, 1.0, 1.0e-12);
+        }
+    }
+}
+
+/**
+ * @brief Validate passive scalar advection and diffusion by a uniform D2Q9 flow.
+ *
+ * A sinusoidal D2Q5 scalar wave is transported by a uniform x velocity and
+ * damped by scalar diffusivity `D = c_s^2 (tau_c - 0.5)`.
+ */
+TEST(LBMValidation, PassiveScalarAdvectionDiffusion) {
+    constexpr std::size_t x_extent = 64;
+    constexpr std::size_t y_extent = 8;
+    constexpr int iterations = 200;
+    constexpr double fluid_velocity_x = 0.05;
+    constexpr double fluid_velocity_y = 0.0;
+    constexpr double scalar_relaxation_time = 0.8;
+    constexpr double omega_c = 1.0 / scalar_relaxation_time;
+    constexpr double scalar_diffusivity =
+        lbm::D2Q5::cs2 * (scalar_relaxation_time - 0.5);
+    constexpr double base_concentration = 1.0;
+    constexpr double concentration_amplitude = 0.1;
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(x_extent);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> fluid_mem{x_extent, y_extent};
+    lbm::LatticeMemory<lbm::D2Q5, double> scalar_mem{x_extent, y_extent};
+
+    initialize_uniform_fluid_d2q9(fluid_mem, fluid_velocity_x, fluid_velocity_y);
+    const Eigen::Matrix<double, lbm::D2Q5::D, 1> fluid_velocity{
+        fluid_velocity_x,
+        fluid_velocity_y};
+    initialize_scalar_sine_d2q5(
+        scalar_mem,
+        wave_number,
+        base_concentration,
+        concentration_amplitude,
+        fluid_velocity);
+
+    constexpr double fluid_omega = 1.0;
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double>(fluid_mem, fluid_omega);
+        lbm::step_scalar_cpu<lbm::D2Q9, lbm::D2Q5, double>(
+            scalar_mem,
+            fluid_mem,
+            omega_c,
+            0.0);
+    }
+
+    const auto scalar_view = scalar_mem.get_current_view();
+    const double decay =
+        std::exp(-scalar_diffusivity * wave_number * wave_number * iterations);
+    const double displacement = fluid_velocity_x * static_cast<double>(iterations);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            const double concentration = concentration_d2q5(scalar_view, x, y);
+            const double analytical_concentration =
+                base_concentration +
+                concentration_amplitude *
+                    std::sin(wave_number * (static_cast<double>(x) - displacement)) *
+                    decay;
+
+            EXPECT_NEAR(concentration, analytical_concentration, 1.0e-4);
+        }
+    }
+}
+
+/**
+ * @brief Validate fused A+B batch kinetics for initially equal reactants.
+ *
+ * With uniform concentrations and a resting fluid, streaming and diffusion
+ * preserve spatial uniformity, so the fused ADR loop reduces to the analytical
+ * second-order batch reactor `C(t) = C0 / (1 + C0 k t)`.
+ */
+TEST(LBMValidation, ReactionKineticsBatch) {
+    constexpr std::size_t x_extent = 16;
+    constexpr std::size_t y_extent = 16;
+    constexpr int iterations = 200;
+    constexpr double initial_concentration = 1.0;
+    constexpr double reaction_rate = 0.005;
+    constexpr double scalar_relaxation_time = 0.8;
+    constexpr double omega_c = 1.0 / scalar_relaxation_time;
+
+    lbm::LatticeMemory<lbm::D2Q9, double> fluid_mem{x_extent, y_extent};
+    lbm::LatticeMemory<lbm::D2Q5, double> species_a_mem{x_extent, y_extent};
+    lbm::LatticeMemory<lbm::D2Q5, double> species_b_mem{x_extent, y_extent};
+
+    initialize_uniform_fluid_d2q9(fluid_mem, 0.0, 0.0);
+    const Eigen::Matrix<double, lbm::D2Q5::D, 1> fluid_velocity{0.0, 0.0};
+    initialize_uniform_scalar_d2q5(
+        species_a_mem,
+        initial_concentration,
+        fluid_velocity);
+    initialize_uniform_scalar_d2q5(
+        species_b_mem,
+        initial_concentration,
+        fluid_velocity);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_reaction_AB<lbm::D2Q9, lbm::D2Q5, double>(
+            fluid_mem,
+            species_a_mem,
+            species_b_mem,
+            omega_c,
+            reaction_rate);
+    }
+
+    const auto species_a_view = species_a_mem.get_current_view();
+    const auto species_b_view = species_b_mem.get_current_view();
+    const double analytical_concentration =
+        initial_concentration /
+        (1.0 + initial_concentration * reaction_rate * static_cast<double>(iterations));
+
+    EXPECT_NEAR(
+        concentration_d2q5(species_a_view, 0, 0),
+        analytical_concentration,
+        1.0e-4);
+    EXPECT_NEAR(
+        concentration_d2q5(species_b_view, 0, 0),
+        analytical_concentration,
+        1.0e-4);
+}
+
+/**
+ * @brief Verify segregated reactants diffuse into an interface and consume symmetrically.
+ *
+ * This is a compact smoke test for the practical reactive-mixing setup: A starts
+ * on the left half, B starts on the right half, and the fused ADR loop should
+ * consume both species by the same amount while keeping concentrations finite
+ * and non-negative.
+ */
+TEST(LBMValidation, SegregatedReactiveMixingD2Q5Cpu) {
+    constexpr std::size_t x_extent = 32;
+    constexpr std::size_t y_extent = 32;
+    constexpr int iterations = 20;
+    constexpr double reaction_rate = 0.05;
+    constexpr double scalar_relaxation_time = 0.8;
+    constexpr double omega_c = 1.0 / scalar_relaxation_time;
+
+    lbm::LatticeMemory<lbm::D2Q9, double> fluid_mem{x_extent, y_extent};
+    lbm::LatticeMemory<lbm::D2Q5, double> species_a_mem{x_extent, y_extent};
+    lbm::LatticeMemory<lbm::D2Q5, double> species_b_mem{x_extent, y_extent};
+
+    initialize_uniform_fluid_d2q9(fluid_mem, 0.0, 0.0);
+    const Eigen::Matrix<double, lbm::D2Q5::D, 1> fluid_velocity{0.0, 0.0};
+    initialize_split_scalar_d2q5(species_a_mem, 1.0, 0.0, x_extent / 2, fluid_velocity);
+    initialize_split_scalar_d2q5(species_b_mem, 0.0, 1.0, x_extent / 2, fluid_velocity);
+
+    const double initial_mass_a = total_concentration_d2q5(species_a_mem);
+    const double initial_mass_b = total_concentration_d2q5(species_b_mem);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_reaction_AB<lbm::D2Q9, lbm::D2Q5, double>(
+            fluid_mem,
+            species_a_mem,
+            species_b_mem,
+            omega_c,
+            reaction_rate);
+    }
+
+    const double final_mass_a = total_concentration_d2q5(species_a_mem);
+    const double final_mass_b = total_concentration_d2q5(species_b_mem);
+    EXPECT_LT(final_mass_a, initial_mass_a);
+    EXPECT_LT(final_mass_b, initial_mass_b);
+    EXPECT_NEAR(final_mass_a, final_mass_b, 1.0e-10);
+
+    const auto species_a_view = species_a_mem.get_current_view();
+    const auto species_b_view = species_b_mem.get_current_view();
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            const double concentration_a = concentration_d2q5(species_a_view, x, y);
+            const double concentration_b = concentration_d2q5(species_b_view, x, y);
+
+            EXPECT_TRUE(std::isfinite(concentration_a));
+            EXPECT_TRUE(std::isfinite(concentration_b));
+            EXPECT_GE(concentration_a, -1.0e-12);
+            EXPECT_GE(concentration_b, -1.0e-12);
         }
     }
 }

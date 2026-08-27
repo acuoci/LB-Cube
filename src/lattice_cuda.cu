@@ -263,6 +263,136 @@ __global__ void kernel_scalar_step(
 }
 
 /**
+ * @brief CUDA kernel for fused `A + B -> C` scalar reaction transport.
+ *
+ * Both reactants are advanced in a single thread-local operation so the reaction
+ * source is computed once and no source arrays are allocated.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_a Device pointer to species A current SoA buffer.
+ * @param next_a Device pointer to species A next SoA buffer.
+ * @param current_b Device pointer to species B current SoA buffer.
+ * @param next_b Device pointer to species B next SoA buffer.
+ * @param current_fluid Device pointer to fluid current SoA buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param k_react Second-order reaction-rate constant.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+__global__ void kernel_reaction_AB(
+    const Real* current_a,
+    Real* next_a,
+    const Real* current_b,
+    Real* next_b,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real k_react) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    const std::size_t x = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    const std::size_t y = static_cast<std::size_t>(blockIdx.y * blockDim.y + threadIdx.y);
+    const std::size_t z = static_cast<std::size_t>(blockIdx.z * blockDim.z + threadIdx.z);
+
+    if (x >= x_extent || y >= y_extent || z >= z_extent) {
+        return;
+    }
+
+    std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> a_pops{};
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> b_pops{};
+
+    if constexpr (ScalarLattice::D == 2) {
+        for (int i = 0; i < FluidLattice::Q; ++i) {
+            fluid_pops[static_cast<std::size_t>(i)] =
+                current_fluid[detail::population_index(
+                    i, x, y, 0, x_extent, y_extent, z_extent)];
+        }
+        const MacroState<FluidLattice, Real> fluid_macro =
+            compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+            const int cx = ScalarLattice::c[direction_offset];
+            const int cy = ScalarLattice::c[direction_offset + 1];
+            const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+            const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+            const auto q = static_cast<std::size_t>(i);
+
+            a_pops[q] = current_a[detail::population_index(
+                i, nx, ny, 0, x_extent, y_extent, z_extent)];
+            b_pops[q] = current_b[detail::population_index(
+                i, nx, ny, 0, x_extent, y_extent, z_extent)];
+        }
+
+        const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
+        const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+        const Real reaction_source =
+            compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
+
+        collide_scalar_bgk<ScalarLattice, Real>(
+            a_pops, fluid_macro.velocity, omega_c, reaction_source);
+        collide_scalar_bgk<ScalarLattice, Real>(
+            b_pops, fluid_macro.velocity, omega_c, reaction_source);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            const auto q = static_cast<std::size_t>(i);
+            next_a[detail::population_index(i, x, y, 0, x_extent, y_extent, z_extent)] = a_pops[q];
+            next_b[detail::population_index(i, x, y, 0, x_extent, y_extent, z_extent)] = b_pops[q];
+        }
+    } else {
+        for (int i = 0; i < FluidLattice::Q; ++i) {
+            fluid_pops[static_cast<std::size_t>(i)] =
+                current_fluid[detail::population_index(
+                    i, x, y, z, x_extent, y_extent, z_extent)];
+        }
+        const MacroState<FluidLattice, Real> fluid_macro =
+            compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+            const int cx = ScalarLattice::c[direction_offset];
+            const int cy = ScalarLattice::c[direction_offset + 1];
+            const int cz = ScalarLattice::c[direction_offset + 2];
+            const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+            const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+            const std::size_t nz = detail::periodic_pull_index(z, cz, z_extent);
+            const auto q = static_cast<std::size_t>(i);
+
+            a_pops[q] = current_a[detail::population_index(
+                i, nx, ny, nz, x_extent, y_extent, z_extent)];
+            b_pops[q] = current_b[detail::population_index(
+                i, nx, ny, nz, x_extent, y_extent, z_extent)];
+        }
+
+        const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
+        const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+        const Real reaction_source =
+            compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
+
+        collide_scalar_bgk<ScalarLattice, Real>(
+            a_pops, fluid_macro.velocity, omega_c, reaction_source);
+        collide_scalar_bgk<ScalarLattice, Real>(
+            b_pops, fluid_macro.velocity, omega_c, reaction_source);
+
+        for (int i = 0; i < ScalarLattice::Q; ++i) {
+            const auto q = static_cast<std::size_t>(i);
+            next_a[detail::population_index(i, x, y, z, x_extent, y_extent, z_extent)] = a_pops[q];
+            next_b[detail::population_index(i, x, y, z, x_extent, y_extent, z_extent)] = b_pops[q];
+        }
+    }
+}
+
+/**
  * @brief Validate launch inputs and enqueue the CUDA step kernel.
  *
  * The wrapper leaves synchronization to the caller so timing code can measure
@@ -387,6 +517,83 @@ cudaError_t launch_scalar_step_gpu(
         z_extent,
         omega_c,
         source_term);
+
+    return cudaGetLastError();
+}
+
+/**
+ * @brief Validate inputs and enqueue the CUDA fused reaction kernel.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param current_a Device pointer to species A current SoA buffer.
+ * @param next_a Device pointer to species A next SoA buffer.
+ * @param current_b Device pointer to species B current SoA buffer.
+ * @param next_b Device pointer to species B next SoA buffer.
+ * @param current_fluid Device pointer to fluid current SoA buffer.
+ * @param x_extent Number of nodes in x.
+ * @param y_extent Number of nodes in y.
+ * @param z_extent Number of nodes in z, overwritten to 1 for 2D lattices.
+ * @param omega_c Scalar BGK relaxation frequency.
+ * @param k_react Second-order reaction-rate constant.
+ * @param block CUDA block dimensions.
+ * @return CUDA validation or launch status.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+cudaError_t launch_reaction_AB_gpu(
+    const Real* current_a,
+    Real* next_a,
+    const Real* current_b,
+    Real* next_b,
+    const Real* current_fluid,
+    std::size_t x_extent,
+    std::size_t y_extent,
+    std::size_t z_extent,
+    Real omega_c,
+    Real k_react,
+    dim3 block) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    if (current_a == nullptr || next_a == nullptr ||
+        current_b == nullptr || next_b == nullptr ||
+        current_fluid == nullptr) {
+        return cudaErrorInvalidDevicePointer;
+    }
+
+    if (block.x == 0 || block.y == 0 || block.z == 0) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    if constexpr (ScalarLattice::D == 2) {
+        z_extent = 1;
+        block.z = 1;
+    }
+
+    if (x_extent == 0 || y_extent == 0 || z_extent == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    const dim3 grid{
+        static_cast<unsigned int>((x_extent + block.x - 1) / block.x),
+        static_cast<unsigned int>((y_extent + block.y - 1) / block.y),
+        static_cast<unsigned int>((z_extent + block.z - 1) / block.z)
+    };
+
+    kernel_reaction_AB<FluidLattice, ScalarLattice, Real><<<grid, block>>>(
+        current_a,
+        next_a,
+        current_b,
+        next_b,
+        current_fluid,
+        x_extent,
+        y_extent,
+        z_extent,
+        omega_c,
+        k_react);
 
     return cudaGetLastError();
 }
@@ -595,5 +802,43 @@ template cudaError_t launch_scalar_step_gpu<D3Q27, D3Q7, double>(
     double,
     double,
     dim3);
+
+template __global__ void kernel_reaction_AB<D2Q9, D2Q5, float>(
+    const float*, float*, const float*, float*, const float*,
+    std::size_t, std::size_t, std::size_t, float, float);
+template __global__ void kernel_reaction_AB<D2Q9, D2Q5, double>(
+    const double*, double*, const double*, double*, const double*,
+    std::size_t, std::size_t, std::size_t, double, double);
+template __global__ void kernel_reaction_AB<D3Q19, D3Q7, float>(
+    const float*, float*, const float*, float*, const float*,
+    std::size_t, std::size_t, std::size_t, float, float);
+template __global__ void kernel_reaction_AB<D3Q19, D3Q7, double>(
+    const double*, double*, const double*, double*, const double*,
+    std::size_t, std::size_t, std::size_t, double, double);
+template __global__ void kernel_reaction_AB<D3Q27, D3Q7, float>(
+    const float*, float*, const float*, float*, const float*,
+    std::size_t, std::size_t, std::size_t, float, float);
+template __global__ void kernel_reaction_AB<D3Q27, D3Q7, double>(
+    const double*, double*, const double*, double*, const double*,
+    std::size_t, std::size_t, std::size_t, double, double);
+
+template cudaError_t launch_reaction_AB_gpu<D2Q9, D2Q5, float>(
+    const float*, float*, const float*, float*, const float*,
+    std::size_t, std::size_t, std::size_t, float, float, dim3);
+template cudaError_t launch_reaction_AB_gpu<D2Q9, D2Q5, double>(
+    const double*, double*, const double*, double*, const double*,
+    std::size_t, std::size_t, std::size_t, double, double, dim3);
+template cudaError_t launch_reaction_AB_gpu<D3Q19, D3Q7, float>(
+    const float*, float*, const float*, float*, const float*,
+    std::size_t, std::size_t, std::size_t, float, float, dim3);
+template cudaError_t launch_reaction_AB_gpu<D3Q19, D3Q7, double>(
+    const double*, double*, const double*, double*, const double*,
+    std::size_t, std::size_t, std::size_t, double, double, dim3);
+template cudaError_t launch_reaction_AB_gpu<D3Q27, D3Q7, float>(
+    const float*, float*, const float*, float*, const float*,
+    std::size_t, std::size_t, std::size_t, float, float, dim3);
+template cudaError_t launch_reaction_AB_gpu<D3Q27, D3Q7, double>(
+    const double*, double*, const double*, double*, const double*,
+    std::size_t, std::size_t, std::size_t, double, double, dim3);
 
 } // namespace lbm

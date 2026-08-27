@@ -249,4 +249,141 @@ inline void step_scalar_cpu(
     scalar_mem.swap_buffers();
 }
 
+/**
+ * @brief Advance two reacting scalar species with fused advection-diffusion-reaction.
+ *
+ * The reaction model is the isothermal second-order process `A + B -> C`. The
+ * local source increment is evaluated from the closed-form one-step batch
+ * solution, then applied inside the scalar BGK collision without allocating
+ * source-term fields. Both scalar memories are swapped after the full domain
+ * update.
+ *
+ * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision shared by fluid and species populations.
+ * @param fluid_mem Read-only fluid populations used to reconstruct advecting velocity.
+ * @param species_a_mem Scalar population storage for reactant A.
+ * @param species_b_mem Scalar population storage for reactant B.
+ * @param omega_c Scalar BGK relaxation frequency for both reactants.
+ * @param k_react Second-order reaction-rate constant.
+ */
+template <
+    IsLatticeModel FluidLattice,
+    IsLatticeModel ScalarLattice,
+    std::floating_point Real>
+inline void step_reaction_AB(
+    const LatticeMemory<FluidLattice, Real>& fluid_mem,
+    LatticeMemory<ScalarLattice, Real>& species_a_mem,
+    LatticeMemory<ScalarLattice, Real>& species_b_mem,
+    Real omega_c,
+    Real k_react) {
+    static_assert(FluidLattice::D == ScalarLattice::D);
+
+    auto fluid_current = fluid_mem.get_current_view();
+    auto a_current = species_a_mem.get_current_view();
+    auto a_next = species_a_mem.get_next_view();
+    auto b_current = species_b_mem.get_current_view();
+    auto b_next = species_b_mem.get_next_view();
+
+    if constexpr (ScalarLattice::D == 2) {
+        const std::size_t y_extent = a_current.extent(1);
+        const std::size_t x_extent = a_current.extent(2);
+
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
+                for (int i = 0; i < FluidLattice::Q; ++i) {
+                    fluid_pops[static_cast<std::size_t>(i)] =
+                        fluid_current[static_cast<std::size_t>(i), y, x];
+                }
+                const MacroState<FluidLattice, Real> fluid_macro =
+                    compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+                std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> a_pops{};
+                std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> b_pops{};
+                for (int i = 0; i < ScalarLattice::Q; ++i) {
+                    const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+                    const int cx = ScalarLattice::c[direction_offset];
+                    const int cy = ScalarLattice::c[direction_offset + 1];
+                    const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+                    const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+                    const auto q = static_cast<std::size_t>(i);
+
+                    a_pops[q] = a_current[q, ny, nx];
+                    b_pops[q] = b_current[q, ny, nx];
+                }
+
+                const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
+                const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+                const Real reaction_source =
+                    compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
+
+                collide_scalar_bgk<ScalarLattice, Real>(
+                    a_pops, fluid_macro.velocity, omega_c, reaction_source);
+                collide_scalar_bgk<ScalarLattice, Real>(
+                    b_pops, fluid_macro.velocity, omega_c, reaction_source);
+
+                for (int i = 0; i < ScalarLattice::Q; ++i) {
+                    const auto q = static_cast<std::size_t>(i);
+                    a_next[q, y, x] = a_pops[q];
+                    b_next[q, y, x] = b_pops[q];
+                }
+            }
+        }
+    } else {
+        const std::size_t z_extent = a_current.extent(1);
+        const std::size_t y_extent = a_current.extent(2);
+        const std::size_t x_extent = a_current.extent(3);
+
+        for (std::size_t z = 0; z < z_extent; ++z) {
+            for (std::size_t y = 0; y < y_extent; ++y) {
+                for (std::size_t x = 0; x < x_extent; ++x) {
+                    std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
+                    for (int i = 0; i < FluidLattice::Q; ++i) {
+                        fluid_pops[static_cast<std::size_t>(i)] =
+                            fluid_current[static_cast<std::size_t>(i), z, y, x];
+                    }
+                    const MacroState<FluidLattice, Real> fluid_macro =
+                        compute_macro_state<FluidLattice, Real>(fluid_pops);
+
+                    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> a_pops{};
+                    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> b_pops{};
+                    for (int i = 0; i < ScalarLattice::Q; ++i) {
+                        const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
+                        const int cx = ScalarLattice::c[direction_offset];
+                        const int cy = ScalarLattice::c[direction_offset + 1];
+                        const int cz = ScalarLattice::c[direction_offset + 2];
+                        const std::size_t nx = detail::periodic_pull_index(x, cx, x_extent);
+                        const std::size_t ny = detail::periodic_pull_index(y, cy, y_extent);
+                        const std::size_t nz = detail::periodic_pull_index(z, cz, z_extent);
+                        const auto q = static_cast<std::size_t>(i);
+
+                        a_pops[q] = a_current[q, nz, ny, nx];
+                        b_pops[q] = b_current[q, nz, ny, nx];
+                    }
+
+                    const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
+                    const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+                    const Real reaction_source =
+                        compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
+
+                    collide_scalar_bgk<ScalarLattice, Real>(
+                        a_pops, fluid_macro.velocity, omega_c, reaction_source);
+                    collide_scalar_bgk<ScalarLattice, Real>(
+                        b_pops, fluid_macro.velocity, omega_c, reaction_source);
+
+                    for (int i = 0; i < ScalarLattice::Q; ++i) {
+                        const auto q = static_cast<std::size_t>(i);
+                        a_next[q, z, y, x] = a_pops[q];
+                        b_next[q, z, y, x] = b_pops[q];
+                    }
+                }
+            }
+        }
+    }
+
+    species_a_mem.swap_buffers();
+    species_b_mem.swap_buffers();
+}
+
 } // namespace lbm
