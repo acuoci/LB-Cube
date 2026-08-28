@@ -19,6 +19,7 @@
 
 #include "lattice_core.hpp"
 #include "lattice_memory.hpp"
+#include "lattice_mrt.hpp"
 #include "lattice_physics.hpp"
 #include "lattice_traits.hpp"
 
@@ -386,6 +387,87 @@ double total_concentration_d2q5(const lbm::LatticeMemory<lbm::D2Q5, double>& mem
 }
 
 /**
+ * @brief Run the D2Q9 Taylor-Green kinetic-energy decay validation.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_taylor_green_test() {
+    constexpr std::size_t domain_size = 64;
+    constexpr int iterations = 1000;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+    constexpr double initial_velocity = 0.01;
+    constexpr double relaxation_time = 0.8;
+    constexpr double omega = 1.0 / relaxation_time;
+    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(domain_size);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> mem{domain_size, domain_size};
+    initialize_taylor_green_d2q9(mem, wave_number, initial_velocity, sound_speed_squared);
+
+    const double initial_energy = kinetic_energy_d2q9(mem);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double, CT>(mem, omega);
+    }
+
+    const double final_energy = kinetic_energy_d2q9(mem);
+    const double analytical_energy =
+        initial_energy * std::exp(-4.0 * viscosity * wave_number * wave_number * iterations);
+
+    EXPECT_NEAR(final_energy, analytical_energy, 1.0e-5);
+}
+
+/**
+ * @brief Run the transverse shear-wave decay validation.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_shear_wave_decay_test() {
+    constexpr std::size_t x_extent = 8;
+    constexpr std::size_t y_extent = 64;
+    constexpr int iterations = 500;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+    constexpr double initial_velocity = 0.05;
+    constexpr double relaxation_time = 0.8;
+    constexpr double omega = 1.0 / relaxation_time;
+    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(y_extent);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> mem{x_extent, y_extent};
+    initialize_shear_wave_d2q9(mem, wave_number, initial_velocity);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double, CT>(mem, omega);
+    }
+
+    const auto view = mem.get_current_view();
+    const double decay = std::exp(-viscosity * wave_number * wave_number * iterations);
+
+    for (std::size_t y = 0; y < y_extent; ++y) {
+        const double analytical_ux =
+            initial_velocity * std::sin(wave_number * static_cast<double>(y)) * decay;
+
+        for (std::size_t x = 0; x < x_extent; ++x) {
+            std::array<double, static_cast<std::size_t>(lbm::D2Q9::Q)> local_pops{};
+            for (int i = 0; i < lbm::D2Q9::Q; ++i) {
+                local_pops[static_cast<std::size_t>(i)] = view[static_cast<std::size_t>(i), y, x];
+            }
+
+            const lbm::MacroState<lbm::D2Q9, double> macro =
+                lbm::compute_macro_state<lbm::D2Q9, double>(local_pops);
+
+            EXPECT_NEAR(macro.velocity[0], analytical_ux, 1.0e-4);
+            EXPECT_LT(std::abs(macro.velocity[1]), 1.0e-7);
+            EXPECT_NEAR(macro.density, 1.0, 1.0e-12);
+        }
+    }
+}
+
+/**
  * @brief Run a diffusive-scaling Taylor-Green vortex and return relative L2 error.
  *
  * The physical state is kept fixed while the lattice resolution changes. The
@@ -488,83 +570,48 @@ TEST(LBMValidation, MassConservationD3Q19Cpu) {
 }
 
 /**
- * @brief Validate D2Q9 Taylor-Green kinetic-energy decay against theory.
- *
- * The analytical decay is `K(t) = K(0) exp(-4 nu k^2 t)` with
- * `nu = c_s^2 (tau - 0.5)`.
+ * @brief Validate BGK viscous decay of a transverse D2Q9 shear wave.
  */
-TEST(LBMValidation, TaylorGreenVortexD2Q9Decay) {
-    constexpr std::size_t domain_size = 64;
-    constexpr int iterations = 1000;
-    constexpr double sound_speed_squared = 1.0 / 3.0;
-    constexpr double initial_velocity = 0.01;
-    constexpr double relaxation_time = 0.8;
-    constexpr double omega = 1.0 / relaxation_time;
-    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
-    constexpr double wave_number =
-        2.0 * std::numbers::pi_v<double> / static_cast<double>(domain_size);
-
-    lbm::LatticeMemory<lbm::D2Q9, double> mem{domain_size, domain_size};
-    initialize_taylor_green_d2q9(mem, wave_number, initial_velocity, sound_speed_squared);
-
-    const double initial_energy = kinetic_energy_d2q9(mem);
-
-    for (int step = 0; step < iterations; ++step) {
-        lbm::step_cpu<lbm::D2Q9, double>(mem, omega);
-    }
-
-    const double final_energy = kinetic_energy_d2q9(mem);
-    const double analytical_energy =
-        initial_energy * std::exp(-4.0 * viscosity * wave_number * wave_number * iterations);
-
-    EXPECT_NEAR(final_energy, analytical_energy, 1.0e-5);
+TEST(Validation, ShearWaveDecay_BGK) {
+    run_shear_wave_decay_test<lbm::CollisionType::BGK>();
 }
 
 /**
- * @brief Validate viscous decay of a transverse D2Q9 shear wave.
- *
- * The analytical solution is `u_x(y,t) = u_0 sin(k y) exp(-nu k^2 t)` with
- * constant density and vanishing `u_y` in a fully periodic domain.
+ * @brief Validate TRT viscous decay of a transverse D2Q9 shear wave.
  */
-TEST(LBMValidation, ShearWaveDecayD2Q9Cpu) {
-    constexpr std::size_t x_extent = 8;
-    constexpr std::size_t y_extent = 64;
-    constexpr int iterations = 500;
-    constexpr double sound_speed_squared = 1.0 / 3.0;
-    constexpr double initial_velocity = 0.05;
-    constexpr double relaxation_time = 0.8;
-    constexpr double omega = 1.0 / relaxation_time;
-    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
-    constexpr double wave_number =
-        2.0 * std::numbers::pi_v<double> / static_cast<double>(y_extent);
+TEST(Validation, ShearWaveDecay_TRT) {
+    run_shear_wave_decay_test<lbm::CollisionType::TRT>();
+}
 
-    lbm::LatticeMemory<lbm::D2Q9, double> mem{x_extent, y_extent};
-    initialize_shear_wave_d2q9(mem, wave_number, initial_velocity);
+/**
+ * @brief Validate BGK D2Q9 Taylor-Green kinetic-energy decay against theory.
+ */
+TEST(Validation, TaylorGreenVortex_BGK) {
+    run_taylor_green_test<lbm::CollisionType::BGK>();
+}
 
-    for (int step = 0; step < iterations; ++step) {
-        lbm::step_cpu<lbm::D2Q9, double>(mem, omega);
-    }
+/**
+ * @brief Validate TRT D2Q9 Taylor-Green kinetic-energy decay against theory.
+ */
+TEST(Validation, TaylorGreenVortex_TRT) {
+    run_taylor_green_test<lbm::CollisionType::TRT>();
+}
 
-    const auto view = mem.get_current_view();
-    const double decay = std::exp(-viscosity * wave_number * wave_number * iterations);
+/**
+ * @brief Verify that the hardcoded D2Q9 MRT transform and inverse are consistent.
+ */
+TEST(Validation, MRT_D2Q9_Transformation_Identity) {
+    constexpr std::array<double, 9> f_original{
+        1.125, 2.25, 3.375, 4.5, 5.625, 6.75, 7.875, 9.0, 10.125
+    };
 
-    for (std::size_t y = 0; y < y_extent; ++y) {
-        const double analytical_ux =
-            initial_velocity * std::sin(wave_number * static_cast<double>(y)) * decay;
+    const std::array<double, 9> moments =
+        lbm::mrt::compute_moments_d2q9(f_original);
+    const std::array<double, 9> f_restored =
+        lbm::mrt::compute_populations_d2q9(moments);
 
-        for (std::size_t x = 0; x < x_extent; ++x) {
-            std::array<double, static_cast<std::size_t>(lbm::D2Q9::Q)> local_pops{};
-            for (int i = 0; i < lbm::D2Q9::Q; ++i) {
-                local_pops[static_cast<std::size_t>(i)] = view[static_cast<std::size_t>(i), y, x];
-            }
-
-            const lbm::MacroState<lbm::D2Q9, double> macro =
-                lbm::compute_macro_state<lbm::D2Q9, double>(local_pops);
-
-            EXPECT_NEAR(macro.velocity[0], analytical_ux, 1.0e-4);
-            EXPECT_LT(std::abs(macro.velocity[1]), 1.0e-7);
-            EXPECT_NEAR(macro.density, 1.0, 1.0e-12);
-        }
+    for (std::size_t i = 0; i < f_original.size(); ++i) {
+        EXPECT_DOUBLE_EQ(f_original[i], f_restored[i]);
     }
 }
 

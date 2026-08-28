@@ -19,6 +19,22 @@
 
 namespace lbm {
 
+#ifndef LB_CUBE_COLLISION_TYPE_DEFINED
+#define LB_CUBE_COLLISION_TYPE_DEFINED
+/**
+ * @brief Compile-time collision operator selection for fused LBM steps.
+ *
+ * The enum is used as a non-type template parameter so BGK and TRT dispatch is
+ * resolved during compilation, leaving no runtime branch in the inner loop.
+ */
+enum class CollisionType {
+    /** @brief Single-relaxation-time BGK collision. */
+    BGK,
+    /** @brief Two-relaxation-time symmetric/anti-symmetric collision. */
+    TRT
+};
+#endif
+
 namespace detail {
 
 /**
@@ -43,6 +59,30 @@ namespace detail {
     return static_cast<std::size_t>(signed_index % signed_extent);
 }
 
+/**
+ * @brief Apply the selected collision model to a gathered cell population array.
+ *
+ * @tparam CT Compile-time collision operator selection.
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param local_pops Populations gathered by pull streaming and overwritten with
+ * post-collision values.
+ * @param omega Even/BGK relaxation frequency.
+ */
+template <CollisionType CT, IsLatticeModel Lattice, std::floating_point Real>
+inline void collide_cell(
+    std::array<Real, static_cast<std::size_t>(Lattice::Q)>& local_pops,
+    Real omega) {
+    if constexpr (CT == CollisionType::BGK) {
+        collide_bgk<Lattice, Real>(local_pops, omega);
+    } else if constexpr (CT == CollisionType::TRT) {
+        const MacroState<Lattice, Real> macro =
+            compute_macro_state<Lattice, Real>(local_pops);
+        const Real omega_minus = compute_omega_minus<Real>(omega);
+        collide_trt<Lattice, Real>(local_pops, macro, omega, omega_minus);
+    }
+}
+
 } // namespace detail
 
 /**
@@ -50,16 +90,21 @@ namespace detail {
  *
  * The function reads from `mem.get_current_view()`, writes to
  * `mem.get_next_view()`, and calls `mem.swap_buffers()` when the entire domain
- * has been updated. The 2D and 3D code paths are selected with `if constexpr` so
- * each compiled instantiation contains only the relevant loop nest and indexing
- * rank.
+ * has been updated. The 2D and 3D code paths and the collision operator are
+ * selected with `if constexpr`, so each compiled instantiation contains only the
+ * relevant loop nest, indexing rank, and BGK/TRT collision formula.
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
  * @tparam Real Floating-point precision used by the population buffers.
+ * @tparam CT Compile-time collision operator. Defaults to BGK to preserve the
+ * existing `step_cpu<Lattice, Real>(...)` call style.
  * @param mem Host SoA population storage participating in the ping-pong scheme.
- * @param omega BGK relaxation frequency.
+ * @param omega BGK relaxation frequency, or TRT even relaxation frequency.
  */
-template <IsLatticeModel Lattice, std::floating_point Real>
+template <
+    IsLatticeModel Lattice,
+    std::floating_point Real,
+    CollisionType CT = CollisionType::BGK>
 inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
     auto current_view = mem.get_current_view();
     auto next_view = mem.get_next_view();
@@ -83,7 +128,7 @@ inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
                         current_view[static_cast<std::size_t>(i), ny, nx];
                 }
 
-                collide_bgk<Lattice, Real>(local_pops, omega);
+                detail::collide_cell<CT, Lattice, Real>(local_pops, omega);
 
                 for (int i = 0; i < Lattice::Q; ++i) {
                     next_view[static_cast<std::size_t>(i), y, x] =
@@ -114,7 +159,7 @@ inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
                             current_view[static_cast<std::size_t>(i), nz, ny, nx];
                     }
 
-                    collide_bgk<Lattice, Real>(local_pops, omega);
+                    detail::collide_cell<CT, Lattice, Real>(local_pops, omega);
 
                     for (int i = 0; i < Lattice::Q; ++i) {
                         next_view[static_cast<std::size_t>(i), z, y, x] =

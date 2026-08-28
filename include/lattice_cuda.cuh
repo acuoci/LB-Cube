@@ -20,6 +20,22 @@
 
 namespace lbm {
 
+#ifndef LB_CUBE_COLLISION_TYPE_DEFINED
+#define LB_CUBE_COLLISION_TYPE_DEFINED
+/**
+ * @brief Compile-time collision operator selection for fused LBM steps.
+ *
+ * The enum is used as a non-type template parameter so BGK and TRT dispatch is
+ * resolved during compilation, leaving no runtime branch in the kernel.
+ */
+enum class CollisionType {
+    /** @brief Single-relaxation-time BGK collision. */
+    BGK,
+    /** @brief Two-relaxation-time symmetric/anti-symmetric collision. */
+    TRT
+};
+#endif
+
 /**
  * @brief Default CUDA block dimensions used by the host launcher.
  *
@@ -34,15 +50,16 @@ inline dim3 default_cuda_block_size() noexcept {
 
 #ifdef __CUDACC__
 /**
- * @brief CUDA kernel implementing one fused pull-streaming BGK update.
+ * @brief CUDA kernel implementing one fused pull-streaming fluid update.
  *
  * Each CUDA thread maps to one spatial lattice node. It gathers all incoming
- * populations from periodic neighbors in the current buffer, calls the stateless
- * BGK collision function, and writes post-collision populations to the next
- * buffer using the same flat SoA layout as the CPU path.
+ * populations from periodic neighbors in the current buffer, applies the
+ * compile-time selected collision operator, and writes post-collision
+ * populations to the next buffer using the same flat SoA layout as the CPU path.
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
  * @tparam Real Floating-point population precision.
+ * @tparam CT Compile-time collision operator, defaulting to BGK.
  * @param current_populations Device pointer to the read-side population buffer.
  * @param next_populations Device pointer to the write-side population buffer.
  * @param x_extent Number of nodes in x.
@@ -50,7 +67,10 @@ inline dim3 default_cuda_block_size() noexcept {
  * @param z_extent Number of nodes in z, or 1 for 2D lattices.
  * @param omega BGK relaxation frequency.
  */
-template <IsLatticeModel Lattice, std::floating_point Real>
+template <
+    IsLatticeModel Lattice,
+    std::floating_point Real,
+    CollisionType CT = CollisionType::BGK>
 __global__ void kernel_step(
     const Real* current_populations,
     Real* next_populations,
@@ -141,6 +161,7 @@ __global__ void kernel_reaction_AB(
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
  * @tparam Real Floating-point population precision.
+ * @tparam CT Compile-time collision operator, defaulting to BGK.
  * @param current_populations Device pointer to the read-side population buffer.
  * @param next_populations Device pointer to the write-side population buffer.
  * @param x_extent Number of nodes in x.
@@ -150,7 +171,10 @@ __global__ void kernel_reaction_AB(
  * @param block CUDA block dimensions used for launch tuning.
  * @return Immediate CUDA error status from validation or kernel launch.
  */
-template <IsLatticeModel Lattice, std::floating_point Real>
+template <
+    IsLatticeModel Lattice,
+    std::floating_point Real,
+    CollisionType CT = CollisionType::BGK>
 cudaError_t launch_step_gpu(
     const Real* current_populations,
     Real* next_populations,
@@ -270,6 +294,7 @@ cudaError_t launch_reaction_AB_gpu(
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
  * @tparam Real Floating-point population precision.
+ * @tparam CT Compile-time collision operator, defaulting to BGK.
  * @param mem Host memory object used only for domain extents.
  * @param current_populations Device pointer to the read-side population buffer.
  * @param next_populations Device pointer to the write-side population buffer.
@@ -277,7 +302,10 @@ cudaError_t launch_reaction_AB_gpu(
  * @param block CUDA block dimensions used for launch tuning.
  * @return Immediate CUDA error status from validation or kernel launch.
  */
-template <IsLatticeModel Lattice, std::floating_point Real>
+template <
+    IsLatticeModel Lattice,
+    std::floating_point Real,
+    CollisionType CT = CollisionType::BGK>
 cudaError_t launch_step_gpu(
     const LatticeMemory<Lattice, Real>& mem,
     const Real* current_populations,

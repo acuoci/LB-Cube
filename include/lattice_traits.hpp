@@ -26,8 +26,9 @@ namespace lbm {
  *
  * @tparam Lattice Candidate traits type. It is accepted when it provides static
  * constexpr `int D`, static constexpr `int Q`, static constexpr `double cs2`,
- * `std::array<double, Q> weights`, and flattened direction arrays named both
- * `directions` and `c`.
+ * `std::array<double, Q> weights`, flattened direction arrays named both
+ * `directions` and `c`, and an `opposite` table mapping each population index
+ * to its inverse direction.
  */
 template <typename Lattice>
 concept IsLatticeModel =
@@ -46,6 +47,9 @@ concept IsLatticeModel =
         requires std::same_as<
             std::remove_cv_t<decltype(Lattice::c)>,
             std::array<int, static_cast<std::size_t>(Lattice::Q * Lattice::D)>>;
+        requires std::same_as<
+            std::remove_cv_t<decltype(Lattice::opposite)>,
+            std::array<int, static_cast<std::size_t>(Lattice::Q)>>;
     };
 
 /**
@@ -84,6 +88,12 @@ struct D2Q9 {
     };
     /** @brief Alias for the flattened discrete velocity table. */
     static constexpr auto c = directions;
+    /** @brief Opposite-direction index map used by TRT symmetric splitting. */
+    static constexpr std::array<int, Q> opposite{
+        0,
+        3, 4, 1, 2,
+        7, 8, 5, 6
+    };
 };
 
 /**
@@ -135,6 +145,14 @@ struct D3Q19 {
     };
     /** @brief Alias for the flattened discrete velocity table. */
     static constexpr auto c = directions;
+    /** @brief Opposite-direction index map used by TRT symmetric splitting. */
+    static constexpr std::array<int, Q> opposite{
+        0,
+        2, 1, 4, 3, 6, 5,
+        10, 9, 8, 7,
+        14, 13, 12, 11,
+        18, 17, 16, 15
+    };
 };
 
 /**
@@ -197,6 +215,15 @@ struct D3Q27 {
     };
     /** @brief Alias for the flattened discrete velocity table. */
     static constexpr auto c = directions;
+    /** @brief Opposite-direction index map used by TRT symmetric splitting. */
+    static constexpr std::array<int, Q> opposite{
+        0,
+        2, 1, 4, 3, 6, 5,
+        10, 9, 8, 7,
+        14, 13, 12, 11,
+        18, 17, 16, 15,
+        26, 25, 24, 23, 22, 21, 20, 19
+    };
 };
 
 /**
@@ -230,6 +257,11 @@ struct D2Q5 {
     };
     /** @brief Alias for the flattened discrete velocity table. */
     static constexpr auto c = directions;
+    /** @brief Opposite-direction index map used by TRT-style scalar splitting. */
+    static constexpr std::array<int, Q> opposite{
+        0,
+        3, 4, 1, 2
+    };
 };
 
 /**
@@ -265,12 +297,56 @@ struct D3Q7 {
     };
     /** @brief Alias for the flattened discrete velocity table. */
     static constexpr auto c = directions;
+    /** @brief Opposite-direction index map used by TRT-style scalar splitting. */
+    static constexpr std::array<int, Q> opposite{
+        0,
+        2, 1, 4, 3, 6, 5
+    };
 };
+
+/**
+ * @brief Verify at compile time that each opposite link is a true inverse.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
+ * @return `true` when `opposite` is involutive and every paired velocity sums to
+ * zero component-wise.
+ */
+template <IsLatticeModel Lattice>
+consteval bool has_valid_opposites() {
+    for (int i = 0; i < Lattice::Q; ++i) {
+        const int inverse = Lattice::opposite[static_cast<std::size_t>(i)];
+        if (inverse < 0 || inverse >= Lattice::Q) {
+            return false;
+        }
+
+        if (Lattice::opposite[static_cast<std::size_t>(inverse)] != i) {
+            return false;
+        }
+
+        for (int d = 0; d < Lattice::D; ++d) {
+            const auto direction_index = static_cast<std::size_t>(i * Lattice::D + d);
+            const auto inverse_direction_index =
+                static_cast<std::size_t>(inverse * Lattice::D + d);
+            if (Lattice::directions[direction_index] +
+                    Lattice::directions[inverse_direction_index] !=
+                0) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
 
 static_assert(IsLatticeModel<D2Q9>);
 static_assert(IsLatticeModel<D3Q19>);
 static_assert(IsLatticeModel<D3Q27>);
 static_assert(IsLatticeModel<D2Q5>);
 static_assert(IsLatticeModel<D3Q7>);
+static_assert(has_valid_opposites<D2Q9>());
+static_assert(has_valid_opposites<D3Q19>());
+static_assert(has_valid_opposites<D3Q27>());
+static_assert(has_valid_opposites<D2Q5>());
+static_assert(has_valid_opposites<D3Q7>());
 
 } // namespace lbm

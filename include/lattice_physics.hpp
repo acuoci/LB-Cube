@@ -138,6 +138,86 @@ __host__ __device__ inline void collide_bgk(
 }
 
 /**
+ * @brief Compute the TRT odd relaxation frequency from the even one.
+ *
+ * The Two-Relaxation-Time model relaxes symmetric and anti-symmetric population
+ * components independently. Given `omega_plus = 1 / tau_plus`, this helper
+ * applies the standard magic-parameter relation
+ * `Lambda = (tau_plus - 0.5) * (tau_minus - 0.5)` and returns
+ * `omega_minus = 1 / tau_minus`. The default `Lambda = 1/4` is a common
+ * stability-oriented choice for periodic and simple boundary-condition studies.
+ *
+ * @tparam Real Floating-point precision used for relaxation parameters.
+ * @param omega_plus Relaxation frequency for the even, viscosity-controlling
+ * population component.
+ * @param magic_param TRT magic parameter `Lambda`.
+ * @return Odd relaxation frequency `omega_minus`.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline Real compute_omega_minus(
+    Real omega_plus,
+    Real magic_param = Real{1} / Real{4}) {
+    const Real tau_plus = Real{1} / omega_plus;
+    const Real tau_minus =
+        magic_param / (tau_plus - Real{1} / Real{2}) + Real{1} / Real{2};
+    return Real{1} / tau_minus;
+}
+
+/**
+ * @brief Apply an in-place Two-Relaxation-Time collision to one cell.
+ *
+ * TRT decomposes each population pair `(i, opposite[i])` into even and odd
+ * components. The even component controls the physical viscosity through
+ * `omega_plus`; the odd component is relaxed with `omega_minus`, usually chosen
+ * from a magic-parameter relation to improve numerical stability and boundary
+ * behavior. Equilibria are computed first for every direction so the symmetric
+ * and anti-symmetric equilibrium parts are paired consistently.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`, including an
+ * `opposite` table where `c[opposite[i]] = -c[i]`.
+ * @tparam Real Floating-point precision used for populations and relaxation.
+ * @param pops Local population array for one lattice node. Values are
+ * overwritten with post-TRT populations.
+ * @param macro Density and velocity at the node, typically reconstructed from
+ * `pops` before calling this function.
+ * @param omega_plus Relaxation frequency for the even population component.
+ * @param omega_minus Relaxation frequency for the odd population component.
+ */
+template <IsLatticeModel Lattice, std::floating_point Real>
+__host__ __device__ inline void collide_trt(
+    std::array<Real, static_cast<std::size_t>(Lattice::Q)>& pops,
+    const MacroState<Lattice, Real>& macro,
+    Real omega_plus,
+    Real omega_minus) {
+    std::array<Real, static_cast<std::size_t>(Lattice::Q)> equilibrium{};
+    std::array<Real, static_cast<std::size_t>(Lattice::Q)> post_collision{};
+
+    for (int i = 0; i < Lattice::Q; ++i) {
+        equilibrium[static_cast<std::size_t>(i)] =
+            compute_equilibrium<Lattice, Real>(i, macro);
+    }
+
+    for (int i = 0; i < Lattice::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        const auto inverse = static_cast<std::size_t>(Lattice::opposite[index]);
+
+        const Real even = Real{0.5} * (pops[index] + pops[inverse]);
+        const Real equilibrium_even =
+            Real{0.5} * (equilibrium[index] + equilibrium[inverse]);
+        const Real odd = Real{0.5} * (pops[index] - pops[inverse]);
+        const Real equilibrium_odd =
+            Real{0.5} * (equilibrium[index] - equilibrium[inverse]);
+
+        post_collision[index] =
+            pops[index] -
+            omega_plus * (even - equilibrium_even) -
+            omega_minus * (odd - equilibrium_odd);
+    }
+
+    pops = post_collision;
+}
+
+/**
  * @brief Reconstruct passive-scalar concentration from local scalar populations.
  *
  * For the pure LBM scalar model, concentration is the zeroth moment
