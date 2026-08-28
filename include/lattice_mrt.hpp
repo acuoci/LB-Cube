@@ -240,4 +240,293 @@ __host__ __device__ inline void collide_mrt_d2q9(
     pops = compute_populations_d2q9<Real>(moments);
 }
 
+/**
+ * @brief Transform D3Q19 populations into an orthogonal MRT moment basis.
+ *
+ * The population ordering matches `lbm::D3Q19`: rest, axial links, then face
+ * diagonals in the order declared by the lattice trait. The returned moments are
+ * ordered as `rho, e, epsilon, j_x, q_x, j_y, q_y, j_z, q_z, 3p_xx, pi_xx,
+ * p_ww, pi_ww, p_xy, p_yz, p_xz, m_x, m_y, m_z`.
+ *
+ * @tparam Real Floating-point precision used for populations and moments.
+ * @param f D3Q19 population vector.
+ * @return Moment vector `m = M f` in a d'Humieres-style orthogonal basis.
+ */
+template <typename Real>
+__host__ __device__ inline std::array<Real, 19> compute_moments_d3q19(
+    const std::array<Real, 19>& f) {
+    return {
+        f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8] +
+            f[9] + f[10] + f[11] + f[12] + f[13] + f[14] + f[15] +
+            f[16] + f[17] + f[18],
+        -Real{30} * f[0] -
+            Real{11} * (f[1] + f[2] + f[3] + f[4] + f[5] + f[6]) +
+            Real{8} * (f[7] + f[8] + f[9] + f[10] + f[11] + f[12] +
+                f[13] + f[14] + f[15] + f[16] + f[17] + f[18]),
+        Real{12} * f[0] -
+            Real{4} * (f[1] + f[2] + f[3] + f[4] + f[5] + f[6]) +
+            f[7] + f[8] + f[9] + f[10] + f[11] + f[12] + f[13] +
+            f[14] + f[15] + f[16] + f[17] + f[18],
+        f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[11] - f[12] +
+            f[13] - f[14],
+        -Real{4} * f[1] + Real{4} * f[2] + f[7] - f[8] + f[9] - f[10] +
+            f[11] - f[12] + f[13] - f[14],
+        f[3] - f[4] + f[7] + f[8] - f[9] - f[10] + f[15] - f[16] +
+            f[17] - f[18],
+        -Real{4} * f[3] + Real{4} * f[4] + f[7] + f[8] - f[9] -
+            f[10] + f[15] - f[16] + f[17] - f[18],
+        f[5] - f[6] + f[11] + f[12] - f[13] - f[14] + f[15] + f[16] -
+            f[17] - f[18],
+        -Real{4} * f[5] + Real{4} * f[6] + f[11] + f[12] - f[13] -
+            f[14] + f[15] + f[16] - f[17] - f[18],
+        Real{2} * (f[1] + f[2]) - f[3] - f[4] - f[5] - f[6] +
+            f[7] + f[8] + f[9] + f[10] + f[11] + f[12] + f[13] +
+            f[14] - Real{2} * (f[15] + f[16] + f[17] + f[18]),
+        -Real{4} * (f[1] + f[2]) + Real{2} * (f[3] + f[4] + f[5] + f[6]) +
+            f[7] + f[8] + f[9] + f[10] + f[11] + f[12] + f[13] +
+            f[14] - Real{2} * (f[15] + f[16] + f[17] + f[18]),
+        f[3] + f[4] - f[5] - f[6] + f[7] + f[8] + f[9] + f[10] -
+            f[11] - f[12] - f[13] - f[14],
+        -Real{2} * (f[3] + f[4]) + Real{2} * (f[5] + f[6]) +
+            f[7] + f[8] + f[9] + f[10] - f[11] - f[12] - f[13] - f[14],
+        f[7] - f[8] - f[9] + f[10],
+        f[15] - f[16] - f[17] + f[18],
+        f[11] - f[12] - f[13] + f[14],
+        f[7] - f[8] + f[9] - f[10] - f[11] + f[12] - f[13] + f[14],
+        -f[7] - f[8] + f[9] + f[10] + f[15] - f[16] + f[17] - f[18],
+        f[11] + f[12] - f[13] - f[14] - f[15] - f[16] + f[17] + f[18]
+    };
+}
+
+/**
+ * @brief Transform D3Q19 MRT moments back to populations.
+ *
+ * The inverse uses the orthogonality relation `M^{-1} = M^T D^{-1}`, where
+ * `D` contains the row norms of the hardcoded D3Q19 basis. This keeps the
+ * scaling explicit and avoids storing or multiplying dense matrices.
+ *
+ * @tparam Real Floating-point precision used for moments and populations.
+ * @param m Moment vector ordered as in `compute_moments_d3q19`.
+ * @return Population vector `f = M^{-1} m` in `lbm::D3Q19` ordering.
+ */
+template <typename Real>
+__host__ __device__ inline std::array<Real, 19> compute_populations_d3q19(
+    const std::array<Real, 19>& m) {
+    return {
+        Real{1} / Real{19} * m[0] -
+            Real{5} / Real{399} * m[1] +
+            Real{1} / Real{21} * m[2],
+        Real{1} / Real{19} * m[0] -
+            Real{11} / Real{2394} * m[1] -
+            Real{1} / Real{63} * m[2] +
+            Real{1} / Real{10} * m[3] -
+            Real{1} / Real{10} * m[4] +
+            Real{1} / Real{18} * m[9] -
+            Real{1} / Real{18} * m[10],
+        Real{1} / Real{19} * m[0] -
+            Real{11} / Real{2394} * m[1] -
+            Real{1} / Real{63} * m[2] -
+            Real{1} / Real{10} * m[3] +
+            Real{1} / Real{10} * m[4] +
+            Real{1} / Real{18} * m[9] -
+            Real{1} / Real{18} * m[10],
+        Real{1} / Real{19} * m[0] -
+            Real{11} / Real{2394} * m[1] -
+            Real{1} / Real{63} * m[2] +
+            Real{1} / Real{10} * m[5] -
+            Real{1} / Real{10} * m[6] -
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{36} * m[10] +
+            Real{1} / Real{12} * m[11] -
+            Real{1} / Real{12} * m[12],
+        Real{1} / Real{19} * m[0] -
+            Real{11} / Real{2394} * m[1] -
+            Real{1} / Real{63} * m[2] -
+            Real{1} / Real{10} * m[5] +
+            Real{1} / Real{10} * m[6] -
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{36} * m[10] +
+            Real{1} / Real{12} * m[11] -
+            Real{1} / Real{12} * m[12],
+        Real{1} / Real{19} * m[0] -
+            Real{11} / Real{2394} * m[1] -
+            Real{1} / Real{63} * m[2] +
+            Real{1} / Real{10} * m[7] -
+            Real{1} / Real{10} * m[8] -
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{36} * m[10] -
+            Real{1} / Real{12} * m[11] +
+            Real{1} / Real{12} * m[12],
+        Real{1} / Real{19} * m[0] -
+            Real{11} / Real{2394} * m[1] -
+            Real{1} / Real{63} * m[2] -
+            Real{1} / Real{10} * m[7] +
+            Real{1} / Real{10} * m[8] -
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{36} * m[10] -
+            Real{1} / Real{12} * m[11] +
+            Real{1} / Real{12} * m[12],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] +
+            Real{1} / Real{10} * m[3] +
+            Real{1} / Real{40} * m[4] +
+            Real{1} / Real{10} * m[5] +
+            Real{1} / Real{40} * m[6] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] +
+            Real{1} / Real{12} * m[11] +
+            Real{1} / Real{24} * m[12] +
+            Real{1} / Real{4} * m[13] +
+            Real{1} / Real{8} * m[16] -
+            Real{1} / Real{8} * m[17],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] -
+            Real{1} / Real{10} * m[3] -
+            Real{1} / Real{40} * m[4] +
+            Real{1} / Real{10} * m[5] +
+            Real{1} / Real{40} * m[6] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] +
+            Real{1} / Real{12} * m[11] +
+            Real{1} / Real{24} * m[12] -
+            Real{1} / Real{4} * m[13] -
+            Real{1} / Real{8} * m[16] -
+            Real{1} / Real{8} * m[17],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] +
+            Real{1} / Real{10} * m[3] +
+            Real{1} / Real{40} * m[4] -
+            Real{1} / Real{10} * m[5] -
+            Real{1} / Real{40} * m[6] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] +
+            Real{1} / Real{12} * m[11] +
+            Real{1} / Real{24} * m[12] -
+            Real{1} / Real{4} * m[13] +
+            Real{1} / Real{8} * m[16] +
+            Real{1} / Real{8} * m[17],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] -
+            Real{1} / Real{10} * m[3] -
+            Real{1} / Real{40} * m[4] -
+            Real{1} / Real{10} * m[5] -
+            Real{1} / Real{40} * m[6] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] +
+            Real{1} / Real{12} * m[11] +
+            Real{1} / Real{24} * m[12] +
+            Real{1} / Real{4} * m[13] -
+            Real{1} / Real{8} * m[16] +
+            Real{1} / Real{8} * m[17],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] +
+            Real{1} / Real{10} * m[3] +
+            Real{1} / Real{40} * m[4] +
+            Real{1} / Real{10} * m[7] +
+            Real{1} / Real{40} * m[8] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] -
+            Real{1} / Real{12} * m[11] -
+            Real{1} / Real{24} * m[12] +
+            Real{1} / Real{4} * m[15] -
+            Real{1} / Real{8} * m[16] +
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] -
+            Real{1} / Real{10} * m[3] -
+            Real{1} / Real{40} * m[4] +
+            Real{1} / Real{10} * m[7] +
+            Real{1} / Real{40} * m[8] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] -
+            Real{1} / Real{12} * m[11] -
+            Real{1} / Real{24} * m[12] -
+            Real{1} / Real{4} * m[15] +
+            Real{1} / Real{8} * m[16] +
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] +
+            Real{1} / Real{10} * m[3] +
+            Real{1} / Real{40} * m[4] -
+            Real{1} / Real{10} * m[7] -
+            Real{1} / Real{40} * m[8] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] -
+            Real{1} / Real{12} * m[11] -
+            Real{1} / Real{24} * m[12] -
+            Real{1} / Real{4} * m[15] -
+            Real{1} / Real{8} * m[16] -
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] -
+            Real{1} / Real{10} * m[3] -
+            Real{1} / Real{40} * m[4] -
+            Real{1} / Real{10} * m[7] -
+            Real{1} / Real{40} * m[8] +
+            Real{1} / Real{36} * m[9] +
+            Real{1} / Real{72} * m[10] -
+            Real{1} / Real{12} * m[11] -
+            Real{1} / Real{24} * m[12] +
+            Real{1} / Real{4} * m[15] +
+            Real{1} / Real{8} * m[16] -
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] +
+            Real{1} / Real{10} * m[5] +
+            Real{1} / Real{40} * m[6] +
+            Real{1} / Real{10} * m[7] +
+            Real{1} / Real{40} * m[8] -
+            Real{1} / Real{18} * m[9] -
+            Real{1} / Real{36} * m[10] +
+            Real{1} / Real{4} * m[14] +
+            Real{1} / Real{8} * m[17] -
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] -
+            Real{1} / Real{10} * m[5] -
+            Real{1} / Real{40} * m[6] +
+            Real{1} / Real{10} * m[7] +
+            Real{1} / Real{40} * m[8] -
+            Real{1} / Real{18} * m[9] -
+            Real{1} / Real{36} * m[10] -
+            Real{1} / Real{4} * m[14] -
+            Real{1} / Real{8} * m[17] -
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] +
+            Real{1} / Real{10} * m[5] +
+            Real{1} / Real{40} * m[6] -
+            Real{1} / Real{10} * m[7] -
+            Real{1} / Real{40} * m[8] -
+            Real{1} / Real{18} * m[9] -
+            Real{1} / Real{36} * m[10] -
+            Real{1} / Real{4} * m[14] +
+            Real{1} / Real{8} * m[17] +
+            Real{1} / Real{8} * m[18],
+        Real{1} / Real{19} * m[0] +
+            Real{4} / Real{1197} * m[1] +
+            Real{1} / Real{252} * m[2] -
+            Real{1} / Real{10} * m[5] -
+            Real{1} / Real{40} * m[6] -
+            Real{1} / Real{10} * m[7] -
+            Real{1} / Real{40} * m[8] -
+            Real{1} / Real{18} * m[9] -
+            Real{1} / Real{36} * m[10] +
+            Real{1} / Real{4} * m[14] -
+            Real{1} / Real{8} * m[17] +
+            Real{1} / Real{8} * m[18]
+    };
+}
+
 } // namespace lbm::mrt

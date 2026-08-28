@@ -651,6 +651,25 @@ TEST(Validation, MRT_D2Q9_Transformation_Identity) {
 }
 
 /**
+ * @brief Verify that the hardcoded D3Q19 MRT transform and inverse are consistent.
+ */
+TEST(Validation, MRT_D3Q19_Transformation_Identity) {
+    constexpr std::array<double, 19> f_original{
+        0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10,
+        0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19
+    };
+
+    const std::array<double, 19> moments =
+        lbm::mrt::compute_moments_d3q19(f_original);
+    const std::array<double, 19> f_restored =
+        lbm::mrt::compute_populations_d3q19(moments);
+
+    for (std::size_t i = 0; i < f_original.size(); ++i) {
+        EXPECT_NEAR(f_original[i], f_restored[i], 1.0e-12);
+    }
+}
+
+/**
  * @brief Validate passive scalar advection and diffusion by a uniform D2Q9 flow.
  *
  * A sinusoidal D2Q5 scalar wave is transported by a uniform x velocity and
