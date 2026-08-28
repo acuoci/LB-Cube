@@ -15,6 +15,7 @@
 #include <cstddef>
 
 #include "lattice_memory.hpp"
+#include "lattice_mrt.hpp"
 #include "lattice_physics.hpp"
 #include "lattice_traits.hpp"
 
@@ -32,7 +33,9 @@ enum class CollisionType {
     /** @brief Single-relaxation-time BGK collision. */
     BGK,
     /** @brief Two-relaxation-time symmetric/anti-symmetric collision. */
-    TRT
+    TRT,
+    /** @brief Multiple-relaxation-time moment-space collision. */
+    MRT
 };
 #endif
 

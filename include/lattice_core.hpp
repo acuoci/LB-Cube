@@ -5,15 +5,18 @@
  *
  * This header ties the SoA memory views and stateless physics functions together
  * for host execution. The update uses a pull-streaming scheme: each destination
- * cell gathers incoming populations from periodic neighbors, performs local BGK
- * collision, and writes the result to the next ping-pong buffer.
+ * cell gathers incoming populations from periodic neighbors, performs the
+ * compile-time selected collision, and writes the result to the next ping-pong
+ * buffer.
  */
 
 #include <array>
 #include <cstddef>
 #include <concepts>
+#include <type_traits>
 
 #include "lattice_memory.hpp"
+#include "lattice_mrt.hpp"
 #include "lattice_physics.hpp"
 #include "lattice_traits.hpp"
 
@@ -31,7 +34,9 @@ enum class CollisionType {
     /** @brief Single-relaxation-time BGK collision. */
     BGK,
     /** @brief Two-relaxation-time symmetric/anti-symmetric collision. */
-    TRT
+    TRT,
+    /** @brief Multiple-relaxation-time moment-space collision. */
+    MRT
 };
 #endif
 
@@ -80,6 +85,16 @@ inline void collide_cell(
             compute_macro_state<Lattice, Real>(local_pops);
         const Real omega_minus = compute_omega_minus<Real>(omega);
         collide_trt<Lattice, Real>(local_pops, macro, omega, omega_minus);
+    } else if constexpr (CT == CollisionType::MRT) {
+        static_assert(
+            std::is_same_v<Lattice, D2Q9>,
+            "MRT is only supported for D2Q9 currently.");
+
+        const MacroState<Lattice, Real> macro =
+            compute_macro_state<Lattice, Real>(local_pops);
+        mrt::MrtRelaxationRates_D2Q9<Real> relaxation_rates{};
+        relaxation_rates.s_nu = omega;
+        mrt::collide_mrt_d2q9<Real>(local_pops, macro, relaxation_rates);
     }
 }
 
@@ -92,7 +107,7 @@ inline void collide_cell(
  * `mem.get_next_view()`, and calls `mem.swap_buffers()` when the entire domain
  * has been updated. The 2D and 3D code paths and the collision operator are
  * selected with `if constexpr`, so each compiled instantiation contains only the
- * relevant loop nest, indexing rank, and BGK/TRT collision formula.
+ * relevant loop nest, indexing rank, and collision formula.
  *
  * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`.
  * @tparam Real Floating-point precision used by the population buffers.

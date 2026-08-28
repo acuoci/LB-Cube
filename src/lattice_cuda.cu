@@ -1,6 +1,6 @@
 /**
  * @file lattice_cuda.cu
- * @brief CUDA implementation of fused pull-streaming BGK time steps.
+ * @brief CUDA implementation of fused pull-streaming fluid time steps.
  *
  * This translation unit contains device-only indexing helpers, the templated
  * CUDA kernel, host launch wrappers, and explicit template instantiations for the
@@ -10,6 +10,7 @@
 #include "lattice_cuda.cuh"
 
 #include <array>
+#include <type_traits>
 
 namespace lbm {
 
@@ -86,6 +87,16 @@ __device__ inline void collide_cell(
             compute_macro_state<Lattice, Real>(local_pops);
         const Real omega_minus = compute_omega_minus<Real>(omega);
         collide_trt<Lattice, Real>(local_pops, macro, omega, omega_minus);
+    } else if constexpr (CT == CollisionType::MRT) {
+        static_assert(
+            std::is_same_v<Lattice, D2Q9>,
+            "MRT is only supported for D2Q9 currently.");
+
+        const MacroState<Lattice, Real> macro =
+            compute_macro_state<Lattice, Real>(local_pops);
+        mrt::MrtRelaxationRates_D2Q9<Real> relaxation_rates{};
+        relaxation_rates.s_nu = omega;
+        mrt::collide_mrt_d2q9<Real>(local_pops, macro, relaxation_rates);
     }
 }
 
@@ -743,6 +754,11 @@ template __global__ void kernel_step<D3Q27, float, CollisionType::TRT>(
 template __global__ void kernel_step<D3Q27, double, CollisionType::TRT>(
     const double*, double*, std::size_t, std::size_t, std::size_t, double);
 
+template __global__ void kernel_step<D2Q9, float, CollisionType::MRT>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float);
+template __global__ void kernel_step<D2Q9, double, CollisionType::MRT>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double);
+
 template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::BGK>(
     const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
 template cudaError_t launch_step_gpu<D2Q9, double, CollisionType::BGK>(
@@ -767,6 +783,11 @@ template cudaError_t launch_step_gpu<D3Q19, double, CollisionType::TRT>(
 template cudaError_t launch_step_gpu<D3Q27, float, CollisionType::TRT>(
     const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
 template cudaError_t launch_step_gpu<D3Q27, double, CollisionType::TRT>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
+
+template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::MRT>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
+template cudaError_t launch_step_gpu<D2Q9, double, CollisionType::MRT>(
     const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
 
 template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::BGK>(
@@ -794,6 +815,11 @@ template cudaError_t launch_step_gpu<D3Q27, float, CollisionType::TRT>(
     const LatticeMemory<D3Q27, float>&, const float*, float*, float, dim3);
 template cudaError_t launch_step_gpu<D3Q27, double, CollisionType::TRT>(
     const LatticeMemory<D3Q27, double>&, const double*, double*, double, dim3);
+
+template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::MRT>(
+    const LatticeMemory<D2Q9, float>&, const float*, float*, float, dim3);
+template cudaError_t launch_step_gpu<D2Q9, double, CollisionType::MRT>(
+    const LatticeMemory<D2Q9, double>&, const double*, double*, double, dim3);
 
 template __global__ void kernel_scalar_step<D2Q9, D2Q5, float>(
     const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float);

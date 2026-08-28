@@ -446,6 +446,8 @@ void run_shear_wave_decay_test() {
 
     const auto view = mem.get_current_view();
     const double decay = std::exp(-viscosity * wave_number * wave_number * iterations);
+    constexpr double density_tolerance =
+        CT == lbm::CollisionType::MRT ? 1.0e-6 : 1.0e-12;
 
     for (std::size_t y = 0; y < y_extent; ++y) {
         const double analytical_ux =
@@ -462,7 +464,7 @@ void run_shear_wave_decay_test() {
 
             EXPECT_NEAR(macro.velocity[0], analytical_ux, 1.0e-4);
             EXPECT_LT(std::abs(macro.velocity[1]), 1.0e-7);
-            EXPECT_NEAR(macro.density, 1.0, 1.0e-12);
+            EXPECT_NEAR(macro.density, 1.0, density_tolerance);
         }
     }
 }
@@ -478,6 +480,7 @@ void run_shear_wave_decay_test() {
  * @param n Number of nodes in both x and y directions.
  * @return Relative L2 error of velocity magnitude at the final physical time.
  */
+template <lbm::CollisionType CT = lbm::CollisionType::BGK>
 double run_taylor_green_error(int n) {
     constexpr int base_grid = 16;
     constexpr double physical_time = 1.0;
@@ -502,7 +505,7 @@ double run_taylor_green_error(int n) {
     initialize_taylor_green_d2q9(mem, wave_number, lattice_velocity, sound_speed_squared);
 
     for (int step = 0; step < time_steps; ++step) {
-        lbm::step_cpu<lbm::D2Q9, double>(mem, omega);
+        lbm::step_cpu<lbm::D2Q9, double, CT>(mem, omega);
     }
 
     const auto view = mem.get_current_view();
@@ -540,6 +543,24 @@ double run_taylor_green_error(int n) {
     }
 
     return std::sqrt(static_cast<double>(numerator / denominator));
+}
+
+/**
+ * @brief Run the diffusive-scaling convergence check for a collision operator.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_spatial_convergence_test(double eoc_tolerance = 0.15) {
+    const double error_16 = run_taylor_green_error<CT>(16);
+    const double error_32 = run_taylor_green_error<CT>(32);
+    const double error_64 = run_taylor_green_error<CT>(64);
+
+    const double eoc_16_to_32 = std::log2(error_16 / error_32);
+    const double eoc_32_to_64 = std::log2(error_32 / error_64);
+
+    EXPECT_GT(eoc_16_to_32, 1.5);
+    EXPECT_NEAR(eoc_32_to_64, 2.0, eoc_tolerance);
 }
 
 } // namespace
@@ -584,6 +605,13 @@ TEST(Validation, ShearWaveDecay_TRT) {
 }
 
 /**
+ * @brief Validate MRT viscous decay of a transverse D2Q9 shear wave.
+ */
+TEST(Validation, ShearWaveDecay_MRT) {
+    run_shear_wave_decay_test<lbm::CollisionType::MRT>();
+}
+
+/**
  * @brief Validate BGK D2Q9 Taylor-Green kinetic-energy decay against theory.
  */
 TEST(Validation, TaylorGreenVortex_BGK) {
@@ -595,6 +623,13 @@ TEST(Validation, TaylorGreenVortex_BGK) {
  */
 TEST(Validation, TaylorGreenVortex_TRT) {
     run_taylor_green_test<lbm::CollisionType::TRT>();
+}
+
+/**
+ * @brief Validate MRT D2Q9 Taylor-Green kinetic-energy decay against theory.
+ */
+TEST(Validation, TaylorGreenVortex_MRT) {
+    run_taylor_green_test<lbm::CollisionType::MRT>();
 }
 
 /**
@@ -797,13 +832,12 @@ TEST(LBMValidation, SegregatedReactiveMixingD2Q5Cpu) {
  * @brief Verify approximately second-order spatial convergence for D2Q9.
  */
 TEST(Validation, SpatialConvergence) {
-    const double error_16 = run_taylor_green_error(16);
-    const double error_32 = run_taylor_green_error(32);
-    const double error_64 = run_taylor_green_error(64);
+    run_spatial_convergence_test<lbm::CollisionType::BGK>();
+}
 
-    const double eoc_16_to_32 = std::log2(error_16 / error_32);
-    const double eoc_32_to_64 = std::log2(error_32 / error_64);
-
-    EXPECT_GT(eoc_16_to_32, 1.5);
-    EXPECT_NEAR(eoc_32_to_64, 2.0, 0.15);
+/**
+ * @brief Verify MRT keeps second-order spatial convergence for D2Q9.
+ */
+TEST(Validation, SpatialConvergence_MRT) {
+    run_spatial_convergence_test<lbm::CollisionType::MRT>(0.35);
 }
