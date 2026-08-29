@@ -100,9 +100,9 @@ struct MrtRelaxationRates_D3Q19 {
     Real s_q{Real{1.2}};
     /** @brief Relaxation rate for viscous stress modes 9-13. */
     Real s_nu{};
-    /** @brief Relaxation rate for higher-order symmetric stress modes 14-15. */
+    /** @brief Relaxation rate for anti-symmetric stress / higher-order modes 14-15. */
     Real s_pi{Real{1.4}};
-    /** @brief Relaxation rate for anti-symmetric ghost modes 16-18. */
+    /** @brief Relaxation rate for higher-order kinetic modes 16-18. */
     Real s_m{Real{1.98}};
 };
 
@@ -578,8 +578,9 @@ __host__ __device__ inline std::array<Real, 19> compute_populations_d3q19(
  * The moment ordering is the d'Humieres-style basis used by
  * `compute_moments_d3q19`: `rho, e, epsilon, j_x, q_x, j_y, q_y, j_z, q_z,
  * 3p_xx, p_ww, p_xy, p_yz, p_xz, pi_xx, pi_ww, m_x, m_y, m_z`.
- * Momentum moments are conserved; non-conserved moments encode the isothermal
- * weakly compressible Navier-Stokes closure in moment space.
+ * Momentum moments are conserved; stress moments 9-13 encode the isothermal
+ * weakly compressible Navier-Stokes closure, while ghost modes 14-18 have zero
+ * equilibrium in the incompressible limit.
  *
  * @tparam Real Floating-point precision used for the macroscopic state.
  * @param macro D3Q19 macroscopic density and velocity.
@@ -600,7 +601,7 @@ __host__ __device__ inline std::array<Real, 19> compute_equilibrium_moments_d3q1
     const Real uz2 = uz * uz;
     const Real usq = ux2 + uy2 + uz2;
 
-    const Real m9_eq = rho * (Real{2} * ux2 - uy2 - uz2);
+    const Real m9_eq = Real{3} * rho * (Real{2} * ux2 - uy2 - uz2);
     const Real m10_eq = rho * (uy2 - uz2);
 
     return {
@@ -618,8 +619,8 @@ __host__ __device__ inline std::array<Real, 19> compute_equilibrium_moments_d3q1
         rho * ux * uy,
         rho * uy * uz,
         rho * ux * uz,
-        -Real{1} / Real{2} * m9_eq,
-        -Real{1} / Real{2} * m10_eq,
+        Real{0},
+        Real{0},
         Real{0},
         Real{0},
         Real{0}

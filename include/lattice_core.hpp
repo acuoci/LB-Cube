@@ -43,6 +43,17 @@ enum class CollisionType {
 namespace detail {
 
 /**
+ * @brief Dependent false value used to reject unsupported compile-time branches.
+ *
+ * Keeping the expression dependent on the lattice type ensures the assertion is
+ * evaluated only when an unsupported MRT instantiation is actually requested.
+ *
+ * @tparam Lattice Lattice traits type used by the selected solver branch.
+ */
+template <typename Lattice>
+inline constexpr bool always_false_v = false;
+
+/**
  * @brief Compute a wrapped upstream coordinate for pull streaming.
  *
  * For a destination coordinate `x` and lattice velocity component `c`, the
@@ -86,15 +97,21 @@ inline void collide_cell(
         const Real omega_minus = compute_omega_minus<Real>(omega);
         collide_trt<Lattice, Real>(local_pops, macro, omega, omega_minus);
     } else if constexpr (CT == CollisionType::MRT) {
-        static_assert(
-            std::is_same_v<Lattice, D2Q9>,
-            "MRT is only supported for D2Q9 currently.");
-
         const MacroState<Lattice, Real> macro =
             compute_macro_state<Lattice, Real>(local_pops);
-        mrt::MrtRelaxationRates_D2Q9<Real> relaxation_rates{};
-        relaxation_rates.s_nu = omega;
-        mrt::collide_mrt_d2q9<Real>(local_pops, macro, relaxation_rates);
+        if constexpr (std::is_same_v<Lattice, D2Q9>) {
+            mrt::MrtRelaxationRates_D2Q9<Real> relaxation_rates{};
+            relaxation_rates.s_nu = omega;
+            mrt::collide_mrt_d2q9<Real>(local_pops, macro, relaxation_rates);
+        } else if constexpr (std::is_same_v<Lattice, D3Q19>) {
+            mrt::MrtRelaxationRates_D3Q19<Real> relaxation_rates{};
+            relaxation_rates.s_nu = omega;
+            mrt::collide_mrt_d3q19<Real>(local_pops, macro, relaxation_rates);
+        } else {
+            static_assert(
+                always_false_v<Lattice>,
+                "MRT is currently only supported for D2Q9 and D3Q19.");
+        }
     }
 }
 

@@ -97,6 +97,71 @@ long double total_mass(const lbm::LatticeMemory<Lattice, Real>& mem) {
 }
 
 /**
+ * @brief Compute the mean kinetic energy from reconstructed macroscopic fields.
+ *
+ * This diagnostic intentionally omits the density prefactor and tracks
+ * `0.5 |u|^2` averaged over all lattice nodes. That makes it a direct amplitude
+ * monitor for Taylor-Green velocity modes across both D2Q9 and D3Q19 tests.
+ *
+ * @tparam Lattice Lattice traits type satisfying `lbm::IsLatticeModel`.
+ * @tparam Real Floating-point population precision.
+ * @param mem Host population memory whose current buffer is inspected.
+ * @return Mean kinetic energy per lattice node.
+ */
+template <lbm::IsLatticeModel Lattice, std::floating_point Real>
+Real compute_mean_kinetic_energy(const lbm::LatticeMemory<Lattice, Real>& mem) {
+    const auto view = mem.get_current_view();
+    long double kinetic_energy = 0.0L;
+    std::size_t cell_count = 0;
+
+    if constexpr (Lattice::D == 2) {
+        const std::size_t y_extent = view.extent(1);
+        const std::size_t x_extent = view.extent(2);
+        cell_count = x_extent * y_extent;
+
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                std::array<Real, static_cast<std::size_t>(Lattice::Q)> local_pops{};
+                for (int i = 0; i < Lattice::Q; ++i) {
+                    local_pops[static_cast<std::size_t>(i)] =
+                        view[static_cast<std::size_t>(i), y, x];
+                }
+
+                const lbm::MacroState<Lattice, Real> macro =
+                    lbm::compute_macro_state<Lattice, Real>(local_pops);
+                kinetic_energy += static_cast<long double>(
+                    Real{0.5} * macro.velocity.squaredNorm());
+            }
+        }
+    } else {
+        const std::size_t z_extent = view.extent(1);
+        const std::size_t y_extent = view.extent(2);
+        const std::size_t x_extent = view.extent(3);
+        cell_count = x_extent * y_extent * z_extent;
+
+        for (std::size_t z = 0; z < z_extent; ++z) {
+            for (std::size_t y = 0; y < y_extent; ++y) {
+                for (std::size_t x = 0; x < x_extent; ++x) {
+                    std::array<Real, static_cast<std::size_t>(Lattice::Q)> local_pops{};
+                    for (int i = 0; i < Lattice::Q; ++i) {
+                        local_pops[static_cast<std::size_t>(i)] =
+                            view[static_cast<std::size_t>(i), z, y, x];
+                    }
+
+                    const lbm::MacroState<Lattice, Real> macro =
+                        lbm::compute_macro_state<Lattice, Real>(local_pops);
+                    kinetic_energy += static_cast<long double>(
+                        Real{0.5} * macro.velocity.squaredNorm());
+                }
+            }
+        }
+    }
+
+    return static_cast<Real>(
+        kinetic_energy / static_cast<long double>(cell_count));
+}
+
+/**
  * @brief Initialize a D3Q19 domain with random low-Mach equilibrium states.
  *
  * @param mem D3Q19 double-precision memory to initialize.
@@ -189,6 +254,121 @@ double kinetic_energy_d2q9(const lbm::LatticeMemory<lbm::D2Q9, double>& mem) {
     }
 
     return static_cast<double>(energy);
+}
+
+/**
+ * @brief Initialize a D3Q19 domain with a low-Mach 3D Taylor-Green vortex.
+ *
+ * The periodic incompressible velocity field is
+ * `u_x = u0 sin(kx) cos(ky) cos(kz)`, `u_y = -u0 cos(kx) sin(ky) cos(kz)`,
+ * and `u_z = 0`. The density is initialized uniformly so the test isolates
+ * viscous decay of the velocity mode.
+ *
+ * @param mem D3Q19 double-precision memory to initialize.
+ * @param wave_number Fundamental wave number `2 pi / L`.
+ * @param initial_velocity Velocity amplitude.
+ */
+void initialize_taylor_green_d3q19(
+    lbm::LatticeMemory<lbm::D3Q19, double>& mem,
+    double wave_number,
+    double initial_velocity) {
+    const auto view = mem.get_current_view();
+    const std::size_t z_extent = view.extent(1);
+    const std::size_t y_extent = view.extent(2);
+    const std::size_t x_extent = view.extent(3);
+
+    for (std::size_t z = 0; z < z_extent; ++z) {
+        const double phase_z = wave_number * static_cast<double>(z);
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            const double phase_y = wave_number * static_cast<double>(y);
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                const double phase_x = wave_number * static_cast<double>(x);
+
+                lbm::MacroState<lbm::D3Q19, double> macro{};
+                macro.density = 1.0;
+                macro.velocity <<
+                    initial_velocity * std::sin(phase_x) *
+                        std::cos(phase_y) * std::cos(phase_z),
+                    -initial_velocity * std::cos(phase_x) *
+                        std::sin(phase_y) * std::cos(phase_z),
+                    0.0;
+
+                initialize_equilibrium_cell<lbm::D3Q19, double>(
+                    view,
+                    x,
+                    y,
+                    z,
+                    macro);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Compute the relative L2 velocity error for a decayed 3D TGV mode.
+ *
+ * The initial velocity field is a Laplacian eigenfunction with eigenvalue
+ * `-3 k^2`, so the linear viscous amplitude decay is
+ * `exp(-3 nu k^2 t)`. The velocity amplitude is deliberately small to keep
+ * compressibility and nonlinear effects below the test tolerance.
+ *
+ * @param mem D3Q19 memory whose current populations are inspected.
+ * @param wave_number Fundamental wave number `2 pi / L`.
+ * @param initial_velocity Initial velocity amplitude.
+ * @param viscosity Kinematic viscosity in lattice units.
+ * @param iterations Number of elapsed lattice time steps.
+ * @return Relative L2 error of the full velocity vector.
+ */
+double taylor_green_3d_velocity_error(
+    const lbm::LatticeMemory<lbm::D3Q19, double>& mem,
+    double wave_number,
+    double initial_velocity,
+    double viscosity,
+    int iterations) {
+    const auto view = mem.get_current_view();
+    const std::size_t z_extent = view.extent(1);
+    const std::size_t y_extent = view.extent(2);
+    const std::size_t x_extent = view.extent(3);
+    const double decay = std::exp(
+        -3.0 * viscosity * wave_number * wave_number *
+        static_cast<double>(iterations));
+
+    long double numerator = 0.0L;
+    long double denominator = 0.0L;
+
+    for (std::size_t z = 0; z < z_extent; ++z) {
+        const double phase_z = wave_number * static_cast<double>(z);
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            const double phase_y = wave_number * static_cast<double>(y);
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                const double phase_x = wave_number * static_cast<double>(x);
+
+                const Eigen::Vector3d analytical_velocity{
+                    initial_velocity * std::sin(phase_x) *
+                        std::cos(phase_y) * std::cos(phase_z) * decay,
+                    -initial_velocity * std::cos(phase_x) *
+                        std::sin(phase_y) * std::cos(phase_z) * decay,
+                    0.0};
+
+                std::array<double, static_cast<std::size_t>(lbm::D3Q19::Q)> local_pops{};
+                for (int i = 0; i < lbm::D3Q19::Q; ++i) {
+                    local_pops[static_cast<std::size_t>(i)] =
+                        view[static_cast<std::size_t>(i), z, y, x];
+                }
+
+                const lbm::MacroState<lbm::D3Q19, double> macro =
+                    lbm::compute_macro_state<lbm::D3Q19, double>(local_pops);
+                const double error_squared =
+                    (macro.velocity - analytical_velocity).squaredNorm();
+
+                numerator += static_cast<long double>(error_squared);
+                denominator += static_cast<long double>(
+                    analytical_velocity.squaredNorm());
+            }
+        }
+    }
+
+    return std::sqrt(static_cast<double>(numerator / denominator));
 }
 
 /**
@@ -420,6 +600,144 @@ void run_taylor_green_test() {
 }
 
 /**
+ * @brief Run the 3D D3Q19 Taylor-Green vortex velocity-decay validation.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_taylor_green_3d_test() {
+    constexpr std::size_t domain_size = 32;
+    constexpr int iterations = 20;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+    constexpr double initial_velocity = 0.005;
+    constexpr double relaxation_time = 0.8;
+    constexpr double omega = 1.0 / relaxation_time;
+    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(domain_size);
+
+    lbm::LatticeMemory<lbm::D3Q19, double> mem{
+        domain_size,
+        domain_size,
+        domain_size};
+    initialize_taylor_green_d3q19(mem, wave_number, initial_velocity);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_cpu<lbm::D3Q19, double, CT>(mem, omega);
+    }
+
+    const double relative_error = taylor_green_3d_velocity_error(
+        mem,
+        wave_number,
+        initial_velocity,
+        viscosity,
+        iterations);
+
+    EXPECT_LT(relative_error, 7.5e-2);
+}
+
+/**
+ * @brief Track 2D shear-wave mean kinetic energy decay through time.
+ *
+ * The transverse shear wave has no nonlinear vortex-stretching mechanism and is
+ * therefore an appropriate strict energy-decay benchmark. The mean kinetic
+ * energy follows `E_k(t) = E_k(0) exp(-2 nu k^2 t)`.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_tke_shear_wave_test() {
+    constexpr std::size_t domain_size = 32;
+    constexpr int total_steps = 1000;
+    constexpr int sampling_interval = 100;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+    constexpr double initial_velocity = 0.01;
+    constexpr double relaxation_time = 0.8;
+    constexpr double omega = 1.0 / relaxation_time;
+    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(domain_size);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> mem{domain_size, domain_size};
+    initialize_shear_wave_d2q9(mem, wave_number, initial_velocity);
+
+    const double initial_energy =
+        compute_mean_kinetic_energy<lbm::D2Q9, double>(mem);
+    const double energy_tolerance = initial_energy * 1.0e-3;
+
+    for (int step = 1; step <= total_steps; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double, CT>(mem, omega);
+
+        if (step % sampling_interval == 0) {
+            const double numerical_energy =
+                compute_mean_kinetic_energy<lbm::D2Q9, double>(mem);
+            constexpr double analytical_time_shift =
+                CT == lbm::CollisionType::MRT ? 1.0 : 0.5;
+            const double analytical_time =
+                static_cast<double>(step) + analytical_time_shift;
+            const double analytical_energy =
+                initial_energy *
+                std::exp(-2.0 * viscosity * wave_number * wave_number *
+                    analytical_time);
+
+            EXPECT_NEAR(numerical_energy, analytical_energy, energy_tolerance)
+                << "Shear-wave energy decay diverged at step " << step;
+        }
+    }
+}
+
+/**
+ * @brief Track 2D Taylor-Green mean kinetic energy decay through time.
+ *
+ * The initialized density perturbation suppresses the leading acoustic response
+ * for the weakly compressible D2Q9 TGV. In the incompressible analytical limit,
+ * its mean kinetic energy follows `E_k(t) = E_k(0) exp(-4 nu k^2 t)`.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_tke_tgv2d_test() {
+    constexpr std::size_t domain_size = 32;
+    constexpr int total_steps = 1000;
+    constexpr int sampling_interval = 100;
+    constexpr double sound_speed_squared = 1.0 / 3.0;
+    constexpr double initial_velocity = 0.01;
+    constexpr double relaxation_time = 0.8;
+    constexpr double omega = 1.0 / relaxation_time;
+    constexpr double viscosity = sound_speed_squared * (relaxation_time - 0.5);
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(domain_size);
+
+    lbm::LatticeMemory<lbm::D2Q9, double> mem{domain_size, domain_size};
+    initialize_taylor_green_d2q9(
+        mem,
+        wave_number,
+        initial_velocity,
+        sound_speed_squared);
+
+    const double initial_energy =
+        compute_mean_kinetic_energy<lbm::D2Q9, double>(mem);
+    const double energy_tolerance = initial_energy * 1.0e-3;
+
+    for (int step = 1; step <= total_steps; ++step) {
+        lbm::step_cpu<lbm::D2Q9, double, CT>(mem, omega);
+
+        if (step % sampling_interval == 0) {
+            const double numerical_energy =
+                compute_mean_kinetic_energy<lbm::D2Q9, double>(mem);
+            const double analytical_time = static_cast<double>(step) + 0.5;
+            const double analytical_energy =
+                initial_energy *
+                std::exp(-4.0 * viscosity * wave_number * wave_number *
+                    analytical_time);
+
+            EXPECT_NEAR(numerical_energy, analytical_energy, energy_tolerance)
+                << "Taylor-Green energy decay diverged at step " << step;
+        }
+    }
+}
+
+/**
  * @brief Run the transverse shear-wave decay validation.
  *
  * @tparam CT Compile-time collision operator under test.
@@ -630,6 +948,69 @@ TEST(Validation, TaylorGreenVortex_TRT) {
  */
 TEST(Validation, TaylorGreenVortex_MRT) {
     run_taylor_green_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Validate BGK D3Q19 Taylor-Green velocity decay against theory.
+ */
+TEST(Validation, TaylorGreenVortex3D_BGK) {
+    run_taylor_green_3d_test<lbm::CollisionType::BGK>();
+}
+
+/**
+ * @brief Validate TRT D3Q19 Taylor-Green velocity decay against theory.
+ */
+TEST(Validation, TaylorGreenVortex3D_TRT) {
+    run_taylor_green_3d_test<lbm::CollisionType::TRT>();
+}
+
+/**
+ * @brief Validate MRT D3Q19 Taylor-Green velocity decay against theory.
+ */
+TEST(Validation, TaylorGreenVortex3D_MRT) {
+    run_taylor_green_3d_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Track D2Q9 BGK shear-wave mean kinetic energy over time.
+ */
+TEST(Validation, TKE_ShearWave_D2Q9_BGK) {
+    run_tke_shear_wave_test<lbm::CollisionType::BGK>();
+}
+
+/**
+ * @brief Track D2Q9 TRT shear-wave mean kinetic energy over time.
+ */
+TEST(Validation, TKE_ShearWave_D2Q9_TRT) {
+    run_tke_shear_wave_test<lbm::CollisionType::TRT>();
+}
+
+/**
+ * @brief Track D2Q9 MRT shear-wave mean kinetic energy over time.
+ */
+TEST(Validation, TKE_ShearWave_D2Q9_MRT) {
+    run_tke_shear_wave_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Track D2Q9 BGK Taylor-Green mean kinetic energy over time.
+ */
+TEST(Validation, TKE_TaylorGreen2D_D2Q9_BGK) {
+    run_tke_tgv2d_test<lbm::CollisionType::BGK>();
+}
+
+/**
+ * @brief Track D2Q9 TRT Taylor-Green mean kinetic energy over time.
+ */
+TEST(Validation, TKE_TaylorGreen2D_D2Q9_TRT) {
+    run_tke_tgv2d_test<lbm::CollisionType::TRT>();
+}
+
+/**
+ * @brief Track D2Q9 MRT Taylor-Green mean kinetic energy over time.
+ */
+TEST(Validation, TKE_TaylorGreen2D_D2Q9_MRT) {
+    run_tke_tgv2d_test<lbm::CollisionType::MRT>();
 }
 
 /**
