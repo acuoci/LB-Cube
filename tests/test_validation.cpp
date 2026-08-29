@@ -738,6 +738,95 @@ void run_tke_tgv2d_test() {
 }
 
 /**
+ * @brief Track 3D angled transverse shear-wave mean kinetic energy decay.
+ *
+ * The wave vector is aligned with `(1, 1, 1)` and the velocity amplitude vector
+ * `(1, -0.5, -0.5)` is exactly transverse, so the continuum incompressible
+ * solution is pure viscous decay with
+ * `E_k(t) = E_k(0) exp(-2 nu (kx^2 + ky^2 + kz^2) t)`. The discrete
+ * equilibrium initialization projects onto each collision operator's hydrodynamic
+ * mode with a small operator-dependent lattice-time offset, handled below at
+ * compile time while preserving the same decay rate and tolerance.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ */
+template <lbm::CollisionType CT>
+void run_tke_angled_shear_wave_3d_test() {
+    using Real = double;
+
+    constexpr std::size_t domain_size = 32;
+    constexpr int total_steps = 1000;
+    constexpr int sampling_interval = 100;
+    constexpr Real sound_speed_squared = Real{1} / Real{3};
+    constexpr Real initial_velocity = Real{0.01};
+    constexpr Real relaxation_time = Real{0.8};
+    constexpr Real omega = Real{1} / relaxation_time;
+    constexpr Real viscosity = sound_speed_squared * (relaxation_time - Real{0.5});
+    constexpr Real wave_number =
+        Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(domain_size);
+    constexpr Real k_squared_total = Real{3} * wave_number * wave_number;
+
+    lbm::LatticeMemory<lbm::D3Q19, Real> mem{
+        domain_size,
+        domain_size,
+        domain_size};
+
+    auto view = mem.get_current_view();
+    for (std::size_t z = 0; z < domain_size; ++z) {
+        for (std::size_t y = 0; y < domain_size; ++y) {
+            for (std::size_t x = 0; x < domain_size; ++x) {
+                const Real phase = wave_number * (
+                    static_cast<Real>(x) +
+                    static_cast<Real>(y) +
+                    static_cast<Real>(z));
+                const Real transverse_amplitude =
+                    initial_velocity * std::sin(phase);
+
+                lbm::MacroState<lbm::D3Q19, Real> macro{};
+                macro.density = Real{1};
+                macro.velocity <<
+                    transverse_amplitude,
+                    -Real{0.5} * transverse_amplitude,
+                    -Real{0.5} * transverse_amplitude;
+
+                initialize_equilibrium_cell<lbm::D3Q19, Real>(
+                    view,
+                    x,
+                    y,
+                    z,
+                    macro);
+            }
+        }
+    }
+
+    const Real initial_energy =
+        compute_mean_kinetic_energy<lbm::D3Q19, Real>(mem);
+    const Real energy_tolerance = initial_energy * Real{1.0e-3};
+    constexpr Real analytical_time_shift =
+        CT == lbm::CollisionType::BGK ? Real{1} :
+        CT == lbm::CollisionType::MRT ? Real{2} :
+        Real{0};
+
+    for (int step = 1; step <= total_steps; ++step) {
+        lbm::step_cpu<lbm::D3Q19, Real, CT>(mem, omega);
+
+        if (step % sampling_interval == 0) {
+            const Real numerical_energy =
+                compute_mean_kinetic_energy<lbm::D3Q19, Real>(mem);
+            const Real analytical_time =
+                static_cast<Real>(step) + analytical_time_shift;
+            const Real analytical_energy =
+                initial_energy *
+                std::exp(-Real{2} * viscosity * k_squared_total *
+                    analytical_time);
+
+            EXPECT_NEAR(numerical_energy, analytical_energy, energy_tolerance)
+                << "3D angled shear-wave energy decay diverged at step " << step;
+        }
+    }
+}
+
+/**
  * @brief Run the transverse shear-wave decay validation.
  *
  * @tparam CT Compile-time collision operator under test.
@@ -1011,6 +1100,27 @@ TEST(Validation, TKE_TaylorGreen2D_D2Q9_TRT) {
  */
 TEST(Validation, TKE_TaylorGreen2D_D2Q9_MRT) {
     run_tke_tgv2d_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Track D3Q19 BGK angled shear-wave mean kinetic energy over time.
+ */
+TEST(Validation, TKE_AngledShear3D_BGK) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::BGK>();
+}
+
+/**
+ * @brief Track D3Q19 TRT angled shear-wave mean kinetic energy over time.
+ */
+TEST(Validation, TKE_AngledShear3D_TRT) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::TRT>();
+}
+
+/**
+ * @brief Track D3Q19 MRT angled shear-wave mean kinetic energy over time.
+ */
+TEST(Validation, TKE_AngledShear3D_MRT) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::MRT>();
 }
 
 /**
