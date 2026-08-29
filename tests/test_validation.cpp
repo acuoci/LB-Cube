@@ -1268,7 +1268,7 @@ void run_spatial_convergence_test(double eoc_tolerance = 0.15) {
 /**
  * @brief Verify that periodic BGK stepping conserves total mass in 3D.
  */
-TEST(LBMValidation, MassConservationD3Q19Cpu) {
+TEST(FluidDynamics3D, MassConservationD3Q19Cpu) {
     constexpr std::size_t x_extent = 32;
     constexpr std::size_t y_extent = 32;
     constexpr std::size_t z_extent = 32;
@@ -1293,154 +1293,154 @@ TEST(LBMValidation, MassConservationD3Q19Cpu) {
 /**
  * @brief Validate BGK viscous decay of a transverse D2Q9 shear wave.
  */
-TEST(Validation, ShearWaveDecay_BGK) {
+TEST(FluidDynamics2D, ShearWaveDecay_BGK) {
     run_shear_wave_decay_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Validate TRT viscous decay of a transverse D2Q9 shear wave.
  */
-TEST(Validation, ShearWaveDecay_TRT) {
+TEST(FluidDynamics2D, ShearWaveDecay_TRT) {
     run_shear_wave_decay_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Validate MRT viscous decay of a transverse D2Q9 shear wave.
  */
-TEST(Validation, ShearWaveDecay_MRT) {
+TEST(FluidDynamics2D, ShearWaveDecay_MRT) {
     run_shear_wave_decay_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Validate BGK D2Q9 Taylor-Green kinetic-energy decay against theory.
  */
-TEST(Validation, TaylorGreenVortex_BGK) {
+TEST(FluidDynamics2D, TaylorGreenVortex_BGK) {
     run_taylor_green_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Validate TRT D2Q9 Taylor-Green kinetic-energy decay against theory.
  */
-TEST(Validation, TaylorGreenVortex_TRT) {
+TEST(FluidDynamics2D, TaylorGreenVortex_TRT) {
     run_taylor_green_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Validate MRT D2Q9 Taylor-Green kinetic-energy decay against theory.
  */
-TEST(Validation, TaylorGreenVortex_MRT) {
+TEST(FluidDynamics2D, TaylorGreenVortex_MRT) {
     run_taylor_green_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Validate BGK D3Q19 Taylor-Green velocity decay against theory.
  */
-TEST(Validation, TaylorGreenVortex3D_BGK) {
+TEST(FluidDynamics3D, TaylorGreenVortex3D_BGK) {
     run_taylor_green_3d_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Validate TRT D3Q19 Taylor-Green velocity decay against theory.
  */
-TEST(Validation, TaylorGreenVortex3D_TRT) {
+TEST(FluidDynamics3D, TaylorGreenVortex3D_TRT) {
     run_taylor_green_3d_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Validate MRT D3Q19 Taylor-Green velocity decay against theory.
  */
-TEST(Validation, TaylorGreenVortex3D_MRT) {
+TEST(FluidDynamics3D, TaylorGreenVortex3D_MRT) {
     run_taylor_green_3d_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Track D2Q9 BGK shear-wave mean kinetic energy over time.
  */
-TEST(Validation, TKE_ShearWave_D2Q9_BGK) {
+TEST(FluidDynamics2D, TKE_ShearWave_D2Q9_BGK) {
     run_tke_shear_wave_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Track D2Q9 TRT shear-wave mean kinetic energy over time.
  */
-TEST(Validation, TKE_ShearWave_D2Q9_TRT) {
+TEST(FluidDynamics2D, TKE_ShearWave_D2Q9_TRT) {
     run_tke_shear_wave_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Track D2Q9 MRT shear-wave mean kinetic energy over time.
  */
-TEST(Validation, TKE_ShearWave_D2Q9_MRT) {
+TEST(FluidDynamics2D, TKE_ShearWave_D2Q9_MRT) {
     run_tke_shear_wave_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Track D2Q9 BGK Taylor-Green mean kinetic energy over time.
  */
-TEST(Validation, TKE_TaylorGreen2D_D2Q9_BGK) {
+TEST(FluidDynamics2D, TKE_TaylorGreen2D_D2Q9_BGK) {
     run_tke_tgv2d_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Track D2Q9 TRT Taylor-Green mean kinetic energy over time.
  */
-TEST(Validation, TKE_TaylorGreen2D_D2Q9_TRT) {
+TEST(FluidDynamics2D, TKE_TaylorGreen2D_D2Q9_TRT) {
     run_tke_tgv2d_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Track D2Q9 MRT Taylor-Green mean kinetic energy over time.
  */
-TEST(Validation, TKE_TaylorGreen2D_D2Q9_MRT) {
+TEST(FluidDynamics2D, TKE_TaylorGreen2D_D2Q9_MRT) {
     run_tke_tgv2d_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Track D3Q19 BGK angled shear-wave mean kinetic energy over time.
  */
-TEST(Validation, TKE_AngledShear3D_BGK) {
+TEST(FluidDynamics3D, TKE_AngledShear3D_BGK) {
     run_tke_angled_shear_wave_3d_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Track D3Q19 TRT angled shear-wave mean kinetic energy over time.
  */
-TEST(Validation, TKE_AngledShear3D_TRT) {
+TEST(FluidDynamics3D, TKE_AngledShear3D_TRT) {
     run_tke_angled_shear_wave_3d_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Track D3Q19 MRT angled shear-wave mean kinetic energy over time.
  */
-TEST(Validation, TKE_AngledShear3D_MRT) {
+TEST(FluidDynamics3D, TKE_AngledShear3D_MRT) {
     run_tke_angled_shear_wave_3d_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Track BGK energy decay of an advected D3Q19 angled shear wave.
  */
-TEST(Validation, DISABLED_AdvectedShear3D_BGK) {
+TEST(FluidDynamics3D, DISABLED_AdvectedShear3D_BGK) {
     run_advected_shear_wave_3d_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Track TRT energy decay of an advected D3Q19 angled shear wave.
  */
-TEST(Validation, AdvectedShear3D_TRT) {
+TEST(FluidDynamics3D, AdvectedShear3D_TRT) {
     run_advected_shear_wave_3d_test<lbm::CollisionType::TRT>();
 }
 
 /**
  * @brief Track MRT energy decay of an advected D3Q19 angled shear wave.
  */
-TEST(Validation, AdvectedShear3D_MRT) {
+TEST(FluidDynamics3D, AdvectedShear3D_MRT) {
     run_advected_shear_wave_3d_test<lbm::CollisionType::MRT>();
 }
 
 /**
  * @brief Verify that the hardcoded D2Q9 MRT transform and inverse are consistent.
  */
-TEST(Validation, MRT_D2Q9_Transformation_Identity) {
+TEST(MathAndTransforms, MRT_D2Q9_Transformation_Identity) {
     constexpr std::array<double, 9> f_original{
         1.125, 2.25, 3.375, 4.5, 5.625, 6.75, 7.875, 9.0, 10.125
     };
@@ -1458,7 +1458,7 @@ TEST(Validation, MRT_D2Q9_Transformation_Identity) {
 /**
  * @brief Verify that the hardcoded D3Q19 MRT transform and inverse are consistent.
  */
-TEST(Validation, MRT_D3Q19_Transformation_Identity) {
+TEST(MathAndTransforms, MRT_D3Q19_Transformation_Identity) {
     constexpr std::array<double, 19> f_original{
         0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10,
         0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19
@@ -1480,7 +1480,7 @@ TEST(Validation, MRT_D3Q19_Transformation_Identity) {
  * A sinusoidal D2Q5 scalar wave is transported by a uniform x velocity and
  * damped by scalar diffusivity `D = c_s^2 (tau_c - 0.5)`.
  */
-TEST(LBMValidation, PassiveScalarAdvectionDiffusion) {
+TEST(ReactiveTransport, PassiveScalarAdvectionDiffusion) {
     constexpr std::size_t x_extent = 64;
     constexpr std::size_t y_extent = 8;
     constexpr int iterations = 200;
@@ -1545,7 +1545,7 @@ TEST(LBMValidation, PassiveScalarAdvectionDiffusion) {
  * preserve spatial uniformity, so the fused ADR loop reduces to the analytical
  * second-order batch reactor `C(t) = C0 / (1 + C0 k t)`.
  */
-TEST(LBMValidation, ReactionKineticsBatch) {
+TEST(MathAndTransforms, ReactionKineticsBatch) {
     constexpr std::size_t x_extent = 16;
     constexpr std::size_t y_extent = 16;
     constexpr int iterations = 200;
@@ -1602,7 +1602,7 @@ TEST(LBMValidation, ReactionKineticsBatch) {
  * consume both species by the same amount while keeping concentrations finite
  * and non-negative.
  */
-TEST(LBMValidation, SegregatedReactiveMixingD2Q5Cpu) {
+TEST(ReactiveTransport, SegregatedReactiveMixingD2Q5Cpu) {
     constexpr std::size_t x_extent = 32;
     constexpr std::size_t y_extent = 32;
     constexpr int iterations = 20;
@@ -1655,14 +1655,14 @@ TEST(LBMValidation, SegregatedReactiveMixingD2Q5Cpu) {
 /**
  * @brief Verify approximately second-order spatial convergence for D2Q9.
  */
-TEST(Validation, SpatialConvergence) {
+TEST(Convergence, SpatialConvergence) {
     run_spatial_convergence_test<lbm::CollisionType::BGK>();
 }
 
 /**
  * @brief Verify MRT keeps second-order spatial convergence for D2Q9.
  */
-TEST(Validation, SpatialConvergence_MRT) {
+TEST(Convergence, SpatialConvergence_MRT) {
     run_spatial_convergence_test<lbm::CollisionType::MRT>(0.35);
 }
 
@@ -1674,7 +1674,7 @@ TEST(Validation, SpatialConvergence_MRT) {
  * two coarse grids the measured order may be higher than two, so the assertion
  * checks the lower bound required for `O(dx^2)` accuracy.
  */
-TEST(Validation, SpatialConvergence3D) {
+TEST(Convergence, SpatialConvergence3D) {
     const double error_16_mrt = run_3d_shear_error<lbm::CollisionType::MRT>(16);
     const double error_32_mrt = run_3d_shear_error<lbm::CollisionType::MRT>(32);
     const double eoc_mrt = std::log2(error_16_mrt / error_32_mrt);
@@ -1693,7 +1693,7 @@ TEST(Validation, SpatialConvergence3D) {
 /**
  * @brief Verify temporal convergence for D2Q9 BGK, TRT, and MRT shear waves.
  */
-TEST(Validation, TemporalConvergence) {
+TEST(Convergence, TemporalConvergence) {
     const double error_1_bgk = run_temporal_error<lbm::CollisionType::BGK>(1);
     const double error_2_bgk = run_temporal_error<lbm::CollisionType::BGK>(2);
     const double eoc_bgk = std::log2(error_1_bgk / error_2_bgk);
