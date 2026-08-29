@@ -132,6 +132,28 @@ set_target_properties(
         CXX_EXTENSIONS NO
 )
 
+add_executable(lbm_compare_operators src/compare_operators.cpp)
+
+target_link_libraries(
+    lbm_compare_operators
+    PRIVATE
+        lbm::core
+)
+
+target_compile_features(
+    lbm_compare_operators
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_compare_operators
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
 enable_testing()
 
 add_executable(lbm_validation_tests tests/test_validation.cpp)
