@@ -916,6 +916,123 @@ void run_advected_shear_wave_3d_test() {
 }
 
 /**
+ * @brief Run a diffusive-scaling 3D angled shear wave and return L2 speed error.
+ *
+ * The stationary transverse shear wave is initialized on an `N^3` D3Q19 grid.
+ * Lattice velocity, viscosity, and time step count are scaled diffusively from
+ * the `N0 = 16` reference case so that `N = 16` and `N = 32` represent the same
+ * physical state. The returned norm compares velocity magnitude against the
+ * analytical amplitude decay `exp(-nu |k|^2 t)`.
+ *
+ * @tparam CT Compile-time collision operator under test.
+ * @param n Number of grid points along each periodic direction.
+ * @return Relative L2 error of the velocity magnitude at the final time.
+ */
+template <lbm::CollisionType CT>
+double run_3d_shear_error(int n) {
+    using Real = double;
+
+    constexpr Real base_grid = Real{16};
+    constexpr Real physical_time = Real{1};
+    constexpr Real base_velocity = Real{0.01};
+    constexpr Real base_relaxation_time = Real{0.8};
+    constexpr Real sound_speed_squared = Real{1} / Real{3};
+
+    const Real q = static_cast<Real>(n) / base_grid;
+    const Real lattice_velocity = base_velocity / q;
+    const Real base_viscosity =
+        sound_speed_squared * (base_relaxation_time - Real{0.5});
+    const Real lattice_viscosity = base_viscosity / q;
+    const Real relaxation_time = Real{3} * lattice_viscosity + Real{0.5};
+    const Real omega = Real{1} / relaxation_time;
+    const int time_steps = static_cast<int>(
+        physical_time * base_grid * base_grid * q * q);
+    const Real wave_number =
+        Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(n);
+    const Real k_squared_total = Real{3} * wave_number * wave_number;
+    const auto domain_size = static_cast<std::size_t>(n);
+
+    lbm::LatticeMemory<lbm::D3Q19, Real> mem{
+        domain_size,
+        domain_size,
+        domain_size};
+
+    auto initial_view = mem.get_current_view();
+    for (std::size_t z = 0; z < domain_size; ++z) {
+        for (std::size_t y = 0; y < domain_size; ++y) {
+            for (std::size_t x = 0; x < domain_size; ++x) {
+                const Real phase = wave_number * (
+                    static_cast<Real>(x) +
+                    static_cast<Real>(y) +
+                    static_cast<Real>(z));
+                const Real transverse_amplitude =
+                    lattice_velocity * std::sin(phase);
+
+                lbm::MacroState<lbm::D3Q19, Real> macro{};
+                macro.density = Real{1};
+                macro.velocity <<
+                    transverse_amplitude,
+                    -Real{0.5} * transverse_amplitude,
+                    -Real{0.5} * transverse_amplitude;
+
+                initialize_equilibrium_cell<lbm::D3Q19, Real>(
+                    initial_view,
+                    x,
+                    y,
+                    z,
+                    macro);
+            }
+        }
+    }
+
+    for (int step = 0; step < time_steps; ++step) {
+        lbm::step_cpu<lbm::D3Q19, Real, CT>(mem, omega);
+    }
+
+    const auto final_view = mem.get_current_view();
+    constexpr Real analytical_time_shift =
+        CT == lbm::CollisionType::MRT ? Real{2} : Real{0};
+    const Real analytical_time =
+        static_cast<Real>(time_steps) + analytical_time_shift;
+    const Real decay = std::exp(
+        -lattice_viscosity * k_squared_total *
+        analytical_time);
+    long double numerator = 0.0L;
+    long double denominator = 0.0L;
+
+    for (std::size_t z = 0; z < domain_size; ++z) {
+        for (std::size_t y = 0; y < domain_size; ++y) {
+            for (std::size_t x = 0; x < domain_size; ++x) {
+                const Real phase = wave_number * (
+                    static_cast<Real>(x) +
+                    static_cast<Real>(y) +
+                    static_cast<Real>(z));
+                const Real analytical_speed =
+                    std::sqrt(Real{1.5}) *
+                    std::abs(lattice_velocity * std::sin(phase)) *
+                    decay;
+
+                std::array<Real, static_cast<std::size_t>(lbm::D3Q19::Q)> local_pops{};
+                for (int i = 0; i < lbm::D3Q19::Q; ++i) {
+                    local_pops[static_cast<std::size_t>(i)] =
+                        final_view[static_cast<std::size_t>(i), z, y, x];
+                }
+
+                const lbm::MacroState<lbm::D3Q19, Real> macro =
+                    lbm::compute_macro_state<lbm::D3Q19, Real>(local_pops);
+                const Real error = macro.velocity.norm() - analytical_speed;
+
+                numerator += static_cast<long double>(error * error);
+                denominator += static_cast<long double>(
+                    analytical_speed * analytical_speed);
+            }
+        }
+    }
+
+    return std::sqrt(static_cast<double>(numerator / denominator));
+}
+
+/**
  * @brief Run the transverse shear-wave decay validation.
  *
  * @tparam CT Compile-time collision operator under test.
@@ -1460,4 +1577,28 @@ TEST(Validation, SpatialConvergence) {
  */
 TEST(Validation, SpatialConvergence_MRT) {
     run_spatial_convergence_test<lbm::CollisionType::MRT>(0.35);
+}
+
+/**
+ * @brief Verify at least second-order spatial convergence for D3Q19 TRT and MRT.
+ *
+ * BGK is intentionally omitted here because the advected-shear validation
+ * already exposes its Galilean-invariance defect for this 3D mode. With only
+ * two coarse grids the measured order may be higher than two, so the assertion
+ * checks the lower bound required for `O(dx^2)` accuracy.
+ */
+TEST(Validation, SpatialConvergence3D) {
+    const double error_16_mrt = run_3d_shear_error<lbm::CollisionType::MRT>(16);
+    const double error_32_mrt = run_3d_shear_error<lbm::CollisionType::MRT>(32);
+    const double eoc_mrt = std::log2(error_16_mrt / error_32_mrt);
+    EXPECT_GE(eoc_mrt, 1.85)
+        << "MRT errors: N=16 -> " << error_16_mrt
+        << ", N=32 -> " << error_32_mrt;
+
+    const double error_16_trt = run_3d_shear_error<lbm::CollisionType::TRT>(16);
+    const double error_32_trt = run_3d_shear_error<lbm::CollisionType::TRT>(32);
+    const double eoc_trt = std::log2(error_16_trt / error_32_trt);
+    EXPECT_GE(eoc_trt, 1.85)
+        << "TRT errors: N=16 -> " << error_16_trt
+        << ", N=32 -> " << error_32_trt;
 }
