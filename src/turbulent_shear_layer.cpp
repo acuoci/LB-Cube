@@ -33,14 +33,13 @@
 
 namespace {
 
-using FluidLattice = lbm::D2Q9;
 using ScalarLattice = lbm::D2Q5;
 using Real = double;
 using lbm::CollisionType;
 
 constexpr std::size_t nx = 512;
 constexpr std::size_t ny = 512;
-constexpr int total_steps = 30000;
+constexpr int total_steps = 10000;
 constexpr int stability_check_frequency = 50;
 constexpr int vtk_frequency = 1000;
 constexpr Real u0 = Real{0.04};
@@ -50,9 +49,12 @@ constexpr Real fluid_relaxation_time = Real{0.5005};
 constexpr Real scalar_relaxation_time = Real{0.8};
 constexpr Real crash_velocity_threshold = Real{1.0};
 
+template <lbm::IsLatticeModel FluidLattice>
 [[nodiscard]] lbm::MacroState<FluidLattice, Real> shear_layer_macro(
     std::size_t x_index,
     std::size_t y_index) {
+    static_assert(FluidLattice::D == 2, "The shear-layer benchmark is 2D only.");
+
     const Real x_normalized = static_cast<Real>(x_index) / static_cast<Real>(nx);
     const Real y_normalized = static_cast<Real>(y_index) / static_cast<Real>(ny);
 
@@ -68,10 +70,13 @@ constexpr Real crash_velocity_threshold = Real{1.0};
     return macro;
 }
 
+template <lbm::IsLatticeModel FluidLattice>
 void initialize_fields(
     lbm::LatticeMemory<FluidLattice, Real>& fluid,
     lbm::LatticeMemory<ScalarLattice, Real>& species_a,
     lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    static_assert(FluidLattice::D == 2, "The shear-layer benchmark is 2D only.");
+
     auto fluid_view = fluid.get_current_view();
     auto a_view = species_a.get_current_view();
     auto b_view = species_b.get_current_view();
@@ -83,7 +88,7 @@ void initialize_fields(
 
         for (std::size_t x_index = 0; x_index < nx; ++x_index) {
             const lbm::MacroState<FluidLattice, Real> macro =
-                shear_layer_macro(x_index, y_index);
+                shear_layer_macro<FluidLattice>(x_index, y_index);
 
             for (int i = 0; i < FluidLattice::Q; ++i) {
                 fluid_view[static_cast<std::size_t>(i), y_index, x_index] =
@@ -107,6 +112,7 @@ void initialize_fields(
     }
 }
 
+template <lbm::IsLatticeModel FluidLattice>
 [[nodiscard]] lbm::MacroState<FluidLattice, Real> fluid_macro_at(
     typename lbm::LatticeMemory<FluidLattice, Real>::ConstView view,
     std::size_t x_index,
@@ -135,15 +141,18 @@ void initialize_fields(
     return lbm::compute_concentration<ScalarLattice, Real>(populations);
 }
 
+template <lbm::IsLatticeModel FluidLattice>
 [[nodiscard]] Real compute_max_velocity(
     const lbm::LatticeMemory<FluidLattice, Real>& fluid) {
+    static_assert(FluidLattice::D == 2, "The shear-layer benchmark is 2D only.");
+
     const auto view = fluid.get_current_view();
     Real max_velocity{};
 
     for (std::size_t y_index = 0; y_index < ny; ++y_index) {
         for (std::size_t x_index = 0; x_index < nx; ++x_index) {
             const lbm::MacroState<FluidLattice, Real> macro =
-                fluid_macro_at(view, x_index, y_index);
+                fluid_macro_at<FluidLattice>(view, x_index, y_index);
             const Real speed = std::sqrt(macro.velocity.squaredNorm());
 
             if (!std::isfinite(speed)) {
@@ -157,6 +166,7 @@ void initialize_fields(
     return max_velocity;
 }
 
+template <lbm::IsLatticeModel FluidLattice>
 void write_shear_layer_vtk(
     const std::filesystem::path& output_dir,
     const std::string& name,
@@ -164,6 +174,8 @@ void write_shear_layer_vtk(
     const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
     std::size_t time_step) {
+    static_assert(FluidLattice::D == 2, "The shear-layer benchmark is 2D only.");
+
     const std::filesystem::path filename =
         output_dir / std::format("shear_{}_{:06}.vtk", name, time_step);
     std::ofstream vtk{filename};
@@ -189,7 +201,7 @@ void write_shear_layer_vtk(
     for (std::size_t y_index = 0; y_index < ny; ++y_index) {
         for (std::size_t x_index = 0; x_index < nx; ++x_index) {
             const lbm::MacroState<FluidLattice, Real> macro =
-                fluid_macro_at(fluid_view, x_index, y_index);
+                fluid_macro_at<FluidLattice>(fluid_view, x_index, y_index);
             vtk << std::format(
                 "{:.17g} {:.17g} 0\n",
                 static_cast<double>(macro.velocity[0]),
@@ -202,7 +214,7 @@ void write_shear_layer_vtk(
     for (std::size_t y_index = 0; y_index < ny; ++y_index) {
         for (std::size_t x_index = 0; x_index < nx; ++x_index) {
             const lbm::MacroState<FluidLattice, Real> macro =
-                fluid_macro_at(fluid_view, x_index, y_index);
+                fluid_macro_at<FluidLattice>(fluid_view, x_index, y_index);
             vtk << std::format(
                 "{:.17g}\n",
                 static_cast<double>(std::sqrt(macro.velocity.squaredNorm())));
@@ -230,9 +242,11 @@ void write_shear_layer_vtk(
     }
 }
 
-template <CollisionType CT>
-void run_shear_layer_impl(const std::string& name) {
-    const std::filesystem::path output_dir = std::format("output_shear_{}", name);
+template <lbm::IsLatticeModel FluidLattice, CollisionType CT>
+void run_shear_layer(const std::string& name) {
+    static_assert(FluidLattice::D == 2, "The shear-layer benchmark is 2D only.");
+
+    const std::filesystem::path output_dir = std::format("output_shear2d_{}", name);
     std::filesystem::create_directories(output_dir);
 
     const std::filesystem::path stability_filename =
@@ -246,7 +260,7 @@ void run_shear_layer_impl(const std::string& name) {
     lbm::LatticeMemory<FluidLattice, Real> fluid{nx, ny};
     lbm::LatticeMemory<ScalarLattice, Real> species_a{nx, ny};
     lbm::LatticeMemory<ScalarLattice, Real> species_b{nx, ny};
-    initialize_fields(fluid, species_a, species_b);
+    initialize_fields<FluidLattice>(fluid, species_a, species_b);
 
     const Real omega = Real{1} / fluid_relaxation_time;
     const Real omega_c = Real{1} / scalar_relaxation_time;
@@ -255,8 +269,8 @@ void run_shear_layer_impl(const std::string& name) {
               << "Output: " << output_dir.string() << '\n'
               << std::flush;
 
-    write_shear_layer_vtk(output_dir, name, fluid, species_a, species_b, 0);
-    stability_log << "0," << compute_max_velocity(fluid) << '\n';
+    write_shear_layer_vtk<FluidLattice>(output_dir, name, fluid, species_a, species_b, 0);
+    stability_log << "0," << compute_max_velocity<FluidLattice>(fluid) << '\n';
 
     const auto start = std::chrono::high_resolution_clock::now();
     int completed_steps = 0;
@@ -275,7 +289,7 @@ void run_shear_layer_impl(const std::string& name) {
         completed_steps = step;
 
         if (step % stability_check_frequency == 0) {
-            const Real max_velocity = compute_max_velocity(fluid);
+            const Real max_velocity = compute_max_velocity<FluidLattice>(fluid);
             stability_log << step << ',' << std::format("{:.17g}", max_velocity) << '\n';
 
             if (!std::isfinite(max_velocity) || max_velocity > crash_velocity_threshold) {
@@ -283,7 +297,7 @@ void run_shear_layer_impl(const std::string& name) {
                           << "step=" << step
                           << ", Umax=" << max_velocity << '\n'
                           << std::flush;
-                write_shear_layer_vtk(
+                write_shear_layer_vtk<FluidLattice>(
                     output_dir,
                     name,
                     fluid,
@@ -296,7 +310,7 @@ void run_shear_layer_impl(const std::string& name) {
         }
 
         if (step % vtk_frequency == 0) {
-            write_shear_layer_vtk(
+            write_shear_layer_vtk<FluidLattice>(
                 output_dir,
                 name,
                 fluid,
@@ -325,23 +339,6 @@ void run_shear_layer_impl(const std::string& name) {
               << std::flush;
 }
 
-void run_shear_layer(CollisionType collision_type, const std::string& name) {
-    switch (collision_type) {
-    case CollisionType::BGK:
-        run_shear_layer_impl<CollisionType::BGK>(name);
-        break;
-    case CollisionType::TRT:
-        run_shear_layer_impl<CollisionType::TRT>(name);
-        break;
-    case CollisionType::MRT:
-        run_shear_layer_impl<CollisionType::MRT>(name);
-        break;
-    case CollisionType::RLBM:
-        run_shear_layer_impl<CollisionType::RLBM>(name);
-        break;
-    }
-}
-
 } // namespace
 
 int main() {
@@ -354,15 +351,15 @@ int main() {
                   << "kappa: " << shear_steepness << '\n'
                   << "tau: " << fluid_relaxation_time << '\n'
                   << "nu: "
-                  << static_cast<Real>(FluidLattice::cs2) *
+                  << static_cast<Real>(lbm::D2Q9::cs2) *
                          (fluid_relaxation_time - Real{0.5})
                   << '\n'
                   << std::flush;
 
-        run_shear_layer(CollisionType::BGK, "D2Q9_BGK");
-        run_shear_layer(CollisionType::TRT, "D2Q9_TRT");
-        run_shear_layer(CollisionType::MRT, "D2Q9_MRT");
-        run_shear_layer(CollisionType::RLBM, "D2Q9_RLBM");
+        run_shear_layer<lbm::D2Q9, CollisionType::BGK>("D2Q9_BGK");
+        run_shear_layer<lbm::D2Q9, CollisionType::TRT>("D2Q9_TRT");
+        run_shear_layer<lbm::D2Q9, CollisionType::MRT>("D2Q9_MRT");
+        run_shear_layer<lbm::D2Q9, CollisionType::RLBM>("D2Q9_RLBM");
 
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
