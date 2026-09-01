@@ -109,11 +109,20 @@ __device__ inline void collide_cell(
             mrt::MrtRelaxationRates_D3Q19<Real> relaxation_rates{};
             relaxation_rates.s_nu = omega;
             mrt::collide_mrt_d3q19<Real>(local_pops, macro, relaxation_rates);
+        } else if constexpr (std::is_same_v<Lattice, D3Q27>) {
+            mrt::MrtRelaxationRates_D3Q27<Real> relaxation_rates{};
+            relaxation_rates.s_nu = omega;
+            relaxation_rates.s_b = omega;
+            mrt::collide_mrt_d3q27<Real>(local_pops, macro, relaxation_rates);
         } else {
             static_assert(
                 always_false_v<Lattice>,
-                "MRT is currently only supported for D2Q9 and D3Q19.");
+                "MRT is currently only supported for D2Q9, D3Q19, and D3Q27.");
         }
+    } else if constexpr (CT == CollisionType::RLBM) {
+        const MacroState<Lattice, Real> macro =
+            compute_macro_state<Lattice, Real>(local_pops);
+        collide_regularized<Lattice, Real>(local_pops, macro, omega);
     }
 }
 
@@ -779,6 +788,23 @@ template __global__ void kernel_step<D3Q19, float, CollisionType::MRT>(
     const float*, float*, std::size_t, std::size_t, std::size_t, float);
 template __global__ void kernel_step<D3Q19, double, CollisionType::MRT>(
     const double*, double*, std::size_t, std::size_t, std::size_t, double);
+template __global__ void kernel_step<D3Q27, float, CollisionType::MRT>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float);
+template __global__ void kernel_step<D3Q27, double, CollisionType::MRT>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double);
+
+template __global__ void kernel_step<D2Q9, float, CollisionType::RLBM>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float);
+template __global__ void kernel_step<D2Q9, double, CollisionType::RLBM>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double);
+template __global__ void kernel_step<D3Q19, float, CollisionType::RLBM>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float);
+template __global__ void kernel_step<D3Q19, double, CollisionType::RLBM>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double);
+template __global__ void kernel_step<D3Q27, float, CollisionType::RLBM>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float);
+template __global__ void kernel_step<D3Q27, double, CollisionType::RLBM>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double);
 
 template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::BGK>(
     const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
@@ -813,6 +839,23 @@ template cudaError_t launch_step_gpu<D2Q9, double, CollisionType::MRT>(
 template cudaError_t launch_step_gpu<D3Q19, float, CollisionType::MRT>(
     const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
 template cudaError_t launch_step_gpu<D3Q19, double, CollisionType::MRT>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
+template cudaError_t launch_step_gpu<D3Q27, float, CollisionType::MRT>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
+template cudaError_t launch_step_gpu<D3Q27, double, CollisionType::MRT>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
+
+template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::RLBM>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
+template cudaError_t launch_step_gpu<D2Q9, double, CollisionType::RLBM>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
+template cudaError_t launch_step_gpu<D3Q19, float, CollisionType::RLBM>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
+template cudaError_t launch_step_gpu<D3Q19, double, CollisionType::RLBM>(
+    const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
+template cudaError_t launch_step_gpu<D3Q27, float, CollisionType::RLBM>(
+    const float*, float*, std::size_t, std::size_t, std::size_t, float, dim3);
+template cudaError_t launch_step_gpu<D3Q27, double, CollisionType::RLBM>(
     const double*, double*, std::size_t, std::size_t, std::size_t, double, dim3);
 
 template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::BGK>(
@@ -849,6 +892,23 @@ template cudaError_t launch_step_gpu<D3Q19, float, CollisionType::MRT>(
     const LatticeMemory<D3Q19, float>&, const float*, float*, float, dim3);
 template cudaError_t launch_step_gpu<D3Q19, double, CollisionType::MRT>(
     const LatticeMemory<D3Q19, double>&, const double*, double*, double, dim3);
+template cudaError_t launch_step_gpu<D3Q27, float, CollisionType::MRT>(
+    const LatticeMemory<D3Q27, float>&, const float*, float*, float, dim3);
+template cudaError_t launch_step_gpu<D3Q27, double, CollisionType::MRT>(
+    const LatticeMemory<D3Q27, double>&, const double*, double*, double, dim3);
+
+template cudaError_t launch_step_gpu<D2Q9, float, CollisionType::RLBM>(
+    const LatticeMemory<D2Q9, float>&, const float*, float*, float, dim3);
+template cudaError_t launch_step_gpu<D2Q9, double, CollisionType::RLBM>(
+    const LatticeMemory<D2Q9, double>&, const double*, double*, double, dim3);
+template cudaError_t launch_step_gpu<D3Q19, float, CollisionType::RLBM>(
+    const LatticeMemory<D3Q19, float>&, const float*, float*, float, dim3);
+template cudaError_t launch_step_gpu<D3Q19, double, CollisionType::RLBM>(
+    const LatticeMemory<D3Q19, double>&, const double*, double*, double, dim3);
+template cudaError_t launch_step_gpu<D3Q27, float, CollisionType::RLBM>(
+    const LatticeMemory<D3Q27, float>&, const float*, float*, float, dim3);
+template cudaError_t launch_step_gpu<D3Q27, double, CollisionType::RLBM>(
+    const LatticeMemory<D3Q27, double>&, const double*, double*, double, dim3);
 
 template __global__ void kernel_scalar_step<D2Q9, D2Q5, float>(
     const float*, float*, const float*, std::size_t, std::size_t, std::size_t, float, float);

@@ -1,11 +1,11 @@
 /**
- * @file compare_operators.cpp
- * @brief Compare BGK, TRT, MRT, and RLBM collision operators on the same 2D reactive-mixing case.
+ * @file turbulent_shear_layer.cpp
+ * @brief High-Reynolds-number doubly periodic shear-layer benchmark.
  *
- * The executable runs four independent D2Q9/D2Q5 simulations with identical
- * initial conditions. Each run writes scalar mixing diagnostics at high
- * frequency and periodic VTK snapshots so the operators can be compared in
- * terms of mixing, segregation, and reaction progress.
+ * This executable compares BGK, TRT, and MRT on a challenging Kelvin-Helmholtz
+ * instability setup. The case is intentionally configured near the stability
+ * limit so BGK can fail gracefully while TRT and MRT can be inspected under the
+ * same initial conditions.
  */
 
 #include <array>
@@ -18,10 +18,10 @@
 #include <fstream>
 #include <format>
 #include <iostream>
+#include <limits>
 #include <numbers>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 
 #include "lattice_core.hpp"
 #include "lattice_io.hpp"
@@ -37,47 +37,33 @@ using ScalarLattice = lbm::D2Q5;
 using Real = double;
 using lbm::CollisionType;
 
-constexpr std::size_t nx = 256;
-constexpr std::size_t ny = 256;
-constexpr int total_steps = 5000;
-constexpr int stats_frequency = 10;
-constexpr int vtk_frequency = 500;
-constexpr Real fluid_relaxation_time = Real{0.6};
+constexpr std::size_t nx = 512;
+constexpr std::size_t ny = 512;
+constexpr int total_steps = 30000;
+constexpr int stability_check_frequency = 100;
+constexpr int vtk_frequency = 1000;
+constexpr Real u0 = Real{0.04};
+constexpr Real perturbation_amplitude = Real{0.05};
+constexpr Real shear_steepness = Real{80.0};
+constexpr Real fluid_relaxation_time = Real{0.5005};
 constexpr Real scalar_relaxation_time = Real{0.8};
-constexpr Real initial_velocity = Real{0.04};
-constexpr Real reaction_rate = Real{0.05};
+constexpr Real crash_velocity_threshold = Real{1.0};
 
-[[nodiscard]] std::string_view operator_name(CollisionType collision_type) {
-    switch (collision_type) {
-    case CollisionType::BGK:
-        return "BGK";
-    case CollisionType::TRT:
-        return "TRT";
-    case CollisionType::MRT:
-        return "MRT";
-    case CollisionType::RLBM:
-        return "RLBM";
-    }
+[[nodiscard]] lbm::MacroState<FluidLattice, Real> shear_layer_macro(
+    std::size_t x_index,
+    std::size_t y_index) {
+    const Real x_normalized = static_cast<Real>(x_index) / static_cast<Real>(nx);
+    const Real y_normalized = static_cast<Real>(y_index) / static_cast<Real>(ny);
 
-    return "UNKNOWN";
-}
-
-[[nodiscard]] lbm::MacroState<FluidLattice, Real> taylor_green_macro(
-    std::size_t x,
-    std::size_t y) {
-    const Real kx = Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(nx);
-    const Real ky = Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(ny);
-    const Real phase_x = kx * static_cast<Real>(x);
-    const Real phase_y = ky * static_cast<Real>(y);
-    const Real density_perturbation =
-        (initial_velocity * initial_velocity) /
-        (Real{4} * static_cast<Real>(FluidLattice::cs2)) *
-        (std::cos(Real{2} * phase_x) + std::cos(Real{2} * phase_y));
+    const Real ux = y_normalized <= Real{0.5}
+        ? u0 * std::tanh(shear_steepness * (y_normalized - Real{0.25}))
+        : u0 * std::tanh(shear_steepness * (Real{0.75} - y_normalized));
+    const Real uy = u0 * perturbation_amplitude *
+        std::sin(Real{2} * std::numbers::pi_v<Real> * (x_normalized + Real{0.25}));
 
     lbm::MacroState<FluidLattice, Real> macro{};
-    macro.density = Real{1} - density_perturbation;
-    macro.velocity << -initial_velocity * std::cos(phase_x) * std::sin(phase_y),
-        initial_velocity * std::sin(phase_x) * std::cos(phase_y);
+    macro.density = Real{1};
+    macro.velocity << ux, uy;
     return macro;
 }
 
@@ -90,17 +76,18 @@ void initialize_fields(
     auto b_view = species_b.get_current_view();
 
     for (std::size_t y_index = 0; y_index < ny; ++y_index) {
+        const Real y_normalized = static_cast<Real>(y_index) / static_cast<Real>(ny);
+        const Real concentration_a = y_normalized > Real{0.5} ? Real{1} : Real{0};
+        const Real concentration_b = y_normalized <= Real{0.5} ? Real{1} : Real{0};
+
         for (std::size_t x_index = 0; x_index < nx; ++x_index) {
             const lbm::MacroState<FluidLattice, Real> macro =
-                taylor_green_macro(x_index, y_index);
+                shear_layer_macro(x_index, y_index);
 
             for (int i = 0; i < FluidLattice::Q; ++i) {
                 fluid_view[static_cast<std::size_t>(i), y_index, x_index] =
                     lbm::compute_equilibrium<FluidLattice, Real>(i, macro);
             }
-
-            const Real concentration_a = x_index < nx / 2 ? Real{1} : Real{0};
-            const Real concentration_b = x_index < nx / 2 ? Real{0} : Real{1};
 
             for (int i = 0; i < ScalarLattice::Q; ++i) {
                 const auto q = static_cast<std::size_t>(i);
@@ -147,15 +134,37 @@ void initialize_fields(
     return lbm::compute_concentration<ScalarLattice, Real>(populations);
 }
 
-void write_comparison_vtk(
+[[nodiscard]] Real compute_max_velocity(
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid) {
+    const auto view = fluid.get_current_view();
+    Real max_velocity{};
+
+    for (std::size_t y_index = 0; y_index < ny; ++y_index) {
+        for (std::size_t x_index = 0; x_index < nx; ++x_index) {
+            const lbm::MacroState<FluidLattice, Real> macro =
+                fluid_macro_at(view, x_index, y_index);
+            const Real speed = std::sqrt(macro.velocity.squaredNorm());
+
+            if (!std::isfinite(speed)) {
+                return std::numeric_limits<Real>::infinity();
+            }
+
+            max_velocity = std::max(max_velocity, speed);
+        }
+    }
+
+    return max_velocity;
+}
+
+void write_shear_layer_vtk(
     const std::filesystem::path& output_dir,
-    std::string_view collision_name,
+    const std::string& name,
     const lbm::LatticeMemory<FluidLattice, Real>& fluid,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
     std::size_t time_step) {
     const std::filesystem::path filename =
-        output_dir / std::format("comparison_{}_{:06}.vtk", collision_name, time_step);
+        output_dir / std::format("shear_{}_{:06}.vtk", name, time_step);
     std::ofstream vtk{filename};
     if (!vtk) {
         throw std::runtime_error("failed to open " + filename.string());
@@ -167,7 +176,7 @@ void write_comparison_vtk(
     constexpr std::size_t point_count = nx * ny;
 
     vtk << "# vtk DataFile Version 3.0\n";
-    vtk << std::format("LB-Cube {} comparison step {}\n", collision_name, time_step);
+    vtk << std::format("LB-Cube turbulent shear layer {} step {}\n", name, time_step);
     vtk << "ASCII\n";
     vtk << "DATASET STRUCTURED_POINTS\n";
     vtk << std::format("DIMENSIONS {} {} 1\n", nx, ny);
@@ -184,6 +193,18 @@ void write_comparison_vtk(
                 "{:.17g} {:.17g} 0\n",
                 static_cast<double>(macro.velocity[0]),
                 static_cast<double>(macro.velocity[1]));
+        }
+    }
+
+    vtk << "SCALARS velocity_magnitude double 1\n";
+    vtk << "LOOKUP_TABLE default\n";
+    for (std::size_t y_index = 0; y_index < ny; ++y_index) {
+        for (std::size_t x_index = 0; x_index < nx; ++x_index) {
+            const lbm::MacroState<FluidLattice, Real> macro =
+                fluid_macro_at(fluid_view, x_index, y_index);
+            vtk << std::format(
+                "{:.17g}\n",
+                static_cast<double>(std::sqrt(macro.velocity.squaredNorm())));
         }
     }
 
@@ -206,35 +227,20 @@ void write_comparison_vtk(
                 static_cast<double>(scalar_concentration_at(b_view, x_index, y_index)));
         }
     }
-
-    vtk << "SCALARS reaction_rate double 1\n";
-    vtk << "LOOKUP_TABLE default\n";
-    for (std::size_t y_index = 0; y_index < ny; ++y_index) {
-        for (std::size_t x_index = 0; x_index < nx; ++x_index) {
-            const Real concentration_a = scalar_concentration_at(a_view, x_index, y_index);
-            const Real concentration_b = scalar_concentration_at(b_view, x_index, y_index);
-            vtk << std::format(
-                "{:.17g}\n",
-                static_cast<double>(reaction_rate * concentration_a * concentration_b));
-        }
-    }
 }
 
 template <CollisionType CT>
-void run_operator_case(std::string_view collision_name) {
-    const std::filesystem::path output_dir = std::format("output_{}", collision_name);
+void run_shear_layer_impl(const std::string& name) {
+    const std::filesystem::path output_dir = std::format("output_shear_{}", name);
     std::filesystem::create_directories(output_dir);
 
-    const std::filesystem::path stats_filename =
-        output_dir / std::format("stats_{}.csv", collision_name);
-    std::ofstream stats{stats_filename};
-    if (!stats) {
-        throw std::runtime_error("failed to open " + stats_filename.string());
+    const std::filesystem::path stability_filename =
+        output_dir / std::format("stability_{}.csv", name);
+    std::ofstream stability_log{stability_filename};
+    if (!stability_log) {
+        throw std::runtime_error("failed to open " + stability_filename.string());
     }
-
-    stats
-        << "step,mean_A,mean_B,var_A,var_B,covariance,"
-        << "segregation_intensity,true_reaction_rate,mixed_reaction_rate\n";
+    stability_log << "step,max_velocity\n";
 
     lbm::LatticeMemory<FluidLattice, Real> fluid{nx, ny};
     lbm::LatticeMemory<ScalarLattice, Real> species_a{nx, ny};
@@ -244,46 +250,53 @@ void run_operator_case(std::string_view collision_name) {
     const Real omega = Real{1} / fluid_relaxation_time;
     const Real omega_c = Real{1} / scalar_relaxation_time;
 
-    std::cout << "Running " << collision_name << " comparison case\n" << std::flush;
+    std::cout << "Running " << name << " turbulent shear-layer benchmark\n"
+              << "Output: " << output_dir.string() << '\n'
+              << std::flush;
 
-    lbm::log_reactive_diagnostics(
-        stats,
-        0,
-        lbm::compute_reactive_stats<ScalarLattice, Real>(
-            species_a,
-            species_b,
-            reaction_rate));
-    write_comparison_vtk(output_dir, collision_name, fluid, species_a, species_b, 0);
+    write_shear_layer_vtk(output_dir, name, fluid, species_a, species_b, 0);
+    stability_log << "0," << compute_max_velocity(fluid) << '\n';
 
     const auto start = std::chrono::high_resolution_clock::now();
     for (int step = 1; step <= total_steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, CT>(fluid, omega);
-        lbm::step_reaction_AB<FluidLattice, ScalarLattice, Real>(
-            fluid,
+        lbm::step_scalar_cpu<FluidLattice, ScalarLattice, Real>(
             species_a,
+            fluid,
+            omega_c);
+        lbm::step_scalar_cpu<FluidLattice, ScalarLattice, Real>(
             species_b,
-            omega_c,
-            reaction_rate);
+            fluid,
+            omega_c);
 
-        if (step % stats_frequency == 0) {
-            lbm::log_reactive_diagnostics(
-                stats,
-                static_cast<std::size_t>(step),
-                lbm::compute_reactive_stats<ScalarLattice, Real>(
+        if (step % stability_check_frequency == 0) {
+            const Real max_velocity = compute_max_velocity(fluid);
+            stability_log << step << ',' << std::format("{:.17g}", max_velocity) << '\n';
+
+            if (!std::isfinite(max_velocity) || max_velocity > crash_velocity_threshold) {
+                std::cout << name << ": Solver Crashed due to instability! "
+                          << "step=" << step << ", Umax=" << max_velocity << '\n'
+                          << std::flush;
+                write_shear_layer_vtk(
+                    output_dir,
+                    name,
+                    fluid,
                     species_a,
                     species_b,
-                    reaction_rate));
+                    static_cast<std::size_t>(step));
+                break;
+            }
         }
 
         if (step % vtk_frequency == 0) {
-            write_comparison_vtk(
+            write_shear_layer_vtk(
                 output_dir,
-                collision_name,
+                name,
                 fluid,
                 species_a,
                 species_b,
                 static_cast<std::size_t>(step));
-            std::cout << collision_name << ": step " << step << " / " << total_steps
+            std::cout << name << ": step " << step << " / " << total_steps
                       << " complete\n"
                       << std::flush;
         }
@@ -291,28 +304,19 @@ void run_operator_case(std::string_view collision_name) {
 
     const auto stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> elapsed = stop - start;
-    const double updates =
-        static_cast<double>(nx) * static_cast<double>(ny) * static_cast<double>(total_steps);
-    const double mlups = updates / elapsed.count() / 1.0e6;
-
-    std::cout << collision_name << " complete in " << elapsed.count() << " s ("
-              << mlups << " MLUPS fluid step basis)\n"
-              << std::flush;
+    std::cout << name << " elapsed time: " << elapsed.count() << " s\n" << std::flush;
 }
 
-void run_operator_case(CollisionType collision_type) {
+void run_shear_layer(CollisionType collision_type, const std::string& name) {
     switch (collision_type) {
     case CollisionType::BGK:
-        run_operator_case<CollisionType::BGK>(operator_name(collision_type));
+        run_shear_layer_impl<CollisionType::BGK>(name);
         break;
     case CollisionType::TRT:
-        run_operator_case<CollisionType::TRT>(operator_name(collision_type));
+        run_shear_layer_impl<CollisionType::TRT>(name);
         break;
     case CollisionType::MRT:
-        run_operator_case<CollisionType::MRT>(operator_name(collision_type));
-        break;
-    case CollisionType::RLBM:
-        run_operator_case<CollisionType::RLBM>(operator_name(collision_type));
+        run_shear_layer_impl<CollisionType::MRT>(name);
         break;
     }
 }
@@ -321,23 +325,22 @@ void run_operator_case(CollisionType collision_type) {
 
 int main() {
     try {
-        const auto operators = {
-            CollisionType::BGK,
-            CollisionType::TRT,
-            CollisionType::MRT,
-            CollisionType::RLBM};
-
-        std::cout << "LB-Cube collision operator comparison\n"
+        std::cout << "LB-Cube turbulent doubly periodic shear-layer benchmark\n"
                   << "Grid: " << nx << " x " << ny << '\n'
                   << "Steps per operator: " << total_steps << '\n'
-                  << "Stats frequency: " << stats_frequency << '\n'
-                  << "VTK frequency: " << vtk_frequency << '\n'
-                  << "Backend: CPU\n"
+                  << "U0: " << u0 << '\n'
+                  << "delta: " << perturbation_amplitude << '\n'
+                  << "kappa: " << shear_steepness << '\n'
+                  << "tau: " << fluid_relaxation_time << '\n'
+                  << "nu: "
+                  << static_cast<Real>(FluidLattice::cs2) *
+                         (fluid_relaxation_time - Real{0.5})
+                  << '\n'
                   << std::flush;
 
-        for (const CollisionType collision_type : operators) {
-            run_operator_case(collision_type);
-        }
+        run_shear_layer(CollisionType::BGK, "BGK");
+    //  run_shear_layer(CollisionType::TRT, "TRT");
+        run_shear_layer(CollisionType::MRT, "MRT");
 
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

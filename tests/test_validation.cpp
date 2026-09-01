@@ -13,9 +13,11 @@
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <iostream>
 #include <limits>
 #include <numbers>
 #include <random>
+#include <type_traits>
 
 #include "lattice_core.hpp"
 #include "lattice_memory.hpp"
@@ -749,10 +751,12 @@ void run_tke_tgv2d_test() {
  * compile time while preserving the same decay rate and tolerance.
  *
  * @tparam CT Compile-time collision operator under test.
+ * @tparam Lattice 3D lattice traits type, defaulting to `lbm::D3Q19`.
  */
-template <lbm::CollisionType CT>
+template <lbm::CollisionType CT, lbm::IsLatticeModel Lattice = lbm::D3Q19>
 void run_tke_angled_shear_wave_3d_test() {
     using Real = double;
+    static_assert(Lattice::D == 3);
 
     constexpr std::size_t domain_size = 32;
     constexpr int total_steps = 1000;
@@ -766,7 +770,7 @@ void run_tke_angled_shear_wave_3d_test() {
         Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(domain_size);
     constexpr Real k_squared_total = Real{3} * wave_number * wave_number;
 
-    lbm::LatticeMemory<lbm::D3Q19, Real> mem{
+    lbm::LatticeMemory<Lattice, Real> mem{
         domain_size,
         domain_size,
         domain_size};
@@ -782,14 +786,14 @@ void run_tke_angled_shear_wave_3d_test() {
                 const Real transverse_amplitude =
                     initial_velocity * std::sin(phase);
 
-                lbm::MacroState<lbm::D3Q19, Real> macro{};
+                lbm::MacroState<Lattice, Real> macro{};
                 macro.density = Real{1};
                 macro.velocity <<
                     transverse_amplitude,
                     -Real{0.5} * transverse_amplitude,
                     -Real{0.5} * transverse_amplitude;
 
-                initialize_equilibrium_cell<lbm::D3Q19, Real>(
+                initialize_equilibrium_cell<Lattice, Real>(
                     view,
                     x,
                     y,
@@ -800,19 +804,21 @@ void run_tke_angled_shear_wave_3d_test() {
     }
 
     const Real initial_energy =
-        compute_mean_kinetic_energy<lbm::D3Q19, Real>(mem);
+        compute_mean_kinetic_energy<Lattice, Real>(mem);
     const Real energy_tolerance = initial_energy * Real{1.0e-3};
     constexpr Real analytical_time_shift =
         CT == lbm::CollisionType::BGK ? Real{1} :
-        CT == lbm::CollisionType::MRT ? Real{2} :
+        (CT == lbm::CollisionType::MRT && std::is_same_v<Lattice, lbm::D3Q19>) ? Real{2} :
+        CT == lbm::CollisionType::MRT ? Real{1} :
+        CT == lbm::CollisionType::RLBM ? Real{1} :
         Real{0};
 
     for (int step = 1; step <= total_steps; ++step) {
-        lbm::step_cpu<lbm::D3Q19, Real, CT>(mem, omega);
+        lbm::step_cpu<Lattice, Real, CT>(mem, omega);
 
         if (step % sampling_interval == 0) {
             const Real numerical_energy =
-                compute_mean_kinetic_energy<lbm::D3Q19, Real>(mem);
+                compute_mean_kinetic_energy<Lattice, Real>(mem);
             const Real analytical_time =
                 static_cast<Real>(step) + analytical_time_shift;
             const Real analytical_energy =
@@ -836,10 +842,12 @@ void run_tke_angled_shear_wave_3d_test() {
  * background kinetic energy is subtracted from the measurement.
  *
  * @tparam CT Compile-time collision operator under test.
+ * @tparam Lattice 3D lattice traits type, defaulting to `lbm::D3Q19`.
  */
-template <lbm::CollisionType CT>
+template <lbm::CollisionType CT, lbm::IsLatticeModel Lattice = lbm::D3Q19>
 void run_advected_shear_wave_3d_test() {
     using Real = double;
+    static_assert(Lattice::D == 3);
 
     constexpr std::size_t domain_size = 32;
     constexpr int total_steps = 1000;
@@ -854,7 +862,7 @@ void run_advected_shear_wave_3d_test() {
         Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(domain_size);
     constexpr Real k_squared_total = Real{3} * wave_number * wave_number;
 
-    lbm::LatticeMemory<lbm::D3Q19, Real> mem{
+    lbm::LatticeMemory<Lattice, Real> mem{
         domain_size,
         domain_size,
         domain_size};
@@ -870,14 +878,14 @@ void run_advected_shear_wave_3d_test() {
                 const Real transverse_amplitude =
                     perturbation_amplitude * std::sin(phase);
 
-                lbm::MacroState<lbm::D3Q19, Real> macro{};
+                lbm::MacroState<Lattice, Real> macro{};
                 macro.density = Real{1};
                 macro.velocity <<
                     background_velocity + transverse_amplitude,
                     background_velocity - Real{0.5} * transverse_amplitude,
                     background_velocity - Real{0.5} * transverse_amplitude;
 
-                initialize_equilibrium_cell<lbm::D3Q19, Real>(
+                initialize_equilibrium_cell<Lattice, Real>(
                     view,
                     x,
                     y,
@@ -890,15 +898,15 @@ void run_advected_shear_wave_3d_test() {
     constexpr Real background_energy =
         Real{0.5} * Real{3} * background_velocity * background_velocity;
     const Real initial_perturbation_energy =
-        compute_mean_kinetic_energy<lbm::D3Q19, Real>(mem) - background_energy;
+        compute_mean_kinetic_energy<Lattice, Real>(mem) - background_energy;
     const Real energy_tolerance = initial_perturbation_energy * Real{1.0e-3};
 
     for (int step = 1; step <= total_steps; ++step) {
-        lbm::step_cpu<lbm::D3Q19, Real, CT>(mem, omega);
+        lbm::step_cpu<Lattice, Real, CT>(mem, omega);
 
         if (step % sampling_interval == 0) {
             const Real numerical_perturbation_energy =
-                compute_mean_kinetic_energy<lbm::D3Q19, Real>(mem) -
+                compute_mean_kinetic_energy<Lattice, Real>(mem) -
                 background_energy;
             const Real analytical_perturbation_energy =
                 initial_perturbation_energy *
@@ -918,19 +926,21 @@ void run_advected_shear_wave_3d_test() {
 /**
  * @brief Run a diffusive-scaling 3D angled shear wave and return L2 speed error.
  *
- * The stationary transverse shear wave is initialized on an `N^3` D3Q19 grid.
+ * The stationary transverse shear wave is initialized on an `N^3` 3D lattice.
  * Lattice velocity, viscosity, and time step count are scaled diffusively from
  * the `N0 = 16` reference case so that `N = 16` and `N = 32` represent the same
  * physical state. The returned norm compares velocity magnitude against the
  * analytical amplitude decay `exp(-nu |k|^2 t)`.
  *
  * @tparam CT Compile-time collision operator under test.
+ * @tparam Lattice 3D lattice traits type, defaulting to `lbm::D3Q19`.
  * @param n Number of grid points along each periodic direction.
  * @return Relative L2 error of the velocity magnitude at the final time.
  */
-template <lbm::CollisionType CT>
+template <lbm::CollisionType CT, lbm::IsLatticeModel Lattice = lbm::D3Q19>
 double run_3d_shear_error(int n) {
     using Real = double;
+    static_assert(Lattice::D == 3);
 
     constexpr Real base_grid = Real{16};
     constexpr Real physical_time = Real{1};
@@ -952,7 +962,7 @@ double run_3d_shear_error(int n) {
     const Real k_squared_total = Real{3} * wave_number * wave_number;
     const auto domain_size = static_cast<std::size_t>(n);
 
-    lbm::LatticeMemory<lbm::D3Q19, Real> mem{
+    lbm::LatticeMemory<Lattice, Real> mem{
         domain_size,
         domain_size,
         domain_size};
@@ -968,14 +978,14 @@ double run_3d_shear_error(int n) {
                 const Real transverse_amplitude =
                     lattice_velocity * std::sin(phase);
 
-                lbm::MacroState<lbm::D3Q19, Real> macro{};
+                lbm::MacroState<Lattice, Real> macro{};
                 macro.density = Real{1};
                 macro.velocity <<
                     transverse_amplitude,
                     -Real{0.5} * transverse_amplitude,
                     -Real{0.5} * transverse_amplitude;
 
-                initialize_equilibrium_cell<lbm::D3Q19, Real>(
+                initialize_equilibrium_cell<Lattice, Real>(
                     initial_view,
                     x,
                     y,
@@ -986,12 +996,14 @@ double run_3d_shear_error(int n) {
     }
 
     for (int step = 0; step < time_steps; ++step) {
-        lbm::step_cpu<lbm::D3Q19, Real, CT>(mem, omega);
+        lbm::step_cpu<Lattice, Real, CT>(mem, omega);
     }
 
     const auto final_view = mem.get_current_view();
     constexpr Real analytical_time_shift =
-        CT == lbm::CollisionType::MRT ? Real{2} : Real{0};
+        (CT == lbm::CollisionType::MRT && std::is_same_v<Lattice, lbm::D3Q19>) ? Real{2} :
+        CT == lbm::CollisionType::MRT ? Real{1} :
+        Real{0};
     const Real analytical_time =
         static_cast<Real>(time_steps) + analytical_time_shift;
     const Real decay = std::exp(
@@ -1012,14 +1024,14 @@ double run_3d_shear_error(int n) {
                     std::abs(lattice_velocity * std::sin(phase)) *
                     decay;
 
-                std::array<Real, static_cast<std::size_t>(lbm::D3Q19::Q)> local_pops{};
-                for (int i = 0; i < lbm::D3Q19::Q; ++i) {
+                std::array<Real, static_cast<std::size_t>(Lattice::Q)> local_pops{};
+                for (int i = 0; i < Lattice::Q; ++i) {
                     local_pops[static_cast<std::size_t>(i)] =
                         final_view[static_cast<std::size_t>(i), z, y, x];
                 }
 
-                const lbm::MacroState<lbm::D3Q19, Real> macro =
-                    lbm::compute_macro_state<lbm::D3Q19, Real>(local_pops);
+                const lbm::MacroState<Lattice, Real> macro =
+                    lbm::compute_macro_state<Lattice, Real>(local_pops);
                 const Real error = macro.velocity.norm() - analytical_speed;
 
                 numerator += static_cast<long double>(error * error);
@@ -1312,6 +1324,13 @@ TEST(FluidDynamics2D, ShearWaveDecay_MRT) {
 }
 
 /**
+ * @brief Validate RLBM D2Q9 shear-wave kinetic-energy decay against theory.
+ */
+TEST(FluidDynamics2D, ShearWaveDecay_RLBM) {
+    run_tke_shear_wave_test<lbm::CollisionType::RLBM>();
+}
+
+/**
  * @brief Validate BGK D2Q9 Taylor-Green kinetic-energy decay against theory.
  */
 TEST(FluidDynamics2D, TaylorGreenVortex_BGK) {
@@ -1330,6 +1349,13 @@ TEST(FluidDynamics2D, TaylorGreenVortex_TRT) {
  */
 TEST(FluidDynamics2D, TaylorGreenVortex_MRT) {
     run_taylor_green_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Validate RLBM D2Q9 Taylor-Green kinetic-energy decay against theory.
+ */
+TEST(FluidDynamics2D, TaylorGreenVortex_RLBM) {
+    run_tke_tgv2d_test<lbm::CollisionType::RLBM>();
 }
 
 /**
@@ -1403,6 +1429,13 @@ TEST(FluidDynamics3D, TKE_AngledShear3D_BGK) {
 }
 
 /**
+ * @brief Track D3Q27 BGK angled shear-wave mean kinetic energy over time.
+ */
+TEST(FluidDynamics3D, TKE_AngledShear3D_D3Q27_BGK) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::BGK, lbm::D3Q27>();
+}
+
+/**
  * @brief Track D3Q19 TRT angled shear-wave mean kinetic energy over time.
  */
 TEST(FluidDynamics3D, TKE_AngledShear3D_TRT) {
@@ -1410,10 +1443,38 @@ TEST(FluidDynamics3D, TKE_AngledShear3D_TRT) {
 }
 
 /**
+ * @brief Track D3Q27 TRT angled shear-wave mean kinetic energy over time.
+ */
+TEST(FluidDynamics3D, TKE_AngledShear3D_D3Q27_TRT) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::TRT, lbm::D3Q27>();
+}
+
+/**
+ * @brief Track D3Q27 MRT angled shear-wave mean kinetic energy over time.
+ */
+TEST(FluidDynamics3D, TKE_AngledShear3D_D3Q27_MRT) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::MRT, lbm::D3Q27>();
+}
+
+/**
  * @brief Track D3Q19 MRT angled shear-wave mean kinetic energy over time.
  */
 TEST(FluidDynamics3D, TKE_AngledShear3D_MRT) {
     run_tke_angled_shear_wave_3d_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Track D3Q19 RLBM angled shear-wave mean kinetic energy over time.
+ */
+TEST(FluidDynamics3D, AngledShear3D_RLBM) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::RLBM>();
+}
+
+/**
+ * @brief Track D3Q27 RLBM angled shear-wave mean kinetic energy over time.
+ */
+TEST(FluidDynamics3D, AngledShear3D_D3Q27_RLBM) {
+    run_tke_angled_shear_wave_3d_test<lbm::CollisionType::RLBM, lbm::D3Q27>();
 }
 
 /**
@@ -1431,10 +1492,38 @@ TEST(FluidDynamics3D, AdvectedShear3D_TRT) {
 }
 
 /**
+ * @brief Track D3Q27 TRT energy decay of an advected angled shear wave.
+ */
+TEST(FluidDynamics3D, AdvectedShear3D_D3Q27_TRT) {
+    run_advected_shear_wave_3d_test<lbm::CollisionType::TRT, lbm::D3Q27>();
+}
+
+/**
+ * @brief Track D3Q27 MRT energy decay of an advected angled shear wave.
+ */
+TEST(FluidDynamics3D, AdvectedShear3D_D3Q27_MRT) {
+    run_advected_shear_wave_3d_test<lbm::CollisionType::MRT, lbm::D3Q27>();
+}
+
+/**
+ * @brief Track D3Q27 RLBM energy decay of an advected angled shear wave.
+ */
+TEST(FluidDynamics3D, AdvectedShear3D_D3Q27_RLBM) {
+    run_advected_shear_wave_3d_test<lbm::CollisionType::RLBM, lbm::D3Q27>();
+}
+
+/**
  * @brief Track MRT energy decay of an advected D3Q19 angled shear wave.
  */
 TEST(FluidDynamics3D, AdvectedShear3D_MRT) {
     run_advected_shear_wave_3d_test<lbm::CollisionType::MRT>();
+}
+
+/**
+ * @brief Track RLBM energy decay of an advected D3Q19 angled shear wave.
+ */
+TEST(FluidDynamics3D, AdvectedShear3D_RLBM) {
+    run_advected_shear_wave_3d_test<lbm::CollisionType::RLBM>();
 }
 
 /**
@@ -1468,6 +1557,24 @@ TEST(MathAndTransforms, MRT_D3Q19_Transformation_Identity) {
         lbm::mrt::compute_moments_d3q19(f_original);
     const std::array<double, 19> f_restored =
         lbm::mrt::compute_populations_d3q19(moments);
+
+    for (std::size_t i = 0; i < f_original.size(); ++i) {
+        EXPECT_NEAR(f_original[i], f_restored[i], 1.0e-12);
+    }
+}
+
+/**
+ * @brief Verify that the orthogonal D3Q27 MRT transform and inverse are consistent.
+ */
+TEST(MathAndTransforms, MRT_D3Q27_Transformation_Identity) {
+    constexpr std::array<double, 27> f_original{
+        0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09,
+        0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18,
+        0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27
+    };
+
+    const auto moments = lbm::mrt::transform_to_moments_d3q27<double>(f_original);
+    const auto f_restored = lbm::mrt::transform_to_populations_d3q27<double>(moments);
 
     for (std::size_t i = 0; i < f_original.size(); ++i) {
         EXPECT_NEAR(f_original[i], f_restored[i], 1.0e-12);
@@ -1688,6 +1795,67 @@ TEST(Convergence, SpatialConvergence3D) {
     EXPECT_GE(eoc_trt, 1.85)
         << "TRT errors: N=16 -> " << error_16_trt
         << ", N=32 -> " << error_32_trt;
+
+}
+
+/**
+ * @brief Verify first-order spatial convergence for compact-stencil D3Q19 RLBM.
+ */
+TEST(Convergence, SpatialConvergence3D_RLBM) {
+    const double error_16 = run_3d_shear_error<lbm::CollisionType::RLBM>(16);
+    const double error_32 = run_3d_shear_error<lbm::CollisionType::RLBM>(32);
+    const double eoc = std::log2(error_16 / error_32);
+
+    std::cout << "[Convergence] D3Q19 RLBM spatial EOC = " << eoc
+              << " (err16=" << error_16
+              << ", err32=" << error_32 << ')' << std::endl;
+
+    EXPECT_GE(eoc, 0.80)
+        << "D3Q19 RLBM errors: N=16 -> " << error_16
+        << ", N=32 -> " << error_32;
+}
+
+/**
+ * @brief Verify at least second-order spatial convergence for D3Q27 TRT.
+ */
+TEST(Convergence, SpatialConvergence3D_D3Q27_TRT) {
+    const double error_16 = run_3d_shear_error<lbm::CollisionType::TRT, lbm::D3Q27>(16);
+    const double error_32 = run_3d_shear_error<lbm::CollisionType::TRT, lbm::D3Q27>(32);
+    const double eoc = std::log2(error_16 / error_32);
+
+    EXPECT_GE(eoc, 1.85)
+        << "D3Q27 TRT errors: N=16 -> " << error_16
+        << ", N=32 -> " << error_32;
+}
+
+/**
+ * @brief Verify at least second-order spatial convergence for D3Q27 MRT.
+ */
+TEST(Convergence, SpatialConvergence3D_D3Q27_MRT) {
+    const double error_16 = run_3d_shear_error<lbm::CollisionType::MRT, lbm::D3Q27>(16);
+    const double error_32 = run_3d_shear_error<lbm::CollisionType::MRT, lbm::D3Q27>(32);
+    const double eoc = std::log2(error_16 / error_32);
+
+    EXPECT_GE(eoc, 1.85)
+        << "D3Q27 MRT errors: N=16 -> " << error_16
+        << ", N=32 -> " << error_32;
+}
+
+/**
+ * @brief Verify first-order spatial convergence for D3Q27 RLBM.
+ */
+TEST(Convergence, SpatialConvergence3D_D3Q27_RLBM) {
+    const double error_16 = run_3d_shear_error<lbm::CollisionType::RLBM, lbm::D3Q27>(16);
+    const double error_32 = run_3d_shear_error<lbm::CollisionType::RLBM, lbm::D3Q27>(32);
+    const double eoc = std::log2(error_16 / error_32);
+
+    std::cout << "[Convergence] D3Q27 RLBM spatial EOC = " << eoc
+              << " (err16=" << error_16
+              << ", err32=" << error_32 << ')' << std::endl;
+
+    EXPECT_GE(eoc, 0.80)
+        << "D3Q27 RLBM errors: N=16 -> " << error_16
+        << ", N=32 -> " << error_32;
 }
 
 /**
@@ -1714,4 +1882,16 @@ TEST(Convergence, TemporalConvergence) {
     EXPECT_GE(eoc_mrt, 1.85)
         << "MRT errors: m=1 -> " << error_1_mrt
         << ", m=2 -> " << error_2_mrt;
+
+    const double error_1_rlbm = run_temporal_error<lbm::CollisionType::RLBM>(1);
+    const double error_2_rlbm = run_temporal_error<lbm::CollisionType::RLBM>(2);
+    const double eoc_rlbm = std::log2(error_1_rlbm / error_2_rlbm);
+
+    std::cout << "[Convergence] D2Q9 RLBM temporal EOC = " << eoc_rlbm
+              << " (err1=" << error_1_rlbm
+              << ", err2=" << error_2_rlbm << ')' << std::endl;
+
+    EXPECT_GE(eoc_rlbm, 0.80)
+        << "RLBM errors: m=1 -> " << error_1_rlbm
+        << ", m=2 -> " << error_2_rlbm;
 }

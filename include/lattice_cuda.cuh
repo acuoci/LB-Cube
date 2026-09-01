@@ -26,7 +26,7 @@ namespace lbm {
 /**
  * @brief Compile-time collision operator selection for fused LBM steps.
  *
- * The enum is used as a non-type template parameter so BGK and TRT dispatch is
+ * The enum is used as a non-type template parameter so collision dispatch is
  * resolved during compilation, leaving no runtime branch in the kernel.
  */
 enum class CollisionType {
@@ -35,7 +35,9 @@ enum class CollisionType {
     /** @brief Two-relaxation-time symmetric/anti-symmetric collision. */
     TRT,
     /** @brief Multiple-relaxation-time moment-space collision. */
-    MRT
+    MRT,
+    /** @brief Regularized collision with Hermite non-equilibrium reconstruction. */
+    RLBM
 };
 #endif
 

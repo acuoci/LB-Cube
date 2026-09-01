@@ -154,6 +154,50 @@ set_target_properties(
         CXX_EXTENSIONS NO
 )
 
+add_executable(lbm_turbulent_shear_layer src/turbulent_shear_layer.cpp)
+
+target_link_libraries(
+    lbm_turbulent_shear_layer
+    PRIVATE
+        lbm::core
+)
+
+target_compile_features(
+    lbm_turbulent_shear_layer
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_turbulent_shear_layer
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
+add_executable(lbm_turbulent_tgv_3d src/turbulent_tgv_3d.cpp)
+
+target_link_libraries(
+    lbm_turbulent_tgv_3d
+    PRIVATE
+        lbm::core
+)
+
+target_compile_features(
+    lbm_turbulent_tgv_3d
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_turbulent_tgv_3d
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
 enable_testing()
 
 add_executable(lbm_validation_tests tests/test_validation.cpp)

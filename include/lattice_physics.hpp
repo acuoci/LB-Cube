@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 #include "lattice_memory.hpp"
 #include "lattice_traits.hpp"
@@ -29,6 +30,185 @@
 #endif
 
 namespace lbm {
+
+namespace detail {
+
+/**
+ * @brief Dependent false value used for unsupported compile-time physics branches.
+ *
+ * @tparam Lattice Lattice traits type selected by a collision operator.
+ */
+template <typename Lattice>
+inline constexpr bool unsupported_regularized_lattice_v = false;
+
+} // namespace detail
+
+/**
+ * @brief Hermite projection prefactor for lattices with `c_s^2 = 1/3`.
+ *
+ * Regularized reconstruction uses `1 / (2 c_s^4)`. For D2Q9, D3Q19, and D3Q27,
+ * `c_s^2 = 1/3`, so the prefactor is exactly `9 / 2`.
+ *
+ * @tparam Real Floating-point precision used for the reconstruction.
+ */
+template <std::floating_point Real>
+inline constexpr Real hermite_projection_prefactor = Real{9} / Real{2};
+
+/**
+ * @brief Independent components of a symmetric second-order tensor in 2D.
+ *
+ * The regularized collision reconstructs the non-equilibrium stress tensor from
+ * population moments. Naming the tensor components avoids fragile positional
+ * indexing in later RLBM code while keeping the type trivially copyable for
+ * host/device use.
+ *
+ * @tparam Real Floating-point precision used for tensor accumulation.
+ */
+template <typename Real>
+struct SymmetricTensor2D {
+    /** @brief `xx` normal component. */
+    Real xx{0};
+    /** @brief `yy` normal component. */
+    Real yy{0};
+    /** @brief `xy` shear component, equal to `yx` by symmetry. */
+    Real xy{0};
+};
+
+/**
+ * @brief Independent components of a symmetric second-order tensor in 3D.
+ *
+ * The six stored values represent the full tensor because
+ * `Pi_xy = Pi_yx`, `Pi_xz = Pi_zx`, and `Pi_yz = Pi_zy`. This compact form is
+ * enough for regularized reconstruction without carrying redundant off-diagonal
+ * entries through hot kernels.
+ *
+ * @tparam Real Floating-point precision used for tensor accumulation.
+ */
+template <typename Real>
+struct SymmetricTensor3D {
+    /** @brief `xx` normal component. */
+    Real xx{0};
+    /** @brief `yy` normal component. */
+    Real yy{0};
+    /** @brief `zz` normal component. */
+    Real zz{0};
+    /** @brief `xy` shear component. */
+    Real xy{0};
+    /** @brief `xz` shear component. */
+    Real xz{0};
+    /** @brief `yz` shear component. */
+    Real yz{0};
+};
+
+/**
+ * @brief Compute the D2Q9 non-equilibrium momentum-flux tensor.
+ *
+ * The tensor is the second-order moment of the non-equilibrium populations,
+ * `Pi_neq = sum_i (f_i - f_i^eq) c_i c_i`. This is the central quantity used by
+ * regularized LBM operators to reconstruct the non-equilibrium part from
+ * hydrodynamic stress rather than relaxing all higher-order artifacts directly.
+ *
+ * @tparam Real Floating-point precision used for populations and accumulation.
+ * @param pops Local D2Q9 populations before regularized reconstruction.
+ * @param feq Local D2Q9 equilibrium populations computed from the same macro state.
+ * @return Independent components of `Pi_neq` in 2D.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline SymmetricTensor2D<Real> compute_pi_neq_d2q9(
+    const std::array<Real, 9>& pops,
+    const std::array<Real, 9>& feq) {
+    SymmetricTensor2D<Real> pi_neq{};
+
+    for (int i = 0; i < D2Q9::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        const auto direction_offset = static_cast<std::size_t>(i * D2Q9::D);
+        const Real f_neq = pops[index] - feq[index];
+        const Real cx = static_cast<Real>(D2Q9::c[direction_offset]);
+        const Real cy = static_cast<Real>(D2Q9::c[direction_offset + 1]);
+
+        pi_neq.xx += f_neq * cx * cx;
+        pi_neq.yy += f_neq * cy * cy;
+        pi_neq.xy += f_neq * cx * cy;
+    }
+
+    return pi_neq;
+}
+
+/**
+ * @brief Compute the D3Q19 non-equilibrium momentum-flux tensor.
+ *
+ * The tensor is formed by projecting the non-equilibrium population vector onto
+ * the symmetric second-order Hermite basis, `sum_i f_i^neq c_i_alpha c_i_beta`.
+ * Storing only the six independent components keeps the result compact and
+ * directly usable by the upcoming D3Q19 regularized collision operator.
+ *
+ * @tparam Real Floating-point precision used for populations and accumulation.
+ * @param pops Local D3Q19 populations before regularized reconstruction.
+ * @param feq Local D3Q19 equilibrium populations computed from the same macro state.
+ * @return Independent components of `Pi_neq` in 3D.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline SymmetricTensor3D<Real> compute_pi_neq_d3q19(
+    const std::array<Real, 19>& pops,
+    const std::array<Real, 19>& feq) {
+    SymmetricTensor3D<Real> pi_neq{};
+
+    for (int i = 0; i < D3Q19::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        const auto direction_offset = static_cast<std::size_t>(i * D3Q19::D);
+        const Real f_neq = pops[index] - feq[index];
+        const Real cx = static_cast<Real>(D3Q19::c[direction_offset]);
+        const Real cy = static_cast<Real>(D3Q19::c[direction_offset + 1]);
+        const Real cz = static_cast<Real>(D3Q19::c[direction_offset + 2]);
+
+        pi_neq.xx += f_neq * cx * cx;
+        pi_neq.yy += f_neq * cy * cy;
+        pi_neq.zz += f_neq * cz * cz;
+        pi_neq.xy += f_neq * cx * cy;
+        pi_neq.xz += f_neq * cx * cz;
+        pi_neq.yz += f_neq * cy * cz;
+    }
+
+    return pi_neq;
+}
+
+/**
+ * @brief Compute the D3Q27 non-equilibrium momentum-flux tensor.
+ *
+ * D3Q27 carries the full tensor-product velocity set, so the second-order
+ * non-equilibrium stress is accumulated directly from all 27 population
+ * residuals. The returned symmetric tensor feeds the D3Q27 recursive
+ * regularized collision branch.
+ *
+ * @tparam Real Floating-point precision used for populations and accumulation.
+ * @param pops Local D3Q27 populations before regularized reconstruction.
+ * @param feq Local D3Q27 equilibrium populations computed from the same macro state.
+ * @return Independent components of `Pi_neq` in 3D.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline SymmetricTensor3D<Real> compute_pi_neq_d3q27(
+    const std::array<Real, 27>& pops,
+    const std::array<Real, 27>& feq) {
+    SymmetricTensor3D<Real> pi_neq{};
+
+    for (int i = 0; i < D3Q27::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        const auto direction_offset = static_cast<std::size_t>(i * D3Q27::D);
+        const Real f_neq = pops[index] - feq[index];
+        const Real cx = static_cast<Real>(D3Q27::c[direction_offset]);
+        const Real cy = static_cast<Real>(D3Q27::c[direction_offset + 1]);
+        const Real cz = static_cast<Real>(D3Q27::c[direction_offset + 2]);
+
+        pi_neq.xx += f_neq * cx * cx;
+        pi_neq.yy += f_neq * cy * cy;
+        pi_neq.zz += f_neq * cz * cz;
+        pi_neq.xy += f_neq * cx * cy;
+        pi_neq.xz += f_neq * cx * cz;
+        pi_neq.yz += f_neq * cy * cz;
+    }
+
+    return pi_neq;
+}
 
 /**
  * @brief Reconstruct density and velocity from the populations of one cell.
@@ -215,6 +395,213 @@ __host__ __device__ inline void collide_trt(
     }
 
     pops = post_collision;
+}
+
+/**
+ * @brief Apply the regularized LBM collision operator to one cell.
+ *
+ * The regularized collision first computes the non-equilibrium stress tensor
+ * `Pi_neq = sum_i (f_i - f_i^eq) c_i c_i`, then reconstructs the
+ * non-equilibrium distribution with the second-order Hermite projection plus
+ * the recursive third-order contribution
+ * `a_abc^(3,neq) = u_a Pi_bc + u_b Pi_ac + u_c Pi_ab`. Including the recursive
+ * third-order term preserves the hydrodynamic information needed for
+ * second-order Navier-Stokes recovery while filtering non-hydrodynamic
+ * artifacts before relaxation. The D3Q19 branch uses the D3Q19-compatible
+ * paired third-order projection because the 19-velocity stencil does not carry
+ * independent `aaa` or `xyz` third-order Hermite tensors. The D3Q27 branch uses
+ * the full ten-component third-order tensor-product Hermite basis.
+ *
+ * @tparam Lattice Lattice traits type satisfying `IsLatticeModel`. Currently
+ * supported for `D2Q9`, `D3Q19`, and `D3Q27`.
+ * @tparam Real Floating-point precision used for populations and reconstruction.
+ * @param pops Local population array. Values are overwritten with post-RLBM populations.
+ * @param macro Density and velocity reconstructed from the pre-collision populations.
+ * @param omega Relaxation frequency controlling the non-equilibrium stress decay.
+ */
+template <IsLatticeModel Lattice, std::floating_point Real>
+__host__ __device__ inline void collide_regularized(
+    std::array<Real, static_cast<std::size_t>(Lattice::Q)>& pops,
+    const MacroState<Lattice, Real>& macro,
+    Real omega) {
+    std::array<Real, static_cast<std::size_t>(Lattice::Q)> feq{};
+    for (int i = 0; i < Lattice::Q; ++i) {
+        feq[static_cast<std::size_t>(i)] =
+            compute_equilibrium<Lattice, Real>(i, macro);
+    }
+
+    if constexpr (std::is_same_v<Lattice, D2Q9>) {
+        const SymmetricTensor2D<Real> pi_neq = compute_pi_neq_d2q9<Real>(pops, feq);
+        const Real cs2 = static_cast<Real>(D2Q9::cs2);
+        const Real ux = macro.velocity[0];
+        const Real uy = macro.velocity[1];
+        const Real a_xxx = Real{3} * ux * pi_neq.xx;
+        const Real a_yyy = Real{3} * uy * pi_neq.yy;
+        const Real a_xxy = Real{2} * ux * pi_neq.xy + uy * pi_neq.xx;
+        const Real a_xyy = Real{2} * uy * pi_neq.xy + ux * pi_neq.yy;
+
+        for (int i = 0; i < D2Q9::Q; ++i) {
+            const auto index = static_cast<std::size_t>(i);
+            const auto direction_offset = static_cast<std::size_t>(i * D2Q9::D);
+            const Real cx = static_cast<Real>(D2Q9::c[direction_offset]);
+            const Real cy = static_cast<Real>(D2Q9::c[direction_offset + 1]);
+            const Real q_xx = cx * cx - cs2;
+            const Real q_yy = cy * cy - cs2;
+            const Real q_xy = cx * cy;
+            const Real second_order_contraction =
+                q_xx * pi_neq.xx +
+                q_yy * pi_neq.yy +
+                Real{2} * q_xy * pi_neq.xy;
+            const Real h_xxx = cx * cx * cx - Real{3} * cs2 * cx;
+            const Real h_yyy = cy * cy * cy - Real{3} * cs2 * cy;
+            const Real h_xxy = cx * cx * cy - cs2 * cy;
+            const Real h_xyy = cx * cy * cy - cs2 * cx;
+            const Real third_order_contraction =
+                a_xxx * h_xxx +
+                a_yyy * h_yyy +
+                Real{3} * (a_xxy * h_xxy + a_xyy * h_xyy);
+            const Real reconstructed_neq =
+                static_cast<Real>(D2Q9::weights[index]) *
+                hermite_projection_prefactor<Real> *
+                (second_order_contraction + third_order_contraction);
+
+            pops[index] = feq[index] + (Real{1} - omega) * reconstructed_neq;
+        }
+    } else if constexpr (std::is_same_v<Lattice, D3Q19>) {
+        const SymmetricTensor3D<Real> pi_neq = compute_pi_neq_d3q19<Real>(pops, feq);
+        const Real cs2 = static_cast<Real>(D3Q19::cs2);
+        const Real ux = macro.velocity[0];
+        const Real uy = macro.velocity[1];
+        const Real uz = macro.velocity[2];
+        const Real a_xxx = Real{3} * ux * pi_neq.xx;
+        const Real a_yyy = Real{3} * uy * pi_neq.yy;
+        const Real a_zzz = Real{3} * uz * pi_neq.zz;
+        const Real a_xxy = Real{2} * ux * pi_neq.xy + uy * pi_neq.xx;
+        const Real a_xxz = Real{2} * ux * pi_neq.xz + uz * pi_neq.xx;
+        const Real a_xyy = Real{2} * uy * pi_neq.xy + ux * pi_neq.yy;
+        const Real a_yyz = Real{2} * uy * pi_neq.yz + uz * pi_neq.yy;
+        const Real a_xzz = Real{2} * uz * pi_neq.xz + ux * pi_neq.zz;
+        const Real a_yzz = Real{2} * uz * pi_neq.yz + uy * pi_neq.zz;
+        const Real a_xyz = ux * pi_neq.yz + uy * pi_neq.xz + uz * pi_neq.xy;
+
+        for (int i = 0; i < D3Q19::Q; ++i) {
+            const auto index = static_cast<std::size_t>(i);
+            const auto direction_offset = static_cast<std::size_t>(i * D3Q19::D);
+            const Real cx = static_cast<Real>(D3Q19::c[direction_offset]);
+            const Real cy = static_cast<Real>(D3Q19::c[direction_offset + 1]);
+            const Real cz = static_cast<Real>(D3Q19::c[direction_offset + 2]);
+            const Real q_xx = cx * cx - cs2;
+            const Real q_yy = cy * cy - cs2;
+            const Real q_zz = cz * cz - cs2;
+            const Real q_xy = cx * cy;
+            const Real q_xz = cx * cz;
+            const Real q_yz = cy * cz;
+            const Real second_order_contraction =
+                q_xx * pi_neq.xx +
+                q_yy * pi_neq.yy +
+                q_zz * pi_neq.zz +
+                Real{2} * (q_xy * pi_neq.xy + q_xz * pi_neq.xz + q_yz * pi_neq.yz);
+            const Real h_xxx = cx * cx * cx - Real{3} * cs2 * cx;
+            const Real h_yyy = cy * cy * cy - Real{3} * cs2 * cy;
+            const Real h_zzz = cz * cz * cz - Real{3} * cs2 * cz;
+            const Real h_xxy = cx * cx * cy - cs2 * cy;
+            const Real h_xxz = cx * cx * cz - cs2 * cz;
+            const Real h_xyy = cx * cy * cy - cs2 * cx;
+            const Real h_yyz = cy * cy * cz - cs2 * cz;
+            const Real h_xzz = cx * cz * cz - cs2 * cx;
+            const Real h_yzz = cy * cz * cz - cs2 * cy;
+            const Real h_xyz = cx * cy * cz;
+            static_cast<void>(a_xxx);
+            static_cast<void>(a_yyy);
+            static_cast<void>(a_zzz);
+            static_cast<void>(a_xyz);
+            static_cast<void>(h_xxx);
+            static_cast<void>(h_yyy);
+            static_cast<void>(h_zzz);
+            static_cast<void>(h_xyz);
+
+            const Real third_order_contraction =
+                Real{3} * (h_xxy + h_yzz) * (a_xxy + a_yzz) +
+                (h_xxy - h_yzz) * (a_xxy - a_yzz) +
+                Real{3} * (h_xzz + h_xyy) * (a_xzz + a_xyy) +
+                (h_xzz - h_xyy) * (a_xzz - a_xyy) +
+                Real{3} * (h_yyz + h_xxz) * (a_yyz + a_xxz) +
+                (h_yyz - h_xxz) * (a_yyz - a_xxz);
+            const Real reconstructed_neq =
+                static_cast<Real>(D3Q19::weights[index]) *
+                hermite_projection_prefactor<Real> *
+                (second_order_contraction + third_order_contraction);
+
+            pops[index] = feq[index] + (Real{1} - omega) * reconstructed_neq;
+        }
+    } else if constexpr (std::is_same_v<Lattice, D3Q27>) {
+        const SymmetricTensor3D<Real> pi_neq = compute_pi_neq_d3q27<Real>(pops, feq);
+        const Real cs2 = static_cast<Real>(D3Q27::cs2);
+        const Real ux = macro.velocity[0];
+        const Real uy = macro.velocity[1];
+        const Real uz = macro.velocity[2];
+        const Real a_xxx = Real{3} * ux * pi_neq.xx;
+        const Real a_yyy = Real{3} * uy * pi_neq.yy;
+        const Real a_zzz = Real{3} * uz * pi_neq.zz;
+        const Real a_xxy = Real{2} * ux * pi_neq.xy + uy * pi_neq.xx;
+        const Real a_xxz = Real{2} * ux * pi_neq.xz + uz * pi_neq.xx;
+        const Real a_xyy = ux * pi_neq.yy + Real{2} * uy * pi_neq.xy;
+        const Real a_yyz = Real{2} * uy * pi_neq.yz + uz * pi_neq.yy;
+        const Real a_xzz = ux * pi_neq.zz + Real{2} * uz * pi_neq.xz;
+        const Real a_yzz = uy * pi_neq.zz + Real{2} * uz * pi_neq.yz;
+        const Real a_xyz = ux * pi_neq.yz + uy * pi_neq.xz + uz * pi_neq.xy;
+
+        for (int i = 0; i < D3Q27::Q; ++i) {
+            const auto index = static_cast<std::size_t>(i);
+            const auto direction_offset = static_cast<std::size_t>(i * D3Q27::D);
+            const Real cx = static_cast<Real>(D3Q27::c[direction_offset]);
+            const Real cy = static_cast<Real>(D3Q27::c[direction_offset + 1]);
+            const Real cz = static_cast<Real>(D3Q27::c[direction_offset + 2]);
+            const Real q_xx = cx * cx - cs2;
+            const Real q_yy = cy * cy - cs2;
+            const Real q_zz = cz * cz - cs2;
+            const Real q_xy = cx * cy;
+            const Real q_xz = cx * cz;
+            const Real q_yz = cy * cz;
+            const Real second_order_contraction =
+                q_xx * pi_neq.xx +
+                q_yy * pi_neq.yy +
+                q_zz * pi_neq.zz +
+                Real{2} * (q_xy * pi_neq.xy + q_xz * pi_neq.xz + q_yz * pi_neq.yz);
+            const Real h_xxx = cx * cx * cx - Real{3} * cs2 * cx;
+            const Real h_yyy = cy * cy * cy - Real{3} * cs2 * cy;
+            const Real h_zzz = cz * cz * cz - Real{3} * cs2 * cz;
+            const Real h_xxy = cx * cx * cy - cs2 * cy;
+            const Real h_xxz = cx * cx * cz - cs2 * cz;
+            const Real h_xyy = cx * cy * cy - cs2 * cx;
+            const Real h_yyz = cy * cy * cz - cs2 * cz;
+            const Real h_xzz = cx * cz * cz - cs2 * cx;
+            const Real h_yzz = cy * cz * cz - cs2 * cy;
+            const Real h_xyz = cx * cy * cz;
+            const Real third_order_contraction =
+                a_xxx * h_xxx +
+                a_yyy * h_yyy +
+                a_zzz * h_zzz +
+                Real{3} * (
+                    a_xxy * h_xxy +
+                    a_xxz * h_xxz +
+                    a_xyy * h_xyy +
+                    a_yyz * h_yyz +
+                    a_xzz * h_xzz +
+                    a_yzz * h_yzz) +
+                Real{6} * a_xyz * h_xyz;
+            const Real reconstructed_neq =
+                static_cast<Real>(D3Q27::weights[index]) *
+                hermite_projection_prefactor<Real> *
+                (second_order_contraction + third_order_contraction);
+
+            pops[index] = feq[index] + (Real{1} - omega) * reconstructed_neq;
+        }
+    } else {
+        static_assert(
+            detail::unsupported_regularized_lattice_v<Lattice>,
+            "Regularized collision is currently supported only for D2Q9, D3Q19, and D3Q27.");
+    }
 }
 
 /**

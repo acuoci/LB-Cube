@@ -27,7 +27,7 @@ namespace lbm {
 /**
  * @brief Compile-time collision operator selection for fused LBM steps.
  *
- * The enum is used as a non-type template parameter so BGK and TRT dispatch is
+ * The enum is used as a non-type template parameter so collision dispatch is
  * resolved during compilation, leaving no runtime branch in the inner loop.
  */
 enum class CollisionType {
@@ -36,7 +36,9 @@ enum class CollisionType {
     /** @brief Two-relaxation-time symmetric/anti-symmetric collision. */
     TRT,
     /** @brief Multiple-relaxation-time moment-space collision. */
-    MRT
+    MRT,
+    /** @brief Regularized collision with Hermite non-equilibrium reconstruction. */
+    RLBM
 };
 #endif
 
@@ -107,11 +109,20 @@ inline void collide_cell(
             mrt::MrtRelaxationRates_D3Q19<Real> relaxation_rates{};
             relaxation_rates.s_nu = omega;
             mrt::collide_mrt_d3q19<Real>(local_pops, macro, relaxation_rates);
+        } else if constexpr (std::is_same_v<Lattice, D3Q27>) {
+            mrt::MrtRelaxationRates_D3Q27<Real> relaxation_rates{};
+            relaxation_rates.s_nu = omega;
+            relaxation_rates.s_b = omega;
+            mrt::collide_mrt_d3q27<Real>(local_pops, macro, relaxation_rates);
         } else {
             static_assert(
                 always_false_v<Lattice>,
-                "MRT is currently only supported for D2Q9 and D3Q19.");
+                "MRT is currently only supported for D2Q9, D3Q19, and D3Q27.");
         }
+    } else if constexpr (CT == CollisionType::RLBM) {
+        const MacroState<Lattice, Real> macro =
+            compute_macro_state<Lattice, Real>(local_pops);
+        collide_regularized<Lattice, Real>(local_pops, macro, omega);
     }
 }
 
