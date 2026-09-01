@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <concepts>
@@ -1894,4 +1895,281 @@ TEST(Convergence, TemporalConvergence) {
     EXPECT_GE(eoc_rlbm, 0.80)
         << "RLBM errors: m=1 -> " << error_1_rlbm
         << ", m=2 -> " << error_2_rlbm;
+}
+
+/**
+ * @brief Initialize a 3D D3Q19 fluid field from a uniform velocity.
+ *
+ * @param mem Fluid population memory to initialize.
+ * @param ux Uniform x velocity.
+ * @param uy Uniform y velocity.
+ * @param uz Uniform z velocity.
+ */
+void initialize_uniform_fluid_d3q19(
+    lbm::LatticeMemory<lbm::D3Q19, double>& mem,
+    double ux,
+    double uy,
+    double uz) {
+    auto view = mem.get_current_view();
+
+    lbm::MacroState<lbm::D3Q19, double> macro{};
+    macro.density = 1.0;
+    macro.velocity << ux, uy, uz;
+
+    for (std::size_t z = 0; z < mem.z_extent(); ++z) {
+        for (std::size_t y = 0; y < mem.y_extent(); ++y) {
+            for (std::size_t x = 0; x < mem.x_extent(); ++x) {
+                for (int i = 0; i < lbm::D3Q19::Q; ++i) {
+                    view[static_cast<std::size_t>(i), z, y, x] =
+                        lbm::compute_equilibrium<lbm::D3Q19, double>(i, macro);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Reconstruct concentration from the current D3Q7 scalar populations.
+ *
+ * @param view Read-only scalar population view.
+ * @param x Cell x coordinate.
+ * @param y Cell y coordinate.
+ * @param z Cell z coordinate.
+ * @return Local scalar concentration.
+ */
+double concentration_d3q7(
+    typename lbm::LatticeMemory<lbm::D3Q7, double>::ConstView view,
+    std::size_t x,
+    std::size_t y,
+    std::size_t z) {
+    std::array<double, static_cast<std::size_t>(lbm::D3Q7::Q)> scalar_pops{};
+    for (int i = 0; i < lbm::D3Q7::Q; ++i) {
+        scalar_pops[static_cast<std::size_t>(i)] =
+            view[static_cast<std::size_t>(i), z, y, x];
+    }
+
+    return lbm::compute_concentration<lbm::D3Q7, double>(scalar_pops);
+}
+
+/**
+ * @brief Sum D3Q7 concentration over the current scalar field.
+ *
+ * @param mem Scalar memory whose current buffer is inspected.
+ * @return Total scalar mass over the 3D domain.
+ */
+double total_concentration_d3q7(const lbm::LatticeMemory<lbm::D3Q7, double>& mem) {
+    const auto view = mem.get_current_view();
+    long double total = 0.0L;
+
+    for (std::size_t z = 0; z < mem.z_extent(); ++z) {
+        for (std::size_t y = 0; y < mem.y_extent(); ++y) {
+            for (std::size_t x = 0; x < mem.x_extent(); ++x) {
+                total += static_cast<long double>(concentration_d3q7(view, x, y, z));
+            }
+        }
+    }
+
+    return static_cast<double>(total);
+}
+
+/**
+ * @brief Find D3Q7 scalar concentration extrema over the current domain.
+ *
+ * @param mem Scalar memory whose current buffer is inspected.
+ * @return Pair `(minimum, maximum)`.
+ */
+std::pair<double, double> concentration_extrema_d3q7(
+    const lbm::LatticeMemory<lbm::D3Q7, double>& mem) {
+    const auto view = mem.get_current_view();
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+
+    for (std::size_t z = 0; z < mem.z_extent(); ++z) {
+        for (std::size_t y = 0; y < mem.y_extent(); ++y) {
+            for (std::size_t x = 0; x < mem.x_extent(); ++x) {
+                const double concentration = concentration_d3q7(view, x, y, z);
+                minimum = std::min(minimum, concentration);
+                maximum = std::max(maximum, concentration);
+            }
+        }
+    }
+
+    return {minimum, maximum};
+}
+
+/**
+ * @brief Validate D3Q7 passive scalar transport in a uniform diagonal D3Q19 flow.
+ *
+ * A sinusoidal concentration mode varies along x only, so its maximum should
+ * translate by `U_x T` cells while the y and z velocity components exercise the
+ * 3D velocity coupling path. With periodic boundaries and zero source, the
+ * scalar mass must remain conserved to roundoff.
+ */
+TEST(PassiveScalar3D, AdvectionDiffusion_D3Q7) {
+    constexpr std::size_t domain_size = 16;
+    constexpr int iterations = 40;
+    constexpr double fluid_velocity = 0.05;
+    constexpr double scalar_relaxation_time = 0.8;
+    constexpr double omega_c = 1.0 / scalar_relaxation_time;
+    constexpr double fluid_omega = 1.0;
+    constexpr double base_concentration = 1.0;
+    constexpr double concentration_amplitude = 0.1;
+    constexpr double wave_number =
+        2.0 * std::numbers::pi_v<double> / static_cast<double>(domain_size);
+
+    lbm::LatticeMemory<lbm::D3Q19, double> fluid_mem{
+        domain_size,
+        domain_size,
+        domain_size};
+    lbm::LatticeMemory<lbm::D3Q7, double> scalar_mem{
+        domain_size,
+        domain_size,
+        domain_size};
+
+    initialize_uniform_fluid_d3q19(
+        fluid_mem,
+        fluid_velocity,
+        fluid_velocity,
+        fluid_velocity);
+
+    const Eigen::Matrix<double, lbm::D3Q7::D, 1> advecting_velocity{
+        fluid_velocity,
+        fluid_velocity,
+        fluid_velocity};
+    auto scalar_view = scalar_mem.get_current_view();
+    for (std::size_t z = 0; z < domain_size; ++z) {
+        for (std::size_t y = 0; y < domain_size; ++y) {
+            for (std::size_t x = 0; x < domain_size; ++x) {
+                const double concentration =
+                    base_concentration +
+                    concentration_amplitude *
+                        std::sin(wave_number * static_cast<double>(x));
+
+                for (int i = 0; i < lbm::D3Q7::Q; ++i) {
+                    scalar_view[static_cast<std::size_t>(i), z, y, x] =
+                        lbm::compute_scalar_equilibrium<lbm::D3Q7, double>(
+                            i,
+                            concentration,
+                            advecting_velocity);
+                }
+            }
+        }
+    }
+
+    const double initial_mass = total_concentration_d3q7(scalar_mem);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_cpu<lbm::D3Q19, double>(fluid_mem, fluid_omega);
+        lbm::step_scalar_cpu<lbm::D3Q19, lbm::D3Q7, double>(
+            scalar_mem,
+            fluid_mem,
+            omega_c,
+            0.0);
+    }
+
+    const double final_mass = total_concentration_d3q7(scalar_mem);
+    EXPECT_NEAR(final_mass, initial_mass, std::abs(initial_mass) * 1.0e-12);
+
+    const auto final_view = scalar_mem.get_current_view();
+    double peak_concentration = -std::numeric_limits<double>::infinity();
+    std::size_t peak_x = 0;
+    for (std::size_t z = 0; z < domain_size; ++z) {
+        for (std::size_t y = 0; y < domain_size; ++y) {
+            for (std::size_t x = 0; x < domain_size; ++x) {
+                const double concentration = concentration_d3q7(final_view, x, y, z);
+                if (concentration > peak_concentration) {
+                    peak_concentration = concentration;
+                    peak_x = x;
+                }
+            }
+        }
+    }
+
+    constexpr std::size_t initial_peak_x = domain_size / 4;
+    const auto advected_cells = static_cast<std::size_t>(
+        std::llround(fluid_velocity * static_cast<double>(iterations)));
+    const std::size_t expected_peak_x = (initial_peak_x + advected_cells) % domain_size;
+    const std::size_t direct_distance =
+        peak_x > expected_peak_x ? peak_x - expected_peak_x : expected_peak_x - peak_x;
+    const std::size_t periodic_distance =
+        std::min(direct_distance, domain_size - direct_distance);
+
+    EXPECT_LE(periodic_distance, std::size_t{1})
+        << "D3Q7 scalar peak should advect from x=" << initial_peak_x
+        << " to near x=" << expected_peak_x
+        << ", but was found at x=" << peak_x;
+}
+
+/**
+ * @brief Validate 3D fused A+B reactive mixing with D3Q7 species populations.
+ *
+ * Two initially segregated reactants diffuse into a planar interface and are
+ * consumed symmetrically by the fused no-extra-storage reaction update.
+ */
+TEST(ReactiveMixing3D, Segregated_D3Q7) {
+    constexpr std::size_t x_extent = 32;
+    constexpr std::size_t y_extent = 32;
+    constexpr std::size_t z_extent = 32;
+    constexpr int iterations = 100;
+    constexpr double reaction_rate = 0.05;
+    constexpr double scalar_relaxation_time = 0.8;
+    constexpr double omega_c = 1.0 / scalar_relaxation_time;
+
+    lbm::LatticeMemory<lbm::D3Q19, double> fluid_mem{x_extent, y_extent, z_extent};
+    lbm::LatticeMemory<lbm::D3Q7, double> species_a_mem{x_extent, y_extent, z_extent};
+    lbm::LatticeMemory<lbm::D3Q7, double> species_b_mem{x_extent, y_extent, z_extent};
+
+    initialize_uniform_fluid_d3q19(fluid_mem, 0.0, 0.0, 0.0);
+
+    const Eigen::Matrix<double, lbm::D3Q7::D, 1> zero_velocity{0.0, 0.0, 0.0};
+    auto a_view = species_a_mem.get_current_view();
+    auto b_view = species_b_mem.get_current_view();
+    for (std::size_t z = 0; z < z_extent; ++z) {
+        for (std::size_t y = 0; y < y_extent; ++y) {
+            for (std::size_t x = 0; x < x_extent; ++x) {
+                const double concentration_a = x < x_extent / 2 ? 1.0 : 0.0;
+                const double concentration_b = x < x_extent / 2 ? 0.0 : 1.0;
+
+                for (int i = 0; i < lbm::D3Q7::Q; ++i) {
+                    const auto q = static_cast<std::size_t>(i);
+                    a_view[q, z, y, x] =
+                        lbm::compute_scalar_equilibrium<lbm::D3Q7, double>(
+                            i,
+                            concentration_a,
+                            zero_velocity);
+                    b_view[q, z, y, x] =
+                        lbm::compute_scalar_equilibrium<lbm::D3Q7, double>(
+                            i,
+                            concentration_b,
+                            zero_velocity);
+                }
+            }
+        }
+    }
+
+    const double initial_mass_a = total_concentration_d3q7(species_a_mem);
+    const double initial_mass_b = total_concentration_d3q7(species_b_mem);
+
+    for (int step = 0; step < iterations; ++step) {
+        lbm::step_reaction_AB<lbm::D3Q19, lbm::D3Q7, double>(
+            fluid_mem,
+            species_a_mem,
+            species_b_mem,
+            omega_c,
+            reaction_rate);
+    }
+
+    const double final_mass_a = total_concentration_d3q7(species_a_mem);
+    const double final_mass_b = total_concentration_d3q7(species_b_mem);
+    EXPECT_LT(final_mass_a, initial_mass_a);
+    EXPECT_LT(final_mass_b, initial_mass_b);
+    EXPECT_NEAR(final_mass_a, final_mass_b, 1.0e-9);
+
+    const auto [minimum_a, maximum_a] = concentration_extrema_d3q7(species_a_mem);
+    const auto [minimum_b, maximum_b] = concentration_extrema_d3q7(species_b_mem);
+
+    EXPECT_GE(minimum_a, 0.0);
+    EXPECT_GE(minimum_b, 0.0);
+    EXPECT_LE(maximum_a, 1.0);
+    EXPECT_LE(maximum_b, 1.0);
 }
