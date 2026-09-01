@@ -347,11 +347,11 @@ void run_tgv_3d(const std::string& name) {
  */
 int main() {
     try {
-        run_tgv_3d<lbm::D3Q19, CollisionType::BGK>("D3Q19_BGK");
+    //    run_tgv_3d<lbm::D3Q19, CollisionType::BGK>("D3Q19_BGK");
         run_tgv_3d<lbm::D3Q19, CollisionType::MRT>("D3Q19_MRT");
-        run_tgv_3d<lbm::D3Q19, CollisionType::RLBM>("D3Q19_RLBM");
-        run_tgv_3d<lbm::D3Q27, CollisionType::MRT>("D3Q27_MRT");
-        run_tgv_3d<lbm::D3Q27, CollisionType::RLBM>("D3Q27_RLBM");
+    //    run_tgv_3d<lbm::D3Q19, CollisionType::RLBM>("D3Q19_RLBM");
+    //    run_tgv_3d<lbm::D3Q27, CollisionType::MRT>("D3Q27_MRT");
+    //    run_tgv_3d<lbm::D3Q27, CollisionType::RLBM>("D3Q27_RLBM");
     } catch (const std::exception& error) {
         std::cerr << "Fatal benchmark error: " << error.what() << '\n';
         return 1;

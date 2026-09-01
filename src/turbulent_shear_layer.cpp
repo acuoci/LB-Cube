@@ -2,12 +2,13 @@
  * @file turbulent_shear_layer.cpp
  * @brief High-Reynolds-number doubly periodic shear-layer benchmark.
  *
- * This executable compares BGK, TRT, and MRT on a challenging Kelvin-Helmholtz
- * instability setup. The case is intentionally configured near the stability
- * limit so BGK can fail gracefully while TRT and MRT can be inspected under the
- * same initial conditions.
+ * This executable compares BGK, TRT, MRT, and RLBM on a challenging
+ * Kelvin-Helmholtz instability setup. The case is intentionally configured near
+ * the stability limit so each operator can fail gracefully while the next one
+ * runs under identical initial conditions.
  */
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -40,7 +41,7 @@ using lbm::CollisionType;
 constexpr std::size_t nx = 512;
 constexpr std::size_t ny = 512;
 constexpr int total_steps = 30000;
-constexpr int stability_check_frequency = 100;
+constexpr int stability_check_frequency = 50;
 constexpr int vtk_frequency = 1000;
 constexpr Real u0 = Real{0.04};
 constexpr Real perturbation_amplitude = Real{0.05};
@@ -258,6 +259,9 @@ void run_shear_layer_impl(const std::string& name) {
     stability_log << "0," << compute_max_velocity(fluid) << '\n';
 
     const auto start = std::chrono::high_resolution_clock::now();
+    int completed_steps = 0;
+    bool crashed = false;
+
     for (int step = 1; step <= total_steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, CT>(fluid, omega);
         lbm::step_scalar_cpu<FluidLattice, ScalarLattice, Real>(
@@ -268,14 +272,16 @@ void run_shear_layer_impl(const std::string& name) {
             species_b,
             fluid,
             omega_c);
+        completed_steps = step;
 
         if (step % stability_check_frequency == 0) {
             const Real max_velocity = compute_max_velocity(fluid);
             stability_log << step << ',' << std::format("{:.17g}", max_velocity) << '\n';
 
             if (!std::isfinite(max_velocity) || max_velocity > crash_velocity_threshold) {
-                std::cout << name << ": Solver Crashed due to instability! "
-                          << "step=" << step << ", Umax=" << max_velocity << '\n'
+                std::cout << '[' << name << "] Solver Crashed due to instability! "
+                          << "step=" << step
+                          << ", Umax=" << max_velocity << '\n'
                           << std::flush;
                 write_shear_layer_vtk(
                     output_dir,
@@ -284,6 +290,7 @@ void run_shear_layer_impl(const std::string& name) {
                     species_a,
                     species_b,
                     static_cast<std::size_t>(step));
+                crashed = true;
                 break;
             }
         }
@@ -296,7 +303,7 @@ void run_shear_layer_impl(const std::string& name) {
                 species_a,
                 species_b,
                 static_cast<std::size_t>(step));
-            std::cout << name << ": step " << step << " / " << total_steps
+            std::cout << '[' << name << "] Step " << step << " / " << total_steps
                       << " complete\n"
                       << std::flush;
         }
@@ -304,7 +311,18 @@ void run_shear_layer_impl(const std::string& name) {
 
     const auto stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> elapsed = stop - start;
-    std::cout << name << " elapsed time: " << elapsed.count() << " s\n" << std::flush;
+    constexpr std::size_t cells = nx * ny;
+    const double mlups =
+        static_cast<double>(cells) *
+        static_cast<double>(completed_steps) /
+        elapsed.count() /
+        1.0e6;
+
+    std::cout << '[' << name << "] elapsed=" << elapsed.count()
+              << " s, MLUPS=" << mlups
+              << (crashed ? " (terminated early)" : "")
+              << "\n\n"
+              << std::flush;
 }
 
 void run_shear_layer(CollisionType collision_type, const std::string& name) {
@@ -317,6 +335,9 @@ void run_shear_layer(CollisionType collision_type, const std::string& name) {
         break;
     case CollisionType::MRT:
         run_shear_layer_impl<CollisionType::MRT>(name);
+        break;
+    case CollisionType::RLBM:
+        run_shear_layer_impl<CollisionType::RLBM>(name);
         break;
     }
 }
@@ -338,9 +359,10 @@ int main() {
                   << '\n'
                   << std::flush;
 
-        run_shear_layer(CollisionType::BGK, "BGK");
-    //  run_shear_layer(CollisionType::TRT, "TRT");
-        run_shear_layer(CollisionType::MRT, "MRT");
+        run_shear_layer(CollisionType::BGK, "D2Q9_BGK");
+        run_shear_layer(CollisionType::TRT, "D2Q9_TRT");
+        run_shear_layer(CollisionType::MRT, "D2Q9_MRT");
+        run_shear_layer(CollisionType::RLBM, "D2Q9_RLBM");
 
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

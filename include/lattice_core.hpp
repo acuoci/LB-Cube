@@ -112,7 +112,6 @@ inline void collide_cell(
         } else if constexpr (std::is_same_v<Lattice, D3Q27>) {
             mrt::MrtRelaxationRates_D3Q27<Real> relaxation_rates{};
             relaxation_rates.s_nu = omega;
-            relaxation_rates.s_b = omega;
             mrt::collide_mrt_d3q27<Real>(local_pops, macro, relaxation_rates);
         } else {
             static_assert(

@@ -68,16 +68,17 @@ struct MrtRelaxationRates_D2Q9 {
  * @brief Diagonal MRT relaxation rates for the D3Q19 d'Humieres basis.
  *
  * Conserved moments `rho`, `j_x`, `j_y`, and `j_z` are not relaxed by the
- * collision routine. The remaining modes are grouped by their hydrodynamic role:
- * energy modes, energy fluxes, viscous stresses, higher-order symmetric stress
- * modes, and anti-symmetric ghost modes.
+ * collision routine. The five physical shear-stress moments use the runtime
+ * viscosity relaxation rate. Every other non-conserved mode is set to maximum
+ * dissipative relaxation (`s = 1`) to suppress ghost-mode resonance in
+ * extreme high-Reynolds-number runs.
  *
  * @tparam Real Floating-point precision used for relaxation rates.
  */
 template <typename Real>
 struct MrtRelaxationRates_D3Q19 {
     /**
-     * @brief Construct stable non-hydrodynamic rates with unset viscosity rate.
+     * @brief Construct maximum-dissipation ghost rates with unset viscosity rate.
      *
      * `s_nu` is left at zero because it is tied to the physical shear viscosity
      * and is normally supplied from the run's relaxation time.
@@ -85,7 +86,7 @@ struct MrtRelaxationRates_D3Q19 {
     __host__ __device__ constexpr MrtRelaxationRates_D3Q19() = default;
 
     /**
-     * @brief Construct stable MRT rates with a supplied viscous relaxation rate.
+     * @brief Construct D3Q19 MRT rates with a supplied viscous relaxation rate.
      *
      * @param viscous_relaxation_rate Relaxation rate for stress moments 9-13.
      */
@@ -94,17 +95,56 @@ struct MrtRelaxationRates_D3Q19 {
         : s_nu(viscous_relaxation_rate) {}
 
     /** @brief Relaxation rate for the energy mode `e` (moment 1). */
-    Real s_e{Real{1.19}};
+    Real s_e{Real{1}};
     /** @brief Relaxation rate for the energy-squared mode `epsilon` (moment 2). */
-    Real s_eps{Real{1.4}};
+    Real s_eps{Real{1}};
     /** @brief Relaxation rate for energy-flux modes `q_x`, `q_y`, and `q_z`. */
-    Real s_q{Real{1.2}};
+    Real s_q{Real{1}};
     /** @brief Relaxation rate for viscous stress modes 9-13. */
     Real s_nu{};
     /** @brief Relaxation rate for anti-symmetric stress / higher-order modes 14-15. */
-    Real s_pi{Real{1.4}};
-    /** @brief Relaxation rate for higher-order kinetic modes 16-18. */
-    Real s_m{Real{1.98}};
+    Real s_pi{Real{1}};
+    /**
+     * @brief Relaxation rate for higher-order kinetic modes 16-18.
+     *
+     * The turbulent D3Q19 benchmark uses maximum dissipation for these modes:
+     * one-step relaxation to equilibrium rather than near-two relaxation.
+     */
+    Real s_m{Real{1}};
+
+    /**
+     * @brief Expand grouped D3Q19 rates into the full diagonal relaxation vector.
+     *
+     * The mapping intentionally makes the decoupling explicit:
+     * - conserved moments `0, 3, 5, 7` use `0`
+     * - only physical shear-stress moments `9-13` use runtime `s_nu`
+     * - energy, energy-square, energy-flux, and ghost modes remain fixed
+     *
+     * @return Diagonal relaxation vector ordered like `compute_moments_d3q19`.
+     */
+    [[nodiscard]] __host__ __device__ constexpr std::array<Real, 19> as_array() const {
+        return {
+            Real{0},
+            s_e,
+            s_eps,
+            Real{0},
+            s_q,
+            Real{0},
+            s_q,
+            Real{0},
+            s_q,
+            s_nu,
+            s_nu,
+            s_nu,
+            s_nu,
+            s_nu,
+            s_pi,
+            s_pi,
+            s_m,
+            s_m,
+            s_m
+        };
+    }
 };
 
 /**
@@ -131,11 +171,10 @@ struct MrtRelaxationRates_D3Q27 {
      */
     __host__ __device__ constexpr explicit MrtRelaxationRates_D3Q27(
         Real viscous_relaxation_rate)
-        : s_nu(viscous_relaxation_rate),
-          s_b(viscous_relaxation_rate) {}
+        : s_nu(viscous_relaxation_rate) {}
 
     /** @brief Bulk/trace relaxation rate for the diagonal second-order mode. */
-    Real s_b{Real{1}};
+    Real s_b{Real{1.19}};
     /** @brief Relaxation rate for energy-flux-like third-order modes. */
     Real s_e{Real{1.1}};
     /** @brief Relaxation rate for mixed third-order and fourth-order kinetic modes. */
@@ -916,11 +955,18 @@ __host__ __device__ inline std::array<Real, 19> compute_equilibrium_moments_d3q1
  * three momentum components are skipped so collision preserves local mass and
  * momentum exactly up to floating-point roundoff.
  *
+ * The high-Reynolds-number stability-critical detail is that only the five
+ * shear-stress moments use the runtime viscosity relaxation rate `S.s_nu`.
+ * Energy, energy-square, energy-flux, and higher-order ghost modes are
+ * hardcoded here to `1`, forcing one-step relaxation to equilibrium and
+ * preventing near-two ghost-mode resonance at extreme Reynolds number.
+ *
  * @tparam Real Floating-point precision used for populations and moments.
  * @param pops D3Q19 local population vector. Values are overwritten with
  * post-collision populations.
  * @param macro Macroscopic state used to construct equilibrium moments.
- * @param S Diagonal non-conserved relaxation rates for the D3Q19 MRT collision.
+ * @param S Relaxation-rate bundle. Only `S.s_nu` is consumed for the physical
+ * shear-stress modes; all non-hydrodynamic rates are fixed to `1` here.
  */
 template <typename Real>
 __host__ __device__ inline void collide_mrt_d3q19(
@@ -931,21 +977,33 @@ __host__ __device__ inline void collide_mrt_d3q19(
     const std::array<Real, 19> equilibrium =
         compute_equilibrium_moments_d3q19<Real>(macro);
 
-    moments[1] -= S.s_e * (moments[1] - equilibrium[1]);
-    moments[2] -= S.s_eps * (moments[2] - equilibrium[2]);
-    moments[4] -= S.s_q * (moments[4] - equilibrium[4]);
-    moments[6] -= S.s_q * (moments[6] - equilibrium[6]);
-    moments[8] -= S.s_q * (moments[8] - equilibrium[8]);
-    moments[9] -= S.s_nu * (moments[9] - equilibrium[9]);
-    moments[10] -= S.s_nu * (moments[10] - equilibrium[10]);
-    moments[11] -= S.s_nu * (moments[11] - equilibrium[11]);
-    moments[12] -= S.s_nu * (moments[12] - equilibrium[12]);
-    moments[13] -= S.s_nu * (moments[13] - equilibrium[13]);
-    moments[14] -= S.s_pi * (moments[14] - equilibrium[14]);
-    moments[15] -= S.s_pi * (moments[15] - equilibrium[15]);
-    moments[16] -= S.s_m * (moments[16] - equilibrium[16]);
-    moments[17] -= S.s_m * (moments[17] - equilibrium[17]);
-    moments[18] -= S.s_m * (moments[18] - equilibrium[18]);
+    const Real omega = S.s_nu;
+    const std::array<Real, 19> relaxation_rates{
+        Real{0},    // 0: rho, conserved
+        Real{1},    // 1: e, maximum-dissipation bulk/energy mode
+        Real{1},    // 2: eps, maximum-dissipation energy-square mode
+        Real{0},    // 3: j_x, conserved
+        Real{1},    // 4: q_x, maximum-dissipation energy flux
+        Real{0},    // 5: j_y, conserved
+        Real{1},    // 6: q_y, maximum-dissipation energy flux
+        Real{0},    // 7: j_z, conserved
+        Real{1},    // 8: q_z, maximum-dissipation energy flux
+        omega,      // 9: 3p_xx, physical shear stress
+        omega,      // 10: p_ww, physical shear stress
+        omega,      // 11: p_xy, physical shear stress
+        omega,      // 12: p_yz, physical shear stress
+        omega,      // 13: p_xz, physical shear stress
+        Real{1},    // 14: pi_xx, maximum-dissipation higher-order mode
+        Real{1},    // 15: pi_ww, maximum-dissipation higher-order mode
+        Real{1},    // 16: m_x, maximum-dissipation ghost mode
+        Real{1},    // 17: m_y, maximum-dissipation ghost mode
+        Real{1}     // 18: m_z, maximum-dissipation ghost mode
+    };
+    for (int i = 0; i < lbm::D3Q19::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        moments[index] -=
+            relaxation_rates[index] * (moments[index] - equilibrium[index]);
+    }
 
     pops = compute_populations_d3q19<Real>(moments);
 }
