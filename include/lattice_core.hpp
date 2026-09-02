@@ -351,7 +351,7 @@ inline void step_scalar_cpu(
  * @param fluid_mem Read-only fluid populations used to reconstruct advecting velocity.
  * @param species_a_mem Scalar population storage for reactant A.
  * @param species_b_mem Scalar population storage for reactant B.
- * @param omega_c Scalar BGK relaxation frequency for both reactants.
+ * @param omega_c Scalar relaxation frequency for both reactants.
  * @param k_react Second-order reaction-rate constant.
  */
 template <
@@ -405,9 +405,9 @@ inline void step_reaction_AB(
                 const Real reaction_source =
                     compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
-                collide_scalar_bgk<ScalarLattice, Real>(
+                collide_scalar_max_dissipation<ScalarLattice, Real>(
                     a_pops, fluid_macro.velocity, omega_c, reaction_source);
-                collide_scalar_bgk<ScalarLattice, Real>(
+                collide_scalar_max_dissipation<ScalarLattice, Real>(
                     b_pops, fluid_macro.velocity, omega_c, reaction_source);
 
                 for (int i = 0; i < ScalarLattice::Q; ++i) {
@@ -454,9 +454,9 @@ inline void step_reaction_AB(
                     const Real reaction_source =
                         compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
-                    collide_scalar_bgk<ScalarLattice, Real>(
+                    collide_scalar_max_dissipation<ScalarLattice, Real>(
                         a_pops, fluid_macro.velocity, omega_c, reaction_source);
-                    collide_scalar_bgk<ScalarLattice, Real>(
+                    collide_scalar_max_dissipation<ScalarLattice, Real>(
                         b_pops, fluid_macro.velocity, omega_c, reaction_source);
 
                     for (int i = 0; i < ScalarLattice::Q; ++i) {

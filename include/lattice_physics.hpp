@@ -694,6 +694,61 @@ __host__ __device__ inline void collide_scalar_bgk(
 }
 
 /**
+ * @brief Apply max-dissipation decoupled TRT collision to scalar populations.
+ *
+ * This operator is intended for near-zero scalar diffusivity, where scalar BGK
+ * can leave high-frequency even modes weakly damped. The scalar populations are
+ * decomposed around the first-order advective equilibrium into opposite-link
+ * odd/even non-equilibrium components. The even component is discarded
+ * completely, while only the odd component is retained with the physical scalar
+ * relaxation rate. A local source increment is then distributed isotropically as
+ * `w_i * source_term`, preserving the existing reaction coupling contract.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`
+ * and providing a valid `opposite` table.
+ * @tparam Real Floating-point precision used for scalar populations.
+ * @param scalar_pops Scalar populations gathered at one destination cell. Values
+ * are overwritten with post-collision populations.
+ * @param fluid_velocity Advecting fluid velocity at the destination cell.
+ * @param omega_s Scalar relaxation frequency for the odd non-equilibrium part.
+ * @param source_term Local scalar source added over one time step.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+__host__ __device__ inline void collide_scalar_max_dissipation(
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)>& scalar_pops,
+    const Eigen::Matrix<Real, ScalarLattice::D, 1>& fluid_velocity,
+    Real omega_s,
+    Real source_term) {
+    const Real concentration = compute_concentration<ScalarLattice, Real>(scalar_pops);
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> equilibrium{};
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> nonequilibrium{};
+
+    for (int i = 0; i < ScalarLattice::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        equilibrium[index] =
+            compute_scalar_equilibrium<ScalarLattice, Real>(
+                i,
+                concentration,
+                fluid_velocity);
+        nonequilibrium[index] = scalar_pops[index] - equilibrium[index];
+    }
+
+    for (int i = 0; i < ScalarLattice::Q; ++i) {
+        const auto index = static_cast<std::size_t>(i);
+        const auto opposite_index =
+            static_cast<std::size_t>(ScalarLattice::opposite[index]);
+        const Real odd_nonequilibrium =
+            Real{0.5} * (nonequilibrium[index] - nonequilibrium[opposite_index]);
+        const Real weight = static_cast<Real>(ScalarLattice::weights[index]);
+
+        scalar_pops[index] =
+            equilibrium[index] +
+            (Real{1} - omega_s) * odd_nonequilibrium +
+            weight * source_term;
+    }
+}
+
+/**
  * @brief Compute the exact local source increment for `A + B -> C` over one step.
  *
  * The scalar collision accepts a source increment integrated over one lattice
