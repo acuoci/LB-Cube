@@ -52,6 +52,7 @@ struct Config {
     int steps{10000};
     int stat_freq{10};
     int screen_freq{100};
+    int vtk_freq{1000};
     int vtk_burst_length{1000};
     int vtk_burst_freq{100};
 };
@@ -59,6 +60,19 @@ struct Config {
 struct FlowDiagnostics {
     Real u_max{};
     Real mean_kinetic_energy{};
+};
+
+struct ScalarDiagnostics {
+    Real mean_ca{};
+    Real var_ca{};
+    Real min_ca{};
+    Real max_ca{};
+    Real mean_cb{};
+    Real var_cb{};
+    Real mean_cc{};
+    Real var_cc{};
+    Real rate_true{};
+    Real rate_mixed{};
 };
 
 [[nodiscard]] std::size_t cell_count(const Config& config) {
@@ -114,6 +128,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --steps <n>              Total simulation steps (default 10000)\n"
         << "  --stat_freq <n>          CSV statistics interval (default 10)\n"
         << "  --screen_freq <n>        Console telemetry interval (default 100)\n"
+        << "  --vtk_freq <n>           Regular binary VTK interval (default 1000)\n"
         << "  --vtk_burst_length <n>   Steps covered by burst output (default 1000)\n"
         << "  --vtk_burst_freq <n>     VTK interval during burst (default 100)\n"
         << "  --help                   Show this message\n";
@@ -148,6 +163,8 @@ void print_usage(std::ostream& stream, std::string_view executable) {
             config.stat_freq = parse_int(flag, require_value(index, argc, argv));
         } else if (flag == "--screen_freq") {
             config.screen_freq = parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--vtk_freq") {
+            config.vtk_freq = parse_int(flag, require_value(index, argc, argv));
         } else if (flag == "--vtk_burst_length") {
             config.vtk_burst_length = parse_int(flag, require_value(index, argc, argv));
         } else if (flag == "--vtk_burst_freq") {
@@ -193,6 +210,7 @@ void print_recap(const Config& config) {
         << "steps: " << config.steps
         << ", stat_freq: " << config.stat_freq
         << ", screen_freq: " << config.screen_freq << '\n'
+        << "VTK regular frequency: " << config.vtk_freq << '\n'
         << "VTK burst length: " << config.vtk_burst_length
         << ", VTK burst frequency: " << config.vtk_burst_freq << '\n'
         << std::flush;
@@ -340,102 +358,64 @@ template <lbm::IsLatticeModel Lattice>
         static_cast<Real>(kinetic_energy / static_cast<long double>(cell_count(config)))};
 }
 
-[[nodiscard]] double total_concentration(
+[[nodiscard]] ScalarDiagnostics compute_scalar_diagnostics(
     const Config& config,
-    const lbm::LatticeMemory<ScalarLattice, Real>& scalar) {
-    const auto view = scalar.get_current_view();
-    long double total = 0.0L;
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    const auto a_view = species_a.get_current_view();
+    const auto b_view = species_b.get_current_view();
+
+    long double sum_ca = 0.0L;
+    long double sum_cb = 0.0L;
+    long double sum_cc = 0.0L;
+    long double sum_ca2 = 0.0L;
+    long double sum_cb2 = 0.0L;
+    long double sum_cc2 = 0.0L;
+    long double sum_rate = 0.0L;
+    Real min_ca = std::numeric_limits<Real>::infinity();
+    Real max_ca = -std::numeric_limits<Real>::infinity();
 
     for (std::size_t z = 0; z < config.nz; ++z) {
         for (std::size_t y = 0; y < config.ny; ++y) {
             for (std::size_t x = 0; x < config.nx; ++x) {
-                total += static_cast<long double>(concentration_at(view, x, y, z));
+                const Real concentration_a = concentration_at(a_view, x, y, z);
+                const Real concentration_b = concentration_at(b_view, x, y, z);
+                const Real concentration_c =
+                    Real{0.5} * (Real{1} - concentration_a - concentration_b);
+                const Real local_rate = config.k_react * concentration_a * concentration_b;
+
+                sum_ca += static_cast<long double>(concentration_a);
+                sum_cb += static_cast<long double>(concentration_b);
+                sum_cc += static_cast<long double>(concentration_c);
+                sum_ca2 += static_cast<long double>(concentration_a * concentration_a);
+                sum_cb2 += static_cast<long double>(concentration_b * concentration_b);
+                sum_cc2 += static_cast<long double>(concentration_c * concentration_c);
+                sum_rate += static_cast<long double>(local_rate);
+                min_ca = std::min(min_ca, concentration_a);
+                max_ca = std::max(max_ca, concentration_a);
             }
         }
     }
 
-    return static_cast<double>(total);
-}
+    const long double inv_cells = 1.0L / static_cast<long double>(cell_count(config));
+    const Real mean_ca = static_cast<Real>(sum_ca * inv_cells);
+    const Real mean_cb = static_cast<Real>(sum_cb * inv_cells);
+    const Real mean_cc = static_cast<Real>(sum_cc * inv_cells);
+    const Real mean_ca2 = static_cast<Real>(sum_ca2 * inv_cells);
+    const Real mean_cb2 = static_cast<Real>(sum_cb2 * inv_cells);
+    const Real mean_cc2 = static_cast<Real>(sum_cc2 * inv_cells);
 
-[[nodiscard]] double step_reaction_ab_accumulate_product(
-    lbm::LatticeMemory<ScalarLattice, Real>& species_a,
-    lbm::LatticeMemory<ScalarLattice, Real>& species_b,
-    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
-    Real omega_c,
-    Real k_react) {
-    auto fluid_current = fluid.get_current_view();
-    auto a_current = species_a.get_current_view();
-    auto a_next = species_a.get_next_view();
-    auto b_current = species_b.get_current_view();
-    auto b_next = species_b.get_next_view();
-
-    const std::size_t z_extent = a_current.extent(1);
-    const std::size_t y_extent = a_current.extent(2);
-    const std::size_t x_extent = a_current.extent(3);
-    long double product_increment = 0.0L;
-
-    for (std::size_t z = 0; z < z_extent; ++z) {
-        for (std::size_t y = 0; y < y_extent; ++y) {
-            for (std::size_t x = 0; x < x_extent; ++x) {
-                std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
-                for (int i = 0; i < FluidLattice::Q; ++i) {
-                    fluid_pops[static_cast<std::size_t>(i)] =
-                        fluid_current[static_cast<std::size_t>(i), z, y, x];
-                }
-                const lbm::MacroState<FluidLattice, Real> fluid_macro =
-                    lbm::compute_macro_state<FluidLattice, Real>(fluid_pops);
-
-                std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> a_pops{};
-                std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> b_pops{};
-                for (int i = 0; i < ScalarLattice::Q; ++i) {
-                    const auto direction_offset = static_cast<std::size_t>(i * ScalarLattice::D);
-                    const int cx = ScalarLattice::c[direction_offset];
-                    const int cy = ScalarLattice::c[direction_offset + 1];
-                    const int cz = ScalarLattice::c[direction_offset + 2];
-                    const std::size_t nx = lbm::detail::periodic_pull_index(x, cx, x_extent);
-                    const std::size_t ny = lbm::detail::periodic_pull_index(y, cy, y_extent);
-                    const std::size_t nz = lbm::detail::periodic_pull_index(z, cz, z_extent);
-                    const auto q = static_cast<std::size_t>(i);
-
-                    a_pops[q] = a_current[q, nz, ny, nx];
-                    b_pops[q] = b_current[q, nz, ny, nx];
-                }
-
-                const Real concentration_a =
-                    lbm::compute_concentration<ScalarLattice, Real>(a_pops);
-                const Real concentration_b =
-                    lbm::compute_concentration<ScalarLattice, Real>(b_pops);
-                const Real reaction_source =
-                    lbm::compute_reaction_ab_source<Real>(
-                        concentration_a,
-                        concentration_b,
-                        k_react);
-
-                product_increment += static_cast<long double>(-reaction_source);
-
-                lbm::collide_scalar_max_dissipation<ScalarLattice, Real>(
-                    a_pops,
-                    fluid_macro.velocity,
-                    omega_c,
-                    reaction_source);
-                lbm::collide_scalar_max_dissipation<ScalarLattice, Real>(
-                    b_pops,
-                    fluid_macro.velocity,
-                    omega_c,
-                    reaction_source);
-
-                for (int i = 0; i < ScalarLattice::Q; ++i) {
-                    const auto q = static_cast<std::size_t>(i);
-                    a_next[q, z, y, x] = a_pops[q];
-                    b_next[q, z, y, x] = b_pops[q];
-                }
-            }
-        }
-    }
-
-    species_a.swap_buffers();
-    species_b.swap_buffers();
-    return static_cast<double>(product_increment);
+    return {
+        mean_ca,
+        mean_ca2 - mean_ca * mean_ca,
+        min_ca,
+        max_ca,
+        mean_cb,
+        mean_cb2 - mean_cb * mean_cb,
+        mean_cc,
+        mean_cc2 - mean_cc * mean_cc,
+        static_cast<Real>(sum_rate * inv_cells),
+        config.k_react * mean_ca * mean_cb};
 }
 
 void write_big_endian_double(std::ostream& stream, double value) {
@@ -515,6 +495,21 @@ void write_binary_vtk(
         }
     }
     vtk << '\n';
+
+    vtk << "SCALARS C_C double 1\n";
+    vtk << "LOOKUP_TABLE default\n";
+    for (std::size_t z = 0; z < config.nz; ++z) {
+        for (std::size_t y = 0; y < config.ny; ++y) {
+            for (std::size_t x = 0; x < config.nx; ++x) {
+                const Real concentration_a = concentration_at(a_view, x, y, z);
+                const Real concentration_b = concentration_at(b_view, x, y, z);
+                const Real concentration_c =
+                    Real{0.5} * (Real{1} - concentration_a - concentration_b);
+                write_big_endian_double(vtk, static_cast<double>(concentration_c));
+            }
+        }
+    }
+    vtk << '\n';
 }
 
 void append_statistics(
@@ -524,26 +519,24 @@ void append_statistics(
     Real simulation_time,
     const FlowDiagnostics& flow,
     Real dissipation_rate,
-    const lbm::ReactiveDiagnostics<Real>& reactive,
-    double total_product_c_formed) {
-    const Real mean_c =
-        static_cast<Real>(total_product_c_formed / static_cast<double>(cell_count(config)));
-    const Real global_rate =
-        reactive.true_reaction_rate * static_cast<Real>(cell_count(config));
-
+    const ScalarDiagnostics& scalar) {
     statistics << std::format(
-        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}\n",
+        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}\n",
         step,
         static_cast<double>(simulation_time),
         static_cast<double>(flow.u_max),
         static_cast<double>(flow.mean_kinetic_energy),
         static_cast<double>(dissipation_rate),
-        static_cast<double>(reactive.mean_A),
-        static_cast<double>(reactive.var_A),
-        static_cast<double>(reactive.mean_B),
-        static_cast<double>(reactive.var_B),
-        static_cast<double>(mean_c),
-        static_cast<double>(global_rate));
+        static_cast<double>(scalar.mean_ca),
+        static_cast<double>(scalar.var_ca),
+        static_cast<double>(scalar.min_ca),
+        static_cast<double>(scalar.max_ca),
+        static_cast<double>(scalar.mean_cb),
+        static_cast<double>(scalar.var_cb),
+        static_cast<double>(scalar.mean_cc),
+        static_cast<double>(scalar.var_cc),
+        static_cast<double>(scalar.rate_true),
+        static_cast<double>(scalar.rate_mixed));
 }
 
 void run_simulation(const Config& config) {
@@ -559,14 +552,14 @@ void run_simulation(const Config& config) {
     }
     statistics
         << "step,time,u_max,E_k,dissipation_rate,"
-        << "mean_Ca,var_Ca,mean_Cb,var_Cb,mean_Cc,global_rate\n";
+        << "mean_Ca,var_Ca,min_Ca,max_Ca,"
+        << "mean_Cb,var_Cb,mean_Cc,var_Cc,rate_true,rate_mixed\n";
 
     const Real omega_f = Real{1} / config.tau_f;
     const Real omega_s = Real{1} / config.tau_s;
-    const std::filesystem::path burst_dir{"vtk_burst_shear_3d"};
+    const std::filesystem::path vtk_dir{"vtk_shear_3d"};
     const auto start = std::chrono::high_resolution_clock::now();
 
-    double total_product_c_formed = 0.0;
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
     const FlowDiagnostics initial_flow = flow;
     Real kinetic_energy_previous = flow.mean_kinetic_energy;
@@ -574,11 +567,8 @@ void run_simulation(const Config& config) {
     bool burst_active = false;
     int burst_steps_recorded = 0;
 
-    const lbm::ReactiveDiagnostics<Real> initial_reactive =
-        lbm::compute_reactive_stats<ScalarLattice, Real>(
-            species_a,
-            species_b,
-            config.k_react);
+    const ScalarDiagnostics initial_scalar =
+        compute_scalar_diagnostics(config, species_a, species_b);
     append_statistics(
         statistics,
         config,
@@ -586,15 +576,15 @@ void run_simulation(const Config& config) {
         Real{},
         flow,
         latest_dissipation_rate,
-        initial_reactive,
-        total_product_c_formed);
+        initial_scalar);
+    write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
 
     for (int step = 1; step <= config.steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, lbm::CollisionType::RLBM>(fluid, omega_f);
-        total_product_c_formed += step_reaction_ab_accumulate_product(
+        lbm::step_reaction_AB<FluidLattice, ScalarLattice, Real>(
+            fluid,
             species_a,
             species_b,
-            fluid,
             omega_s,
             config.k_react);
 
@@ -605,11 +595,8 @@ void run_simulation(const Config& config) {
                 static_cast<Real>(config.stat_freq);
             kinetic_energy_previous = flow.mean_kinetic_energy;
 
-            const lbm::ReactiveDiagnostics<Real> reactive =
-                lbm::compute_reactive_stats<ScalarLattice, Real>(
-                    species_a,
-                    species_b,
-                    config.k_react);
+            const ScalarDiagnostics scalar =
+                compute_scalar_diagnostics(config, species_a, species_b);
             append_statistics(
                 statistics,
                 config,
@@ -617,8 +604,7 @@ void run_simulation(const Config& config) {
                 static_cast<Real>(step),
                 flow,
                 latest_dissipation_rate,
-                reactive,
-                total_product_c_formed);
+                scalar);
 
             if (!burst_active &&
                 flow.mean_kinetic_energy < Real{0.95} * initial_flow.mean_kinetic_energy) {
@@ -651,12 +637,16 @@ void run_simulation(const Config& config) {
                       << std::flush;
         }
 
-        if (burst_active && burst_steps_recorded < config.vtk_burst_length) {
+        const bool is_regular_vtk = step % config.vtk_freq == 0;
+        const bool is_burst_vtk =
+            burst_active &&
+            burst_steps_recorded < config.vtk_burst_length &&
+            step % config.vtk_burst_freq == 0;
+        if (is_regular_vtk || is_burst_vtk) {
+            write_binary_vtk(config, vtk_dir, step, fluid, species_a, species_b);
+        }
+        if (is_burst_vtk) {
             ++burst_steps_recorded;
-            if (burst_steps_recorded == 1 ||
-                burst_steps_recorded % config.vtk_burst_freq == 0) {
-                write_binary_vtk(config, burst_dir, step, fluid, species_a, species_b);
-            }
         }
 
         if (!std::isfinite(flow.u_max) || !std::isfinite(flow.mean_kinetic_energy)) {
@@ -670,9 +660,8 @@ void run_simulation(const Config& config) {
     const auto stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> elapsed = stop - start;
     std::cout << "Simulation complete in " << elapsed.count()
-              << " s. Total product C formed: " << total_product_c_formed
-              << "\nStatistics: statistics_shear_3d.csv"
-              << "\nVTK burst directory: " << burst_dir.string() << '\n'
+              << " s.\nStatistics: statistics_shear_3d.csv"
+              << "\nVTK directory: " << vtk_dir.string() << '\n'
               << std::flush;
 }
 
