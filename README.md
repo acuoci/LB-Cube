@@ -1,133 +1,225 @@
-# LB-Cube
+# LB-Cube: A C++23 Lattice Boltzmann Framework for Transport Phenomena
 
 ![C++23](https://img.shields.io/badge/C%2B%2B-23-blue)
-![CUDA](https://img.shields.io/badge/CUDA-optional-green)
 ![CMake](https://img.shields.io/badge/CMake-3.24%2B-064F8C)
+![CUDA](https://img.shields.io/badge/CUDA-optional-green)
 ![GoogleTest](https://img.shields.io/badge/tests-GoogleTest-informational)
 
-LB-Cube is a modern C++23/CUDA Lattice Boltzmann Method (LBM) research solver
-for direct numerical simulation of incompressible and weakly compressible flows,
-with an emphasis on turbulent reactive mixing. The codebase uses compile-time
-lattice traits, strict Structure-of-Arrays storage, ping-pong population buffers,
-and stateless physics kernels shared by the CPU and CUDA backends.
+LB-Cube is a high-performance, dimension-agnostic Lattice Boltzmann framework
+for transport phenomena, specializing in turbulent hydrodynamics and
+high-Schmidt-number reactive scalar transport. The codebase targets
+liquid-phase reactive mixing of the form `A + B -> C`, with explicit support for
+2D and 3D hydrodynamic lattices, scalar advection-diffusion-reaction transport,
+and production-oriented diagnostics for DNS and implicit-LES studies.
 
-The solver currently supports fluid dynamics with D2Q9 and D3Q19 lattices,
-passive and reactive scalar transport with D2Q5 and D3Q7 lattices, and
-BGK, TRT, and MRT collision operators. The design avoids virtual dispatch and
-runtime polymorphism in hot paths, keeping the numerical kernels suitable for
-high-performance CPU and GPU execution.
+The framework is built around compile-time lattice traits, strict
+Structure-of-Arrays population storage, ping-pong time integration, and
+stateless single-cell physics kernels. This keeps hot loops free from virtual
+dispatch while preserving a clean separation between lattice definitions,
+memory layout, collision physics, core time-stepping, validation, and output.
 
-## Features
+## Core Features & Architecture
 
-- **Fluid lattices:** D2Q9, D3Q19, and D3Q27 compile-time lattice traits.
-- **Scalar lattices:** D2Q5 and D3Q7 for advection-diffusion-reaction transport.
-- **Collision operators:** BGK, TRT, and MRT, selected at compile time.
-- **Reactive mixing:** fused two-species `A + B -> C` scalar reaction step.
-- **Modern C++:** C++23 concepts, templates, `std::mdspan`, and type-safe traits.
-- **CUDA acceleration:** optional GPU backend with raw device buffers and fused kernels.
-- **Precision templating:** `float` and `double` execution paths through `Real`.
-- **SoA memory layout:** population-major storage with contiguous spatial domains for coalesced access.
-- **Ping-pong updates:** two population buffers per field for race-free streaming.
-- **On-the-fly statistics:** scalar means, variances, covariance, segregation intensity, and reaction rates.
-- **Visualization output:** legacy ASCII VTK files readable directly by ParaView.
-- **Validation suite:** GoogleTest coverage for transformations, physics decay, convergence, and ADR kinetics.
+- **Modern C++23:** LB-Cube is built strictly around native `<mdspan>` for
+  zero-cost multidimensional array views over flat population buffers. This
+  exposes the same logical `[Q, Y, X]` or `[Q, Z, Y, X]` layout to CPU kernels,
+  diagnostics, and future GPU-oriented memory abstractions.
+- **Hydrodynamics:** Fluid models include `D2Q9`, `D3Q19`, and `D3Q27`.
+  Collision operators include BGK, TRT, MRT, and Regularized LBM (RLBM), with
+  compile-time dispatch through `CollisionType`. The RLBM path is used for
+  robust high-Reynolds-number turbulent flows where implicit-LES-like stability
+  is required.
+- **Reactive Scalar Transport:** Scalar advection-diffusion uses compact
+  `D2Q5` and `D3Q7` lattices coupled to the local fluid velocity reconstructed
+  from the hydrodynamic populations. Multiple species are represented as
+  independent `LatticeMemory` fields, preserving simple SoA access and avoiding
+  hidden interleaving.
+- **High-Schmidt Stability:** Reactive scalar transport includes a decoupled
+  max-dissipation TRT-style scalar collision. It discards even non-equilibrium
+  scalar modes and relaxes only the odd component with the physical scalar rate,
+  suppressing high-frequency checkerboard/Gibbs oscillations at `Sc > 1`.
+- **Robust Chemistry:** The `A + B -> C` reaction source is integrated with an
+  explicit positivity-preserving exact batch analytical update at each lattice
+  node. This avoids stiff ODE solvers while retaining a fused, allocation-free
+  reaction step suitable for production mixing simulations.
+- **Diagnostics and Output:** The production executables provide real-time
+  telemetry, CSV statistics, scalar means and variances, true versus mixed
+  reaction rates, min/max bounds, and legacy VTK output for ParaView.
 
-## Repository Layout
+## Compiler Requirements
 
-```text
-include/
-  lattice_traits.hpp    Compile-time lattice definitions and opposite maps
-  lattice_memory.hpp    SoA host memory and macroscopic state types
-  lattice_physics.hpp   Stateless BGK/TRT/scalar physics functions
-  lattice_mrt.hpp       D2Q9 and D3Q19 MRT transformations and collision
-  lattice_core.hpp      CPU fused collision-streaming and ADR loops
-  lattice_cuda.cuh      CUDA kernel declarations and launchers
-  lattice_io.hpp        Diagnostics, statistics, and VTK output
+LB-Cube strictly requires **C++23**.
 
-src/
-  main.cpp              3D fluid simulation executable
-  simulate_reaction.cpp 2D reactive mixing executable
-  compare_operators.cpp BGK/TRT/MRT reactive-mixing comparison executable
-  lattice_cuda.cu       CUDA backend implementation
+This is not a cosmetic requirement: the framework relies on the final standard
+`<mdspan>` header. When using GCC, use **GCC 16 or newer**. Equivalent Clang,
+AppleClang, or MSVC versions are acceptable only if they provide conforming
+C++23 `<mdspan>` support.
 
-tests/
-  test_validation.cpp   GoogleTest validation and convergence suite
-```
+Required dependencies:
 
-## Prerequisites
+- CMake 3.24 or newer
+- C++23 compiler with native `<mdspan>`
+- Eigen3
+- GoogleTest
 
-Required for all builds:
+Optional CUDA backend requirements:
 
-- CMake 3.24 or newer.
-- A C++23-capable compiler, such as GCC 13+, Clang 16+, or a recent AppleClang.
-- Eigen3.
-- GoogleTest.
+- NVIDIA CUDA Toolkit
+- `nvcc` available on `PATH`
+- CUDA-capable NVIDIA GPU
 
-Required only for CUDA builds:
-
-- NVIDIA CUDA Toolkit, recommended 12.2 or newer.
-- `nvcc` available on `PATH`, or `CUDAToolkit_ROOT` provided to CMake.
-- A CUDA-capable NVIDIA GPU for GPU execution.
-
-On HPC systems, these dependencies are typically provided through environment
-modules. The default CUDA architecture setting is `native`, which asks CMake to
-compile for the GPU available on the build node.
+CPU-only builds are fully supported and do not require `nvcc`.
 
 ## Build Instructions
 
+### CPU Build
+
+Use this configuration on machines without CUDA or when validating the CPU
+reference backend:
+
+```bash
+mkdir build-cpu
+cd build-cpu
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 -DLB_CUBE_ENABLE_CUDA=OFF
+cmake --build . -j 4
+```
+
 ### CUDA Build
 
-Use this path on a workstation or cluster node with a working CUDA compiler:
+Use this configuration on a node with a working CUDA compiler:
 
 ```bash
-git clone <repository-url> LB-Cube
-cd LB-Cube
-
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLB_CUBE_ENABLE_CUDA=ON
-
-cmake --build build -j
+mkdir build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 -DLB_CUBE_ENABLE_CUDA=ON
+cmake --build . -j 4
 ```
 
-If CUDA or dependencies are installed in non-standard locations:
+By default, CMake uses `CMAKE_CUDA_ARCHITECTURES=native`, which targets the GPU
+available on the build node. On clusters where compilation happens away from the
+compute GPU, set the architecture explicitly:
 
 ```bash
-cmake -S . -B build \
+cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLB_CUBE_ENABLE_CUDA=ON \
-  -DCUDAToolkit_ROOT=/path/to/cuda \
-  -DEigen3_DIR=/path/to/eigen/cmake \
-  -DGTest_DIR=/path/to/gtest/cmake
-```
-
-For login-node builds or cross-compilation, set the CUDA architecture explicitly:
-
-```bash
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_STANDARD=23 \
   -DLB_CUBE_ENABLE_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=80
 ```
 
-### CPU-Only Build Without `nvcc`
+## Flagship Executable
 
-If the machine does not have the NVIDIA CUDA compiler, disable the CUDA backend:
+The flagship production executable is:
 
 ```bash
-cmake -S . -B build-cpu \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLB_CUBE_ENABLE_CUDA=OFF
-
-cmake --build build-cpu -j
+./build-cpu/lbm_turbulent_reactive_shear_3d
 ```
 
-This builds the CPU executables and tests without compiling `.cu` files or
-including `cuda_runtime.h`.
+It runs a 3D liquid-phase turbulent reactive shear layer using:
 
-## Running Tests
+- fluid lattice: `D3Q27`
+- fluid collision: `CollisionType::RLBM`
+- scalar lattices: two `D3Q7` reactant fields
+- chemistry: fused `A + B -> C` exact local batch update
+- scalar stabilization: max-dissipation decoupled scalar collision
 
-Run the full GoogleTest validation suite through CTest:
+Example:
+
+```bash
+./build-cpu/lbm_turbulent_reactive_shear_3d \
+  --Nx 128 --Ny 128 --Nz 128 \
+  --tau_f 0.505 \
+  --tau_s 0.5005 \
+  --U0 0.05 \
+  --k_react 0.1 \
+  --steps 10000 \
+  --stat_freq 10 \
+  --screen_freq 100 \
+  --vtk_freq 1000 \
+  --vtk_burst_length 1000 \
+  --vtk_burst_freq 100
+```
+
+Supported command-line parameters include:
+
+- `--Nx`, `--Ny`, `--Nz`: grid dimensions
+- `--tau_f`: fluid relaxation time
+- `--tau_s`: scalar relaxation time
+- `--U0`: shear velocity amplitude
+- `--k_react`: second-order reaction-rate constant
+- `--steps`: total simulation steps
+- `--stat_freq`: CSV statistics frequency
+- `--screen_freq`: console telemetry frequency
+- `--vtk_freq`: regular binary VTK output frequency
+- `--vtk_burst_length`: duration of high-frequency burst output
+- `--vtk_burst_freq`: VTK interval during burst mode
+
+At startup, the executable prints a full parameter recap including:
+
+- kinematic viscosity: `nu = (tau_f - 0.5) / 3`
+- scalar diffusivity for `D3Q7`: `D = (tau_s - 0.5) / 4`
+- Schmidt number: `Sc = nu / D`
+- Damkohler number: `Da = k_react * Ny / U0`
+
+### Flagship Outputs
+
+The executable writes high-frequency scalar statistics to:
+
+```text
+statistics_shear_3d.csv
+```
+
+The CSV includes:
+
+```text
+step,time,u_max,E_k,dissipation_rate,
+mean_Ca,var_Ca,min_Ca,max_Ca,
+mean_Cb,var_Cb,mean_Cc,var_Cc,
+rate_true,rate_mixed
+```
+
+`rate_true = <k C_A C_B>` captures the actual segregated reaction rate, while
+`rate_mixed = k <C_A><C_B>` gives the perfectly mixed reference rate. Their
+separation is intended for intensity-of-segregation analysis.
+
+Binary legacy VTK files are written to:
+
+```text
+vtk_shear_3d/
+```
+
+VTK output contains:
+
+- velocity vector
+- `C_A`
+- `C_B`
+- reconstructed product `C_C = 0.5 * (1 - C_A - C_B)`
+
+The VTK system supports dual-frequency output:
+
+- regular output every `--vtk_freq` steps
+- burst-mode output every `--vtk_burst_freq` steps after the kinetic energy
+  drops below 95% of its initial value
+
+## Other Executables
+
+LB-Cube also builds several focused tools:
+
+- `lbm_sim`: baseline fluid simulation driver
+- `lbm_reaction_sim`: 2D reactive mixing executable
+- `lbm_compare_operators`: BGK/TRT/MRT/RLBM comparison on a shared 2D reactive case
+- `lbm_turbulent_shear_layer`: 2D high-Re doubly periodic shear-layer gauntlet
+- `lbm_turbulent_tgv_3d`: 3D turbulent Taylor-Green vortex stability benchmark
+
+## Testing
+
+Build the validation target:
+
+```bash
+cmake --build build-cpu --target lbm_validation_tests -j 4
+```
+
+Run the full GoogleTest suite through CTest:
 
 ```bash
 ctest --test-dir build-cpu --output-on-failure
@@ -139,220 +231,31 @@ Or run the test executable directly:
 ./build-cpu/lbm_validation_tests
 ```
 
-For CUDA-enabled builds, replace `build-cpu` with `build`:
+The `lbm_validation_tests` target covers:
 
-```bash
-ctest --test-dir build --output-on-failure
-```
+- mass conservation
+- MRT transformation identity checks
+- 2D shear-wave decay
+- 2D Taylor-Green vortex decay
+- 3D Taylor-Green and angled shear-wave validation
+- spatial and temporal convergence studies
+- passive scalar advection-diffusion
+- 2D and 3D reactive mixing with `D2Q5` and `D3Q7`
+- exact `A + B -> C` batch reaction kinetics
 
-The validation suite includes:
+## Notes for HPC Runs
 
-- MRT transformation identity tests for D2Q9 and D3Q19.
-- 2D shear-wave and Taylor-Green vortex decay tests.
-- 3D angled shear-wave tests for BGK, TRT, and MRT.
-- Spatial and temporal convergence checks.
-- Passive scalar advection-diffusion validation.
-- Batch reaction kinetics for `A + B -> C`.
-
-## Running a Fluid Simulation
-
-The main executable is `lbm_sim`, which currently runs D3Q19 fluid simulations.
-
-```bash
-./build/lbm_sim -nx 128 -ny 128 -nz 128 -steps 5000 -out_freq 250 -gpu
-```
-
-CPU-only example:
-
-```bash
-./build-cpu/lbm_sim -nx 64 -ny 64 -nz 64 -steps 1000 -out_freq 100 -cpu
-```
-
-Command-line options:
-
-- `-nx <N>`: number of grid points in x. Default: `64`.
-- `-ny <N>`: number of grid points in y. Default: `64`.
-- `-nz <N>`: number of grid points in z. Default: `64`.
-- `-steps <N>`: number of time steps. Default: `1000`.
-- `-out_freq <N>`: VTK and diagnostics output frequency. Default: `100`.
-- `-init <name>`: initial condition, currently `tgv` or `rest`.
-- `-cpu`: use the CPU backend.
-- `-gpu`: use the CUDA backend when available.
-
-In a CPU-only build, requesting `-gpu` will fail with a clear runtime error.
-
-## Running Reactive Mixing
-
-The `lbm_reaction_sim` executable runs a 2D segregated reactive-mixing case with
-a Taylor-Green vortex, species A initialized in the left half of the domain, and
-species B initialized in the right half.
-
-```bash
-./build-cpu/lbm_reaction_sim -cpu
-```
-
-Useful options include:
-
-- `-nx <N>` and `-ny <N>`: 2D domain size.
-- `-steps <N>`: number of time steps.
-- `-out_freq <N>`: output frequency.
-- `-u0 <value>`: Taylor-Green velocity amplitude.
-- `-tau <value>`: fluid relaxation time.
-- `-tau_c <value>`: scalar relaxation time.
-- `-k_react <value>`: second-order reaction-rate constant.
-- `-cpu` or `-gpu`: backend selection, depending on build configuration.
-
-## Running the Operator Benchmark
-
-The `lbm_compare_operators` executable runs the same 256x256 reactive-mixing
-case three times, once with each fluid collision operator:
-
-- BGK
-- TRT
-- MRT
-
-The scalar transport and reaction model are kept fixed, so differences in the
-outputs reflect the fluid operator used to generate the mixing field.
-
-Run it from the project root:
-
-```bash
-./build-cpu/lbm_compare_operators
-```
-
-or, for a CUDA-enabled build tree:
-
-```bash
-./build/lbm_compare_operators
-```
-
-The benchmark uses fixed settings:
-
-- Grid: `256 x 256`
-- Steps per operator: `5000`
-- Reactive statistics frequency: every `10` steps
-- VTK output frequency: every `500` steps
-- Fluid lattice: D2Q9
-- Scalar lattices: D2Q5 for species A and B
-- Initial fluid field: Taylor-Green vortex with `U0 = 0.04`, `tau = 0.6`
-- Reaction rate: `k_react = 0.05`
-
-Outputs are written to separate directories:
-
-```text
-output_BGK/
-  stats_BGK.csv
-  comparison_BGK_000000.vtk
-  comparison_BGK_000500.vtk
-  ...
-
-output_TRT/
-  stats_TRT.csv
-  comparison_TRT_000000.vtk
-  comparison_TRT_000500.vtk
-  ...
-
-output_MRT/
-  stats_MRT.csv
-  comparison_MRT_000000.vtk
-  comparison_MRT_000500.vtk
-  ...
-```
-
-Each CSV file contains:
-
-- `mean_A`, `mean_B`
-- `var_A`, `var_B`
-- `covariance`
-- `segregation_intensity`
-- `true_reaction_rate`
-- `mixed_reaction_rate`
-
-Each VTK snapshot contains:
-
-- fluid `velocity`
-- species concentration `C_A`
-- species concentration `C_B`
-- local `reaction_rate`
-
-## Outputs and Visualization
-
-LB-Cube writes lightweight CSV diagnostics for quantitative analysis and legacy
-ASCII VTK files for visualization. The VTK files use the `STRUCTURED_POINTS`
-dataset format and can be opened directly in ParaView:
-
-```bash
-paraview output_MRT/comparison_MRT_000500.vtk
-```
-
-For time-series visualization, open a numbered VTK sequence in ParaView and
-enable file-series loading. For rest-state or weak-flow cases, color by velocity
-magnitude, concentration, or reaction rate rather than uniform density.
-
-## HPC Cluster Execution
-
-For SGE-based clusters, build in a persistent project directory and run large
-jobs from node-local scratch storage. Copy only the final CSV files and selected
-VTK snapshots back to archive storage to avoid unnecessary parallel-filesystem
-traffic.
-
-Example `qsub` script:
-
-```bash
-#!/bin/bash
-#$ -N lb_cube_compare
-#$ -cwd
-#$ -pe smp 16
-#$ -l h_rt=08:00:00
-#$ -j y
-#$ -o lb_cube_compare.$JOB_ID.log
-
-set -euo pipefail
-
-module purge
-module load gcc/13
-module load cmake/3.24
-
-PROJECT_DIR="$HOME/LB-Cube"
-ARCHIVE_DIR="$PROJECT_DIR/runs/$JOB_ID"
-SCRATCH_DIR="${TMPDIR:-/tmp}/lb_cube_compare_$JOB_ID"
-
-mkdir -p "$SCRATCH_DIR" "$ARCHIVE_DIR"
-cd "$SCRATCH_DIR"
-
-"$PROJECT_DIR/build-cpu/lbm_compare_operators"
-
-cp -r output_BGK output_TRT output_MRT "$ARCHIVE_DIR"/
-```
-
-For GPU fluid runs, load the CUDA module and build with
-`-DLB_CUBE_ENABLE_CUDA=ON`.
-
-## Development Notes
-
-LB-Cube follows a strict separation of concerns:
-
-- `lattice_traits.hpp` defines lattice constants and topology.
-- `lattice_memory.hpp` owns population storage and multidimensional views.
-- `lattice_physics.hpp` and `lattice_mrt.hpp` contain stateless mathematical kernels.
-- `lattice_core.hpp` and `lattice_cuda.cuh` implement execution backends.
-- `lattice_io.hpp` handles diagnostics and visualization output.
-
-New kernels should preserve compile-time dispatch, avoid dynamic allocation in
-inner loops, and keep host/device-compatible mathematical functions stateless.
+For cluster execution, prefer out-of-source builds and run simulations from
+scratch storage. Keep large VTK output on scratch during the job and archive only
+selected snapshots, CSV statistics, logs, and configuration files after
+completion. The production executable flushes console telemetry so schedulers
+capture progress promptly.
 
 ## Citation and Acknowledgments
 
-If you use LB-Cube in academic work, please cite the software repository and the
-associated publication once available.
+Citation metadata will be added before publication. Please cite the repository
+and associated paper/preprint when available.
 
-Suggested placeholder citation:
-
-```text
-LB-Cube: A Modern C++23/CUDA Lattice Boltzmann Solver for Reactive Mixing.
-CRECK Modeling Lab, Politecnico di Milano.
-Repository: <repository-url>
-```
-
-This software originated within the CRECK Modeling Lab at Politecnico di Milano
-as a research-oriented platform for high-performance LBM development.
+LB-Cube originates from research software development for transport phenomena
+and reactive mixing studies within the CRECK Modeling Lab at Politecnico di
+Milano.
