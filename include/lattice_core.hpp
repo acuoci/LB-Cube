@@ -10,6 +10,7 @@
  * buffer.
  */
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <concepts>
@@ -405,8 +406,14 @@ inline void step_reaction_AB(
                     b_pops[q] = b_current[q, ny, nx];
                 }
 
-                const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
-                const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+                const Real concentration_a_raw =
+                    compute_concentration<ScalarLattice, Real>(a_pops);
+                const Real concentration_b_raw =
+                    compute_concentration<ScalarLattice, Real>(b_pops);
+                const Real concentration_a =
+                    std::max(Real{}, std::min(Real{1}, concentration_a_raw));
+                const Real concentration_b =
+                    std::max(Real{}, std::min(Real{1}, concentration_b_raw));
                 const Real reaction_source =
                     compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
@@ -455,8 +462,14 @@ inline void step_reaction_AB(
                         b_pops[q] = b_current[q, nz, ny, nx];
                     }
 
-                    const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
-                    const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+                    const Real concentration_a_raw =
+                        compute_concentration<ScalarLattice, Real>(a_pops);
+                    const Real concentration_b_raw =
+                        compute_concentration<ScalarLattice, Real>(b_pops);
+                    const Real concentration_a =
+                        std::max(Real{}, std::min(Real{1}, concentration_a_raw));
+                    const Real concentration_b =
+                        std::max(Real{}, std::min(Real{1}, concentration_b_raw));
                     const Real reaction_source =
                         compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
