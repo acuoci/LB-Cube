@@ -529,7 +529,7 @@ void append_statistics(
     Real dissipation_rate,
     const ScalarDiagnostics& scalar) {
     statistics << std::format(
-        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}\n",
+        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
         step,
         static_cast<double>(simulation_time),
         static_cast<double>(flow.u_max),
@@ -544,7 +544,9 @@ void append_statistics(
         static_cast<double>(scalar.mean_cc),
         static_cast<double>(scalar.var_cc),
         static_cast<double>(scalar.rate_true),
-        static_cast<double>(scalar.rate_mixed));
+        static_cast<double>(scalar.rate_mixed))
+               << std::endl;
+    statistics.flush();
 }
 
 void run_simulation(const Config& config) {
@@ -561,7 +563,9 @@ void run_simulation(const Config& config) {
     statistics
         << "step,time,u_max,E_k,dissipation_rate,"
         << "mean_Ca,var_Ca,min_Ca,max_Ca,"
-        << "mean_Cb,var_Cb,mean_Cc,var_Cc,rate_true,rate_mixed\n";
+        << "mean_Cb,var_Cb,mean_Cc,var_Cc,rate_true,rate_mixed"
+        << std::endl;
+    statistics.flush();
 
     const Real omega_f = Real{1} / config.tau_f;
     const Real omega_s = Real{1} / config.tau_s;
@@ -667,6 +671,9 @@ void run_simulation(const Config& config) {
 
     const auto stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> elapsed = stop - start;
+    statistics.flush();
+    statistics.close();
+
     std::cout << "Simulation complete in " << elapsed.count()
               << " s.\nStatistics: statistics_shear_3d.csv"
               << "\nVTK directory: " << vtk_dir.string() << '\n'
