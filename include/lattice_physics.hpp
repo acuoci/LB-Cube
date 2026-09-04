@@ -41,7 +41,59 @@ namespace detail {
 template <typename Lattice>
 inline constexpr bool unsupported_regularized_lattice_v = false;
 
+/**
+ * @brief Host/device finite check for scalar boundedness limiters.
+ *
+ * CUDA device code provides the C math overloads in the global namespace, while
+ * host code should use the standard library overload set. Keeping this behind a
+ * tiny helper lets the scalar limiter remain shared by CPU and GPU collision
+ * functions.
+ *
+ * @tparam Real Floating-point precision to inspect.
+ * @param value Candidate scalar value.
+ * @return `true` when the value is neither NaN nor infinite.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline bool is_finite(Real value) {
+#if defined(__CUDA_ARCH__)
+    return isfinite(value);
+#else
+    using std::isfinite;
+    return isfinite(value);
+#endif
+}
+
 } // namespace detail
+
+/**
+ * @brief Clamp a concentration for bounded species chemistry and stabilization.
+ *
+ * The helper is written without `std::min`/`std::max` so it can be called from
+ * CUDA device code. Non-finite values are mapped to the lower bound, which is
+ * the least reactive admissible state for the `A + B -> C` chemistry.
+ *
+ * @tparam Real Floating-point precision used for scalar concentrations.
+ * @param concentration Candidate concentration recovered from scalar populations.
+ * @param lower_bound Minimum admissible concentration.
+ * @param upper_bound Maximum admissible concentration.
+ * @return Concentration clipped to `[lower_bound, upper_bound]`.
+ */
+template <std::floating_point Real>
+__host__ __device__ inline Real clamp_scalar_concentration(
+    Real concentration,
+    Real lower_bound = Real{},
+    Real upper_bound = Real{1}) {
+    if (!detail::is_finite(concentration)) {
+        return lower_bound;
+    }
+    if (concentration < lower_bound) {
+        return lower_bound;
+    }
+    if (concentration > upper_bound) {
+        return upper_bound;
+    }
+    return concentration;
+}
 
 /**
  * @brief Hermite projection prefactor for lattices with `c_s^2 = 1/3`.
@@ -659,6 +711,55 @@ __host__ __device__ inline Real compute_scalar_equilibrium(
 }
 
 /**
+ * @brief Enforce bounded scalar concentration after collision/source coupling.
+ *
+ * The scalar transport schemes are conservative and high-order enough to create
+ * Gibbs-type overshoots at sharp, high-Schmidt interfaces. This limiter is a
+ * deliberately local safety valve: after the scalar collision has produced its
+ * post-collision populations, the zeroth moment is inspected. If the recovered
+ * concentration is outside `[lower_bound, upper_bound]` or non-finite, the local
+ * populations are reset to the scalar equilibrium at the clamped concentration.
+ *
+ * Cells that already remain bounded are left untouched, so the limiter does not
+ * add dissipation in smooth, resolved regions. When it activates, it sacrifices
+ * the local non-equilibrium content in order to prevent negative species
+ * concentrations and runaway reaction/source coupling.
+ *
+ * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
+ * @tparam Real Floating-point precision used for scalar populations.
+ * @param scalar_pops Post-collision scalar populations to inspect and, if
+ * needed, overwrite with bounded equilibrium populations.
+ * @param fluid_velocity Advecting fluid velocity used to reconstruct the bounded
+ * scalar equilibrium.
+ * @param lower_bound Minimum admissible scalar concentration.
+ * @param upper_bound Maximum admissible scalar concentration.
+ */
+template <IsLatticeModel ScalarLattice, std::floating_point Real>
+__host__ __device__ inline void enforce_scalar_concentration_bounds(
+    std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)>& scalar_pops,
+    const Eigen::Matrix<Real, ScalarLattice::D, 1>& fluid_velocity,
+    Real lower_bound = Real{},
+    Real upper_bound = Real{1}) {
+    const Real concentration = compute_concentration<ScalarLattice, Real>(scalar_pops);
+
+    const Real bounded_concentration =
+        clamp_scalar_concentration<Real>(concentration, lower_bound, upper_bound);
+    const bool needs_limiting = bounded_concentration != concentration;
+
+    if (!needs_limiting) {
+        return;
+    }
+
+    for (int i = 0; i < ScalarLattice::Q; ++i) {
+        scalar_pops[static_cast<std::size_t>(i)] =
+            compute_scalar_equilibrium<ScalarLattice, Real>(
+                i,
+                bounded_concentration,
+                fluid_velocity);
+    }
+}
+
+/**
  * @brief Apply BGK collision and source forcing to local scalar populations.
  *
  * The scalar populations relax toward `compute_scalar_equilibrium` using
@@ -691,6 +792,7 @@ __host__ __device__ inline void collide_scalar_bgk(
         scalar_pops[index] += omega_c * (equilibrium - scalar_pops[index]) +
                               weight * source_term;
     }
+
 }
 
 /**
@@ -746,6 +848,10 @@ __host__ __device__ inline void collide_scalar_max_dissipation(
             (Real{1} - omega_s) * odd_nonequilibrium +
             weight * source_term;
     }
+
+    enforce_scalar_concentration_bounds<ScalarLattice, Real>(
+        scalar_pops,
+        fluid_velocity);
 }
 
 /**

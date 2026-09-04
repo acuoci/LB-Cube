@@ -398,14 +398,18 @@ __global__ void kernel_reaction_AB(
                 i, nx, ny, 0, x_extent, y_extent, z_extent)];
         }
 
-        const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
-        const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+        const Real concentration_a =
+            clamp_scalar_concentration<Real>(
+                compute_concentration<ScalarLattice, Real>(a_pops));
+        const Real concentration_b =
+            clamp_scalar_concentration<Real>(
+                compute_concentration<ScalarLattice, Real>(b_pops));
         const Real reaction_source =
             compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
-        collide_scalar_bgk<ScalarLattice, Real>(
+        collide_scalar_max_dissipation<ScalarLattice, Real>(
             a_pops, fluid_macro.velocity, omega_c, reaction_source);
-        collide_scalar_bgk<ScalarLattice, Real>(
+        collide_scalar_max_dissipation<ScalarLattice, Real>(
             b_pops, fluid_macro.velocity, omega_c, reaction_source);
 
         for (int i = 0; i < ScalarLattice::Q; ++i) {
@@ -438,14 +442,18 @@ __global__ void kernel_reaction_AB(
                 i, nx, ny, nz, x_extent, y_extent, z_extent)];
         }
 
-        const Real concentration_a = compute_concentration<ScalarLattice, Real>(a_pops);
-        const Real concentration_b = compute_concentration<ScalarLattice, Real>(b_pops);
+        const Real concentration_a =
+            clamp_scalar_concentration<Real>(
+                compute_concentration<ScalarLattice, Real>(a_pops));
+        const Real concentration_b =
+            clamp_scalar_concentration<Real>(
+                compute_concentration<ScalarLattice, Real>(b_pops));
         const Real reaction_source =
             compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
-        collide_scalar_bgk<ScalarLattice, Real>(
+        collide_scalar_max_dissipation<ScalarLattice, Real>(
             a_pops, fluid_macro.velocity, omega_c, reaction_source);
-        collide_scalar_bgk<ScalarLattice, Real>(
+        collide_scalar_max_dissipation<ScalarLattice, Real>(
             b_pops, fluid_macro.velocity, omega_c, reaction_source);
 
         for (int i = 0; i < ScalarLattice::Q; ++i) {
