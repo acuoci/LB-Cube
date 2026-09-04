@@ -331,7 +331,9 @@ template <lbm::IsLatticeModel Lattice>
     const auto view = fluid.get_current_view();
     long double kinetic_energy = 0.0L;
     Real u_max{};
+    int invalid_count = 0;
 
+#pragma omp parallel for collapse(3) schedule(static) reduction(+ : kinetic_energy, invalid_count) reduction(max : u_max)
     for (std::size_t z = 0; z < config.nz; ++z) {
         for (std::size_t y = 0; y < config.ny; ++y) {
             for (std::size_t x = 0; x < config.nx; ++x) {
@@ -341,9 +343,8 @@ template <lbm::IsLatticeModel Lattice>
                 const Real speed = std::sqrt(speed_squared);
 
                 if (!std::isfinite(speed) || !std::isfinite(macro.density)) {
-                    return {
-                        std::numeric_limits<Real>::infinity(),
-                        std::numeric_limits<Real>::infinity()};
+                    ++invalid_count;
+                    continue;
                 }
 
                 kinetic_energy +=
@@ -351,6 +352,12 @@ template <lbm::IsLatticeModel Lattice>
                 u_max = std::max(u_max, speed);
             }
         }
+    }
+
+    if (invalid_count > 0) {
+        return {
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity()};
     }
 
     return {
@@ -375,6 +382,7 @@ template <lbm::IsLatticeModel Lattice>
     Real min_ca = std::numeric_limits<Real>::infinity();
     Real max_ca = -std::numeric_limits<Real>::infinity();
 
+#pragma omp parallel for collapse(3) schedule(static) reduction(+ : sum_ca, sum_cb, sum_cc, sum_ca2, sum_cb2, sum_cc2, sum_rate) reduction(min : min_ca) reduction(max : max_ca)
     for (std::size_t z = 0; z < config.nz; ++z) {
         for (std::size_t y = 0; y < config.ny; ++y) {
             for (std::size_t x = 0; x < config.nx; ++x) {

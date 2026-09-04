@@ -12,12 +12,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(LB_CUBE_ENABLE_CUDA "Build the CUDA backend" ON)
+option(LB_CUBE_ENABLE_OPENMP "Enable OpenMP parallel CPU loops when available" ON)
 option(USE_KOKKOS_MDSPAN "Use Kokkos standalone mdspan instead of native C++23 std::mdspan" OFF)
 set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
+set(LB_CUBE_OPENMP_CXX_FLAGS "" CACHE STRING "Manual OpenMP CXX compile flags, e.g. -fopenmp")
+set(LB_CUBE_OPENMP_LINK_FLAGS "" CACHE STRING "Manual OpenMP linker flags, e.g. -fopenmp")
+set(LB_CUBE_OPENMP_LIBRARIES "" CACHE STRING "Manual OpenMP libraries, e.g. /path/to/libgomp.so")
+set(LB_CUBE_OPENMP_INCLUDE_DIRS "" CACHE STRING "Manual OpenMP include directories, if omp.h is not on the default include path")
 
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(GTest REQUIRED)
-find_package(OpenMP)
+
+if(LB_CUBE_ENABLE_OPENMP)
+    find_package(OpenMP QUIET)
+endif()
 
 add_library(lbm_core INTERFACE)
 add_library(lbm::core ALIAS lbm_core)
@@ -40,11 +48,22 @@ target_link_libraries(
         Eigen3::Eigen
 )
 
-if(OpenMP_CXX_FOUND)
+if(LB_CUBE_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP: found and activated for LB-Cube CPU kernels")
+    if(DEFINED OpenMP_CXX_VERSION)
+        message(STATUS "OpenMP: CXX version ${OpenMP_CXX_VERSION}")
+    endif()
+    message(STATUS "OpenMP: CXX flags '${OpenMP_CXX_FLAGS}'")
+    message(STATUS "OpenMP: CXX libraries '${OpenMP_CXX_LIBRARIES}'")
     target_link_libraries(
         lbm_core
         INTERFACE
             OpenMP::OpenMP_CXX
+    )
+    target_compile_definitions(
+        lbm_core
+        INTERFACE
+            LB_CUBE_OPENMP_ENABLED=1
     )
     if(OpenMP_CXX_FLAGS)
         separate_arguments(OpenMP_CXX_FLAGS_LIST NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
@@ -58,6 +77,62 @@ if(OpenMP_CXX_FOUND)
                 ${LB_CUBE_OPENMP_CXX_OPTIONS}
         )
     endif()
+elseif(LB_CUBE_ENABLE_OPENMP AND (LB_CUBE_OPENMP_CXX_FLAGS OR LB_CUBE_OPENMP_LINK_FLAGS OR LB_CUBE_OPENMP_LIBRARIES OR LB_CUBE_OPENMP_INCLUDE_DIRS))
+    message(WARNING "OpenMP: CMake auto-detection failed, using user-provided LB_CUBE_OPENMP_* settings")
+    message(STATUS "OpenMP: manual CXX flags '${LB_CUBE_OPENMP_CXX_FLAGS}'")
+    message(STATUS "OpenMP: manual link flags '${LB_CUBE_OPENMP_LINK_FLAGS}'")
+    message(STATUS "OpenMP: manual libraries '${LB_CUBE_OPENMP_LIBRARIES}'")
+    message(STATUS "OpenMP: manual include dirs '${LB_CUBE_OPENMP_INCLUDE_DIRS}'")
+
+    target_compile_definitions(
+        lbm_core
+        INTERFACE
+            LB_CUBE_OPENMP_ENABLED=1
+    )
+
+    if(LB_CUBE_OPENMP_INCLUDE_DIRS)
+        separate_arguments(LB_CUBE_OPENMP_INCLUDE_DIRS_LIST NATIVE_COMMAND "${LB_CUBE_OPENMP_INCLUDE_DIRS}")
+        target_include_directories(
+            lbm_core
+            INTERFACE
+                ${LB_CUBE_OPENMP_INCLUDE_DIRS_LIST}
+        )
+    endif()
+
+    if(LB_CUBE_OPENMP_CXX_FLAGS)
+        separate_arguments(LB_CUBE_OPENMP_CXX_FLAGS_LIST NATIVE_COMMAND "${LB_CUBE_OPENMP_CXX_FLAGS}")
+        set(LB_CUBE_MANUAL_OPENMP_CXX_OPTIONS)
+        foreach(openmp_cxx_flag IN LISTS LB_CUBE_OPENMP_CXX_FLAGS_LIST)
+            list(APPEND LB_CUBE_MANUAL_OPENMP_CXX_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:${openmp_cxx_flag}>")
+        endforeach()
+        target_compile_options(
+            lbm_core
+            INTERFACE
+                ${LB_CUBE_MANUAL_OPENMP_CXX_OPTIONS}
+        )
+    endif()
+
+    if(LB_CUBE_OPENMP_LINK_FLAGS)
+        separate_arguments(LB_CUBE_OPENMP_LINK_FLAGS_LIST NATIVE_COMMAND "${LB_CUBE_OPENMP_LINK_FLAGS}")
+        target_link_options(
+            lbm_core
+            INTERFACE
+                ${LB_CUBE_OPENMP_LINK_FLAGS_LIST}
+        )
+    endif()
+
+    if(LB_CUBE_OPENMP_LIBRARIES)
+        separate_arguments(LB_CUBE_OPENMP_LIBRARIES_LIST NATIVE_COMMAND "${LB_CUBE_OPENMP_LIBRARIES}")
+        target_link_libraries(
+            lbm_core
+            INTERFACE
+                ${LB_CUBE_OPENMP_LIBRARIES_LIST}
+        )
+    endif()
+elseif(LB_CUBE_ENABLE_OPENMP)
+    message(WARNING "OpenMP: not found; LB-Cube CPU kernels will build in serial mode. Provide LB_CUBE_OPENMP_CXX_FLAGS/LINK_FLAGS/LIBRARIES/INCLUDE_DIRS to force a manual OpenMP configuration.")
+else()
+    message(STATUS "OpenMP: disabled by LB_CUBE_ENABLE_OPENMP=OFF")
 endif()
 
 if(USE_KOKKOS_MDSPAN)
