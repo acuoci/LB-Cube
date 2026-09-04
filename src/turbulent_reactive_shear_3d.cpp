@@ -261,15 +261,18 @@ void initialize_fields(
 
     const Real y1 = static_cast<Real>(config.ny) / Real{4};
     const Real y2 = Real{3} * static_cast<Real>(config.ny) / Real{4};
+    const Real scalar_interface_thickness = Real{3};
 
 #pragma omp parallel for collapse(3) schedule(static)
     for (std::size_t z = 0; z < config.nz; ++z) {
         for (std::size_t y = 0; y < config.ny; ++y) {
             for (std::size_t x = 0; x < config.nx; ++x) {
                 const Real y_real = static_cast<Real>(y);
-                const bool inside_layer = y_real >= y1 && y_real <= y2;
-                const Real concentration_a = inside_layer ? Real{1} : Real{0};
-                const Real concentration_b = inside_layer ? Real{0} : Real{1};
+                const Real concentration_a =
+                    Real{0.5} *
+                    (std::tanh((y_real - y1) / scalar_interface_thickness) -
+                     std::tanh((y_real - y2) / scalar_interface_thickness));
+                const Real concentration_b = Real{1} - concentration_a;
                 const lbm::MacroState<FluidLattice, Real> macro =
                     initial_fluid_macro(config, x, y, z);
 
