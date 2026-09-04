@@ -155,6 +155,7 @@ inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
         const std::size_t y_extent = current_view.extent(1);
         const std::size_t x_extent = current_view.extent(2);
 
+        #pragma omp parallel for collapse(2) schedule(static)
         for (std::size_t y = 0; y < y_extent; ++y) {
             for (std::size_t x = 0; x < x_extent; ++x) {
                 std::array<Real, static_cast<std::size_t>(Lattice::Q)> local_pops{};
@@ -183,6 +184,7 @@ inline void step_cpu(LatticeMemory<Lattice, Real>& mem, Real omega) {
         const std::size_t y_extent = current_view.extent(2);
         const std::size_t x_extent = current_view.extent(3);
 
+        #pragma omp parallel for collapse(3) schedule(static)
         for (std::size_t z = 0; z < z_extent; ++z) {
             for (std::size_t y = 0; y < y_extent; ++y) {
                 for (std::size_t x = 0; x < x_extent; ++x) {
@@ -254,6 +256,7 @@ inline void step_scalar_cpu(
         const std::size_t y_extent = scalar_current.extent(1);
         const std::size_t x_extent = scalar_current.extent(2);
 
+        #pragma omp parallel for collapse(2) schedule(static)
         for (std::size_t y = 0; y < y_extent; ++y) {
             for (std::size_t x = 0; x < x_extent; ++x) {
                 std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
@@ -293,6 +296,7 @@ inline void step_scalar_cpu(
         const std::size_t y_extent = scalar_current.extent(2);
         const std::size_t x_extent = scalar_current.extent(3);
 
+        #pragma omp parallel for collapse(3) schedule(static)
         for (std::size_t z = 0; z < z_extent; ++z) {
             for (std::size_t y = 0; y < y_extent; ++y) {
                 for (std::size_t x = 0; x < x_extent; ++x) {
@@ -341,9 +345,9 @@ inline void step_scalar_cpu(
  *
  * The reaction model is the isothermal second-order process `A + B -> C`. The
  * local source increment is evaluated from the closed-form one-step batch
- * solution, then applied inside the scalar BGK collision without allocating
- * source-term fields. Both scalar memories are swapped after the full domain
- * update.
+ * solution, then applied inside the stabilized scalar collision without
+ * allocating source-term fields. Both scalar memories are swapped after the full
+ * domain update.
  *
  * @tparam FluidLattice Fluid lattice traits type satisfying `IsLatticeModel`.
  * @tparam ScalarLattice Scalar lattice traits type satisfying `IsLatticeModel`.
@@ -376,6 +380,7 @@ inline void step_reaction_AB(
         const std::size_t y_extent = a_current.extent(1);
         const std::size_t x_extent = a_current.extent(2);
 
+        #pragma omp parallel for collapse(2) schedule(static)
         for (std::size_t y = 0; y < y_extent; ++y) {
             for (std::size_t x = 0; x < x_extent; ++x) {
                 std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
@@ -422,6 +427,7 @@ inline void step_reaction_AB(
         const std::size_t y_extent = a_current.extent(2);
         const std::size_t x_extent = a_current.extent(3);
 
+        #pragma omp parallel for collapse(3) schedule(static)
         for (std::size_t z = 0; z < z_extent; ++z) {
             for (std::size_t y = 0; y < y_extent; ++y) {
                 for (std::size_t x = 0; x < x_extent; ++x) {

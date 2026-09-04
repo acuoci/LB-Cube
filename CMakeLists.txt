@@ -17,6 +17,7 @@ set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build fo
 
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(GTest REQUIRED)
+find_package(OpenMP)
 
 add_library(lbm_core INTERFACE)
 add_library(lbm::core ALIAS lbm_core)
@@ -38,6 +39,26 @@ target_link_libraries(
     INTERFACE
         Eigen3::Eigen
 )
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(
+        lbm_core
+        INTERFACE
+            OpenMP::OpenMP_CXX
+    )
+    if(OpenMP_CXX_FLAGS)
+        separate_arguments(OpenMP_CXX_FLAGS_LIST NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
+        set(LB_CUBE_OPENMP_CXX_OPTIONS)
+        foreach(openmp_cxx_flag IN LISTS OpenMP_CXX_FLAGS_LIST)
+            list(APPEND LB_CUBE_OPENMP_CXX_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:${openmp_cxx_flag}>")
+        endforeach()
+        target_compile_options(
+            lbm_core
+            INTERFACE
+                ${LB_CUBE_OPENMP_CXX_OPTIONS}
+        )
+    endif()
+endif()
 
 if(USE_KOKKOS_MDSPAN)
     find_package(mdspan REQUIRED)
