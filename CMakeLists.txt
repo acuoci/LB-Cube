@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(LB_CUBE_ENABLE_CUDA "Build the CUDA backend" ON)
+option(USE_KOKKOS_MDSPAN "Use Kokkos standalone mdspan instead of native C++23 std::mdspan" OFF)
 set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
 
 find_package(Eigen3 REQUIRED NO_MODULE)
@@ -37,6 +38,20 @@ target_link_libraries(
     INTERFACE
         Eigen3::Eigen
 )
+
+if(USE_KOKKOS_MDSPAN)
+    find_package(mdspan REQUIRED)
+    target_compile_definitions(
+        lbm_core
+        INTERFACE
+            USE_KOKKOS_MDSPAN
+    )
+    target_link_libraries(
+        lbm_core
+        INTERFACE
+            std::mdspan
+    )
+endif()
 
 if(LB_CUBE_ENABLE_CUDA)
     enable_language(CUDA)

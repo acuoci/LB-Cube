@@ -5,7 +5,7 @@
  *
  * This header defines the precision-templated state and memory container used by
  * the CPU backend and host-side diagnostics. Population buffers are stored as
- * flat arrays and exposed through `std::mdspan` views to keep the memory layout
+ * flat arrays and exposed through `lbm::mdspan` views to keep the memory layout
  * explicit.
  */
 
@@ -13,11 +13,11 @@
 
 #include <concepts>
 #include <cstddef>
-#include <mdspan>
 #include <type_traits>
 #include <vector>
 
 #include "lattice_traits.hpp"
+#include "mdspan_compat.hpp"
 
 namespace lbm {
 
@@ -55,7 +55,7 @@ struct MacroState {
  * The container owns exactly two flat `std::vector<Real>` buffers, `pop_0` and
  * `pop_1`, used as current and next populations in the ping-pong time-stepping
  * scheme. The public views expose the layout as `[Q, Y, X]` for 2D lattices and
- * `[Q, Z, Y, X]` for 3D lattices with `std::layout_right`; therefore `X` is the
+ * `[Q, Z, Y, X]` for 3D lattices with `lbm::layout_right`; therefore `X` is the
  * fastest-varying spatial index and each population field is spatially
  * contiguous. This SoA layout mirrors the intended CUDA coalescing strategy while
  * remaining convenient for host validation and IO.
@@ -73,28 +73,28 @@ public:
     using size_type = std::size_t;
 
     /** @brief Mutable 2D SoA view with extents `[Q, Y, X]`. */
-    using View2D = std::mdspan<
+    using View2D = lbm::mdspan<
         Real,
-        std::extents<size_type, static_cast<size_type>(Lattice::Q), std::dynamic_extent, std::dynamic_extent>,
-        std::layout_right>;
+        lbm::extents<size_type, static_cast<size_type>(Lattice::Q), lbm::dynamic_extent, lbm::dynamic_extent>,
+        lbm::layout_right>;
 
     /** @brief Read-only 2D SoA view with extents `[Q, Y, X]`. */
-    using ConstView2D = std::mdspan<
+    using ConstView2D = lbm::mdspan<
         const Real,
-        std::extents<size_type, static_cast<size_type>(Lattice::Q), std::dynamic_extent, std::dynamic_extent>,
-        std::layout_right>;
+        lbm::extents<size_type, static_cast<size_type>(Lattice::Q), lbm::dynamic_extent, lbm::dynamic_extent>,
+        lbm::layout_right>;
 
     /** @brief Mutable 3D SoA view with extents `[Q, Z, Y, X]`. */
-    using View3D = std::mdspan<
+    using View3D = lbm::mdspan<
         Real,
-        std::extents<size_type, static_cast<size_type>(Lattice::Q), std::dynamic_extent, std::dynamic_extent, std::dynamic_extent>,
-        std::layout_right>;
+        lbm::extents<size_type, static_cast<size_type>(Lattice::Q), lbm::dynamic_extent, lbm::dynamic_extent, lbm::dynamic_extent>,
+        lbm::layout_right>;
 
     /** @brief Read-only 3D SoA view with extents `[Q, Z, Y, X]`. */
-    using ConstView3D = std::mdspan<
+    using ConstView3D = lbm::mdspan<
         const Real,
-        std::extents<size_type, static_cast<size_type>(Lattice::Q), std::dynamic_extent, std::dynamic_extent, std::dynamic_extent>,
-        std::layout_right>;
+        lbm::extents<size_type, static_cast<size_type>(Lattice::Q), lbm::dynamic_extent, lbm::dynamic_extent, lbm::dynamic_extent>,
+        lbm::layout_right>;
 
     /** @brief Dimension-dependent mutable mdspan type used by kernels and IO. */
     using View = std::conditional_t<Lattice::D == 2, View2D, View3D>;

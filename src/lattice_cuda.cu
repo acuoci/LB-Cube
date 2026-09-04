@@ -53,7 +53,7 @@ __device__ inline std::size_t periodic_pull_index(
 /**
  * @brief Convert `[q, z, y, x]` coordinates into the flat SoA device index.
  *
- * The formula mirrors `std::layout_right` host views with `X` contiguous. Keeping
+ * The formula mirrors `lbm::layout_right` host views with `X` contiguous. Keeping
  * this mapping identical to `LatticeMemory` is essential for host/device
  * round-trips and CPU/GPU result comparisons.
  *
