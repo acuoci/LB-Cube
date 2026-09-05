@@ -140,6 +140,18 @@ struct FlowDiagnostics {
     Real uperp_rms{};
     Real enstrophy{};
     Real epsilon{};
+    Real theta_1{};
+    Real theta_2{};
+    Real theta_avg{};
+    Real re_theta{};
+    Real delta_omega_1{};
+    Real delta_omega_2{};
+    Real delta_omega_avg{};
+    Real mean_rho{};
+    Real min_rho{};
+    Real max_rho{};
+    Real rho_rms_fluct{};
+    Real mach_max{};
 };
 
 struct ScalarDiagnostics {
@@ -173,6 +185,13 @@ struct ScalarDiagnostics {
     Real mean_grad_z2{};
     Real mean_grad_z4{};
     Real grad_z_flatness{};
+    Real delta_z_1{};
+    Real delta_z_2{};
+    Real delta_z_avg{};
+    Real rms_reaction_rate{};
+    Real max_reaction_rate{};
+    Real reaction_effective_volume_fraction{};
+    Real corr_r_chi_z{};
 };
 
 struct ResolutionDiagnostics {
@@ -180,6 +199,9 @@ struct ResolutionDiagnostics {
     Real eta_b{};
     Real dx_over_eta_k{};
     Real dx_over_eta_b{};
+    Real tau_eta{};
+    Real tau_eta_star{};
+    Real da_eta{};
 };
 
 struct ScalarBudgetDiagnostics {
@@ -1096,11 +1118,15 @@ template <lbm::IsLatticeModel Lattice>
     long double transverse_kinetic_energy = 0.0L;
     long double sum_uy2 = 0.0L;
     long double sum_uz2 = 0.0L;
+    long double sum_rho = 0.0L;
+    long double sum_rho2 = 0.0L;
     Real u_max{};
+    Real min_rho = std::numeric_limits<Real>::infinity();
+    Real max_rho = -std::numeric_limits<Real>::infinity();
     int invalid_count = 0;
 
     // First pass: global velocity moments and x-z plane means for each y.
-#pragma omp parallel for schedule(static) reduction(+ : kinetic_energy, transverse_kinetic_energy, sum_uy2, sum_uz2, invalid_count) reduction(max : u_max)
+#pragma omp parallel for schedule(static) reduction(+ : kinetic_energy, transverse_kinetic_energy, sum_uy2, sum_uz2, sum_rho, sum_rho2, invalid_count) reduction(max : u_max, max_rho) reduction(min : min_rho)
     for (std::size_t y = 0; y < config.ny; ++y) {
         long double local_sum_ux = 0.0L;
         long double local_sum_uy = 0.0L;
@@ -1127,6 +1153,10 @@ template <lbm::IsLatticeModel Lattice>
                     static_cast<long double>(Real{0.5} * (uy * uy + uz * uz));
                 sum_uy2 += static_cast<long double>(uy * uy);
                 sum_uz2 += static_cast<long double>(uz * uz);
+                sum_rho += static_cast<long double>(macro.density);
+                sum_rho2 += static_cast<long double>(macro.density * macro.density);
+                min_rho = std::min(min_rho, macro.density);
+                max_rho = std::max(max_rho, macro.density);
                 local_sum_ux += static_cast<long double>(ux);
                 local_sum_uy += static_cast<long double>(uy);
                 local_sum_uz += static_cast<long double>(uz);
@@ -1149,6 +1179,34 @@ template <lbm::IsLatticeModel Lattice>
         plane_mean_ux[y] = static_cast<Real>(plane_sum_ux[y] * inv_plane);
         plane_mean_uy[y] = static_cast<Real>(plane_sum_uy[y] * inv_plane);
         plane_mean_uz[y] = static_cast<Real>(plane_sum_uz[y] * inv_plane);
+    }
+
+    long double theta_1 = 0.0L;
+    long double theta_2 = 0.0L;
+    Real max_abs_dubar_dy_1{};
+    Real max_abs_dubar_dy_2{};
+    const std::size_t half_y = config.ny / 2;
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        const Real normalized_velocity = plane_mean_ux[y] / config.delta_u;
+        const Real theta_integrand =
+            Real{0.25} - normalized_velocity * normalized_velocity;
+        const std::size_t yp = (y + 1) % config.ny;
+        const std::size_t ym = (y + config.ny - 1) % config.ny;
+        const Real dubar_dy =
+            Real{0.5} * (plane_mean_ux[yp] - plane_mean_ux[ym]);
+        const long double endpoint_weight =
+            (y == 0 || y == half_y) ? 0.5L : 1.0L;
+
+        if (y <= half_y) {
+            theta_1 += endpoint_weight * static_cast<long double>(theta_integrand);
+            max_abs_dubar_dy_1 =
+                std::max(max_abs_dubar_dy_1, std::abs(dubar_dy));
+        }
+        if (y == 0 || y >= half_y) {
+            theta_2 += endpoint_weight * static_cast<long double>(theta_integrand);
+            max_abs_dubar_dy_2 =
+                std::max(max_abs_dubar_dy_2, std::abs(dubar_dy));
+        }
     }
 
     long double fluctuation_kinetic_energy = 0.0L;
@@ -1225,17 +1283,42 @@ template <lbm::IsLatticeModel Lattice>
     }
 
     if (invalid_count > 0) {
-        return {
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity(),
-            std::numeric_limits<Real>::infinity()};
+        FlowDiagnostics invalid{};
+        invalid.u_max = std::numeric_limits<Real>::infinity();
+        invalid.mean_kinetic_energy = std::numeric_limits<Real>::infinity();
+        invalid.transverse_kinetic_energy = std::numeric_limits<Real>::infinity();
+        invalid.fluctuation_kinetic_energy = std::numeric_limits<Real>::infinity();
+        invalid.uy_rms = std::numeric_limits<Real>::infinity();
+        invalid.uz_rms = std::numeric_limits<Real>::infinity();
+        invalid.uperp_rms = std::numeric_limits<Real>::infinity();
+        invalid.enstrophy = std::numeric_limits<Real>::infinity();
+        invalid.epsilon = std::numeric_limits<Real>::infinity();
+        invalid.theta_1 = std::numeric_limits<Real>::infinity();
+        invalid.theta_2 = std::numeric_limits<Real>::infinity();
+        invalid.theta_avg = std::numeric_limits<Real>::infinity();
+        invalid.re_theta = std::numeric_limits<Real>::infinity();
+        invalid.delta_omega_1 = std::numeric_limits<Real>::infinity();
+        invalid.delta_omega_2 = std::numeric_limits<Real>::infinity();
+        invalid.delta_omega_avg = std::numeric_limits<Real>::infinity();
+        invalid.mean_rho = std::numeric_limits<Real>::infinity();
+        invalid.min_rho = std::numeric_limits<Real>::infinity();
+        invalid.max_rho = std::numeric_limits<Real>::infinity();
+        invalid.rho_rms_fluct = std::numeric_limits<Real>::infinity();
+        invalid.mach_max = std::numeric_limits<Real>::infinity();
+        return invalid;
     }
+
+    const Real mean_rho = static_cast<Real>(sum_rho * inv_cells);
+    const Real mean_rho2 = static_cast<Real>(sum_rho2 * inv_cells);
+    const Real theta_1_real = static_cast<Real>(theta_1);
+    const Real theta_2_real = static_cast<Real>(theta_2);
+    const Real theta_avg = Real{0.5} * (theta_1_real + theta_2_real);
+    const Real delta_omega_1 =
+        max_abs_dubar_dy_1 > Real{} ? config.delta_u / max_abs_dubar_dy_1 : Real{};
+    const Real delta_omega_2 =
+        max_abs_dubar_dy_2 > Real{} ? config.delta_u / max_abs_dubar_dy_2 : Real{};
+    const Real delta_omega_avg = Real{0.5} * (delta_omega_1 + delta_omega_2);
+    const Real cs = std::sqrt(static_cast<Real>(FluidLattice::cs2));
 
     return {
         u_max,
@@ -1246,7 +1329,19 @@ template <lbm::IsLatticeModel Lattice>
         std::sqrt(static_cast<Real>(sum_uz2 * inv_cells)),
         std::sqrt(static_cast<Real>((sum_uy2 + sum_uz2) * inv_cells)),
         static_cast<Real>(enstrophy * inv_cells),
-        static_cast<Real>(viscous_dissipation * inv_cells)};
+        static_cast<Real>(viscous_dissipation * inv_cells),
+        theta_1_real,
+        theta_2_real,
+        theta_avg,
+        config.viscosity > Real{} ? config.delta_u * theta_avg / config.viscosity : Real{},
+        delta_omega_1,
+        delta_omega_2,
+        delta_omega_avg,
+        mean_rho,
+        min_rho,
+        max_rho,
+        std::sqrt(std::max(Real{}, mean_rho2 - mean_rho * mean_rho)),
+        cs > Real{} ? u_max / cs : Real{}};
 }
 
 [[nodiscard]] ScalarDiagnostics compute_scalar_diagnostics(
@@ -1270,6 +1365,9 @@ template <lbm::IsLatticeModel Lattice>
     long double sum_chi_z2 = 0.0L;
     long double sum_grad_z2 = 0.0L;
     long double sum_grad_z4 = 0.0L;
+    long double sum_rate2 = 0.0L;
+    long double sum_rate_chi_z = 0.0L;
+    std::vector<long double> plane_sum_z(config.ny, 0.0L);
     Real min_ca = std::numeric_limits<Real>::infinity();
     Real max_ca = -std::numeric_limits<Real>::infinity();
     Real min_cb = std::numeric_limits<Real>::infinity();
@@ -1277,10 +1375,15 @@ template <lbm::IsLatticeModel Lattice>
     Real min_z = std::numeric_limits<Real>::infinity();
     Real max_z = -std::numeric_limits<Real>::infinity();
     Real max_chi_z{};
+    Real max_reaction_rate{};
 
-#pragma omp parallel for collapse(3) schedule(static) reduction(+ : sum_ca, sum_cb, sum_cc, sum_ca2, sum_cb2, sum_cc2, sum_rate, sum_cacb, sum_z, sum_z2, sum_chi_z, sum_chi_z2, sum_grad_z2, sum_grad_z4) reduction(min : min_ca, min_cb, min_z) reduction(max : max_ca, max_cb, max_z, max_chi_z)
-    for (std::size_t z = 0; z < config.nz; ++z) {
-        for (std::size_t y = 0; y < config.ny; ++y) {
+    // Parallelize by y so the x-z plane average of Z can be accumulated
+    // without atomics while the global scalar moments still use reductions.
+#pragma omp parallel for schedule(static) reduction(+ : sum_ca, sum_cb, sum_cc, sum_ca2, sum_cb2, sum_cc2, sum_rate, sum_cacb, sum_z, sum_z2, sum_chi_z, sum_chi_z2, sum_grad_z2, sum_grad_z4, sum_rate2, sum_rate_chi_z) reduction(min : min_ca, min_cb, min_z) reduction(max : max_ca, max_cb, max_z, max_chi_z, max_reaction_rate)
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        long double local_plane_sum_z = 0.0L;
+
+        for (std::size_t z = 0; z < config.nz; ++z) {
             for (std::size_t x = 0; x < config.nx; ++x) {
                 const Real concentration_a = concentration_at(a_view, x, y, z);
                 const Real concentration_b = concentration_at(b_view, x, y, z);
@@ -1320,6 +1423,9 @@ template <lbm::IsLatticeModel Lattice>
                 sum_chi_z2 += static_cast<long double>(chi_z * chi_z);
                 sum_grad_z2 += static_cast<long double>(grad_z2);
                 sum_grad_z4 += static_cast<long double>(grad_z2 * grad_z2);
+                sum_rate2 += static_cast<long double>(local_rate * local_rate);
+                sum_rate_chi_z += static_cast<long double>(local_rate * chi_z);
+                local_plane_sum_z += static_cast<long double>(mixture_fraction);
                 min_ca = std::min(min_ca, concentration_a);
                 max_ca = std::max(max_ca, concentration_a);
                 min_cb = std::min(min_cb, concentration_b);
@@ -1327,11 +1433,16 @@ template <lbm::IsLatticeModel Lattice>
                 min_z = std::min(min_z, mixture_fraction);
                 max_z = std::max(max_z, mixture_fraction);
                 max_chi_z = std::max(max_chi_z, chi_z);
+                max_reaction_rate = std::max(max_reaction_rate, local_rate);
             }
         }
+
+        plane_sum_z[y] = local_plane_sum_z;
     }
 
     const long double inv_cells = 1.0L / static_cast<long double>(cell_count(config));
+    const long double inv_plane =
+        1.0L / static_cast<long double>(config.nx * config.nz);
     const Real mean_ca = static_cast<Real>(sum_ca * inv_cells);
     const Real mean_cb = static_cast<Real>(sum_cb * inv_cells);
     const Real mean_cc = static_cast<Real>(sum_cc * inv_cells);
@@ -1349,6 +1460,9 @@ template <lbm::IsLatticeModel Lattice>
     const Real mean_chi_z = static_cast<Real>(sum_chi_z * inv_cells);
     const Real mean_chi_z2 = static_cast<Real>(sum_chi_z2 * inv_cells);
     const Real var_chi_z = std::max(Real{}, mean_chi_z2 - mean_chi_z * mean_chi_z);
+    const Real mean_rate2 = static_cast<Real>(sum_rate2 * inv_cells);
+    const Real mean_rate_chi_z = static_cast<Real>(sum_rate_chi_z * inv_cells);
+    const Real var_rate = std::max(Real{}, mean_rate2 - rate_true * rate_true);
     const Real tau_mix =
         mean_chi_z > Real{} ? var_z / mean_chi_z : std::numeric_limits<Real>::infinity();
     const Real tau_mix_star =
@@ -1367,6 +1481,32 @@ template <lbm::IsLatticeModel Lattice>
     const Real mean_grad_z4 = static_cast<Real>(sum_grad_z4 * inv_cells);
     const Real grad_z_flatness =
         mean_grad_z2 > Real{} ? mean_grad_z4 / (mean_grad_z2 * mean_grad_z2) : Real{};
+    long double delta_z_1 = 0.0L;
+    long double delta_z_2 = 0.0L;
+    const std::size_t half_y = config.ny / 2;
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        const Real zbar = static_cast<Real>(plane_sum_z[y] * inv_plane);
+        const Real integrand = Real{4} * zbar * (Real{1} - zbar);
+        const long double endpoint_weight =
+            (y == 0 || y == half_y) ? 0.5L : 1.0L;
+        if (y <= half_y) {
+            delta_z_1 += endpoint_weight * static_cast<long double>(integrand);
+        }
+        if (y == 0 || y >= half_y) {
+            delta_z_2 += endpoint_weight * static_cast<long double>(integrand);
+        }
+    }
+    const Real delta_z_1_real = static_cast<Real>(delta_z_1);
+    const Real delta_z_2_real = static_cast<Real>(delta_z_2);
+    const Real delta_z_avg = Real{0.5} * (delta_z_1_real + delta_z_2_real);
+    const Real rms_reaction_rate = std::sqrt(mean_rate2);
+    const Real reaction_effective_volume_fraction =
+        mean_rate2 > Real{} ? (rate_true * rate_true) / mean_rate2 : Real{};
+    const Real corr_r_chi_z =
+        var_rate > Real{} && var_chi_z > Real{}
+            ? (mean_rate_chi_z - rate_true * mean_chi_z) /
+                  std::sqrt(var_rate * var_chi_z)
+            : Real{};
 
     return {
         mean_ca,
@@ -1398,7 +1538,14 @@ template <lbm::IsLatticeModel Lattice>
         rho_ab,
         mean_grad_z2,
         mean_grad_z4,
-        grad_z_flatness};
+        grad_z_flatness,
+        delta_z_1_real,
+        delta_z_2_real,
+        delta_z_avg,
+        rms_reaction_rate,
+        max_reaction_rate,
+        reaction_effective_volume_fraction,
+        corr_r_chi_z};
 }
 
 void write_big_endian_double(std::ostream& stream, double value) {
@@ -1503,18 +1650,25 @@ void write_binary_vtk(
             std::numeric_limits<Real>::infinity(),
             std::numeric_limits<Real>::infinity(),
             Real{},
-            Real{}};
+            Real{},
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            config.k_react > Real{} ? std::numeric_limits<Real>::infinity() : Real{}};
     }
 
     const Real eta_k =
         std::pow(config.viscosity * config.viscosity * config.viscosity / flow.epsilon,
                  Real{0.25});
     const Real eta_b = eta_k / std::sqrt(config.sc);
+    const Real tau_eta = std::sqrt(config.viscosity / flow.epsilon);
     return {
         eta_k,
         eta_b,
         Real{1} / eta_k,
-        Real{1} / eta_b};
+        Real{1} / eta_b,
+        tau_eta,
+        tau_eta * config.delta_u / config.delta0,
+        config.k_react > Real{} ? config.k_react * config.c0 * tau_eta : Real{}};
 }
 
 [[nodiscard]] ScalarBudgetDiagnostics compute_scalar_budget_diagnostics(
@@ -1557,62 +1711,95 @@ void append_statistics(
     const FlowDiagnostics& flow,
     Real kinetic_energy_decay_rate,
     const ScalarDiagnostics& scalar,
-    const ScalarBudgetDiagnostics& scalar_budget) {
+    const ScalarBudgetDiagnostics& scalar_budget,
+    Real initial_mean_z,
+    Real initial_mean_rho) {
     const ResolutionDiagnostics resolution = compute_resolution_diagnostics(config, flow);
-    statistics << std::format(
-        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
-        step,
-        static_cast<double>(simulation_time),
-        static_cast<double>(flow.u_max),
-        static_cast<double>(flow.mean_kinetic_energy),
-        static_cast<double>(kinetic_energy_decay_rate),
-        static_cast<double>(flow.transverse_kinetic_energy),
-        static_cast<double>(flow.fluctuation_kinetic_energy),
-        static_cast<double>(flow.uy_rms),
-        static_cast<double>(flow.uz_rms),
-        static_cast<double>(flow.uperp_rms),
-        static_cast<double>(flow.enstrophy),
-        static_cast<double>(flow.epsilon),
-        static_cast<double>(scalar.mean_ca),
-        static_cast<double>(scalar.var_ca),
-        static_cast<double>(scalar.min_ca),
-        static_cast<double>(scalar.max_ca),
-        static_cast<double>(scalar.mean_cb),
-        static_cast<double>(scalar.var_cb),
-        static_cast<double>(scalar.min_cb),
-        static_cast<double>(scalar.max_cb),
-        static_cast<double>(scalar.mean_cc),
-        static_cast<double>(scalar.var_cc),
-        static_cast<double>(scalar.rate_true),
-        static_cast<double>(scalar.rate_mixed),
-        static_cast<double>(scalar.reaction_efficiency),
-        static_cast<double>(scalar.mean_z),
-        static_cast<double>(scalar.var_z),
-        static_cast<double>(scalar_budget.variance_decay_rate),
-        static_cast<double>(scalar_budget.budget_ratio),
-        static_cast<double>(scalar.min_z),
-        static_cast<double>(scalar.max_z),
-        static_cast<double>(scalar.mean_chi_z),
-        static_cast<double>(scalar.rms_chi_z),
-        static_cast<double>(scalar.max_chi_z),
-        static_cast<double>(scalar.var_chi_z),
-        static_cast<double>(scalar.tau_mix),
-        static_cast<double>(scalar.tau_mix_star),
-        static_cast<double>(scalar_budget.numerical_dissipation_fraction),
-        static_cast<double>(scalar_budget.tau_eff),
-        static_cast<double>(scalar_budget.tau_eff_star),
-        static_cast<double>(scalar.da_mix),
-        static_cast<double>(scalar.cov_ab),
-        static_cast<double>(scalar.segregation_index),
-        static_cast<double>(scalar.rho_ab),
-        static_cast<double>(resolution.eta_k),
-        static_cast<double>(resolution.eta_b),
-        static_cast<double>(resolution.dx_over_eta_k),
-        static_cast<double>(resolution.dx_over_eta_b),
-        static_cast<double>(scalar.mean_grad_z2),
-        static_cast<double>(scalar.mean_grad_z4),
-        static_cast<double>(scalar.grad_z_flatness))
-               << std::endl;
+    const Real mean_z_drift = scalar.mean_z - initial_mean_z;
+    const Real relative_mass_drift =
+        initial_mean_rho != Real{} ? (flow.mean_rho - initial_mean_rho) / initial_mean_rho
+                                   : Real{};
+
+    const auto write_real = [&statistics](Real value) {
+        statistics << ',' << std::format("{:.17g}", static_cast<double>(value));
+    };
+
+    statistics << step;
+    write_real(simulation_time);
+    write_real(flow.u_max);
+    write_real(flow.mean_kinetic_energy);
+    write_real(kinetic_energy_decay_rate);
+    write_real(flow.transverse_kinetic_energy);
+    write_real(flow.fluctuation_kinetic_energy);
+    write_real(flow.uy_rms);
+    write_real(flow.uz_rms);
+    write_real(flow.uperp_rms);
+    write_real(flow.enstrophy);
+    write_real(flow.epsilon);
+    write_real(scalar.mean_ca);
+    write_real(scalar.var_ca);
+    write_real(scalar.min_ca);
+    write_real(scalar.max_ca);
+    write_real(scalar.mean_cb);
+    write_real(scalar.var_cb);
+    write_real(scalar.min_cb);
+    write_real(scalar.max_cb);
+    write_real(scalar.mean_cc);
+    write_real(scalar.var_cc);
+    write_real(scalar.rate_true);
+    write_real(scalar.rate_mixed);
+    write_real(scalar.reaction_efficiency);
+    write_real(scalar.mean_z);
+    write_real(scalar.var_z);
+    write_real(scalar_budget.variance_decay_rate);
+    write_real(scalar_budget.budget_ratio);
+    write_real(scalar.min_z);
+    write_real(scalar.max_z);
+    write_real(scalar.mean_chi_z);
+    write_real(scalar.rms_chi_z);
+    write_real(scalar.max_chi_z);
+    write_real(scalar.var_chi_z);
+    write_real(scalar.tau_mix);
+    write_real(scalar.tau_mix_star);
+    write_real(scalar_budget.numerical_dissipation_fraction);
+    write_real(scalar_budget.tau_eff);
+    write_real(scalar_budget.tau_eff_star);
+    write_real(scalar.da_mix);
+    write_real(scalar.cov_ab);
+    write_real(scalar.segregation_index);
+    write_real(scalar.rho_ab);
+    write_real(resolution.eta_k);
+    write_real(resolution.eta_b);
+    write_real(resolution.dx_over_eta_k);
+    write_real(resolution.dx_over_eta_b);
+    write_real(scalar.mean_grad_z2);
+    write_real(scalar.mean_grad_z4);
+    write_real(scalar.grad_z_flatness);
+    write_real(flow.theta_1);
+    write_real(flow.theta_2);
+    write_real(flow.theta_avg);
+    write_real(flow.re_theta);
+    write_real(flow.delta_omega_1);
+    write_real(flow.delta_omega_2);
+    write_real(flow.delta_omega_avg);
+    write_real(scalar.delta_z_1);
+    write_real(scalar.delta_z_2);
+    write_real(scalar.delta_z_avg);
+    write_real(scalar.rms_reaction_rate);
+    write_real(scalar.max_reaction_rate);
+    write_real(scalar.reaction_effective_volume_fraction);
+    write_real(scalar.corr_r_chi_z);
+    write_real(resolution.tau_eta);
+    write_real(resolution.tau_eta_star);
+    write_real(resolution.da_eta);
+    write_real(flow.mean_rho);
+    write_real(flow.min_rho);
+    write_real(flow.max_rho);
+    write_real(flow.rho_rms_fluct);
+    write_real(flow.mach_max);
+    write_real(mean_z_drift);
+    write_real(relative_mass_drift);
+    statistics << std::endl;
     statistics.flush();
 }
 
@@ -1642,7 +1829,15 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         << "tau_eff,tau_eff_star,Da_mix,"
         << "cov_AB,I_seg,rho_AB,"
         << "eta_K,eta_B,dx_over_etaK,dx_over_etaB,"
-        << "mean_gradZ2,mean_gradZ4,F_gradZ"
+        << "mean_gradZ2,mean_gradZ4,F_gradZ,"
+        << "theta_1,theta_2,theta_avg,Re_theta,"
+        << "delta_omega_1,delta_omega_2,delta_omega_avg,"
+        << "delta_Z_1,delta_Z_2,delta_Z_avg,"
+        << "rms_reaction_rate,max_reaction_rate,"
+        << "reaction_effective_volume_fraction,corr_R_chiZ,"
+        << "tau_eta,tau_eta_star,Da_eta,"
+        << "mean_rho,min_rho,max_rho,rho_rms_fluct,Mach_max,"
+        << "mean_Z_drift,relative_mass_drift"
         << std::endl;
     statistics.flush();
 
@@ -1663,6 +1858,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         compute_scalar_diagnostics(config, species_a, species_b);
     Real previous_var_z = scalar.var_z;
     int previous_statistics_step = 0;
+    const Real initial_mean_z = scalar.mean_z;
+    const Real initial_mean_rho = flow.mean_rho;
     std::cout << "Initial profile check: "
               << "ux(y=0)=" << config.u0 * shear_profile(config, 0)
               << ", ux(y=Ny/2)=" << config.u0 * shear_profile(config, config.ny / 2)
@@ -1681,7 +1878,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         flow,
         latest_kinetic_energy_decay_rate,
         scalar,
-        scalar_budget);
+        scalar_budget,
+        initial_mean_z,
+        initial_mean_rho);
     write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
 
     for (int step = 1; step <= config.steps; ++step) {
@@ -1716,7 +1915,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 flow,
                 latest_kinetic_energy_decay_rate,
                 scalar,
-                scalar_budget);
+                scalar_budget,
+                initial_mean_z,
+                initial_mean_rho);
             previous_var_z = scalar.var_z;
             previous_statistics_step = step;
 
@@ -1742,7 +1943,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 compute_resolution_diagnostics(config, flow);
 
             std::cout << std::format(
-                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} dE/dt: {:.6g} Burst: {} MLUPS: {:.6g}\n",
+                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} theta: {:.6g} dZ: {:.6g} ReTheta: {:.6g} Mach: {:.6g} dE/dt: {:.6g} Burst: {} MLUPS: {:.6g}\n",
                 step,
                 config.steps,
                 static_cast<double>(flow.u_max),
@@ -1756,6 +1957,10 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 static_cast<double>(scalar.tau_mix_star),
                 static_cast<double>(scalar.da_mix),
                 static_cast<double>(resolution.dx_over_eta_b),
+                static_cast<double>(flow.theta_avg),
+                static_cast<double>(scalar.delta_z_avg),
+                static_cast<double>(flow.re_theta),
+                static_cast<double>(flow.mach_max),
                 static_cast<double>(latest_kinetic_energy_decay_rate),
                 burst_active ? "ON" : "OFF",
                 mlups)
