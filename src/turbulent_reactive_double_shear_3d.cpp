@@ -37,6 +37,10 @@
 #include "lattice_physics.hpp"
 #include "lattice_traits.hpp"
 
+#ifdef LB_CUBE_HAS_FFTW
+#include <fftw3.h>
+#endif
+
 namespace {
 
 using FluidLattice = lbm::D3Q27;
@@ -82,6 +86,7 @@ struct Config {
     Real pdf_log_chi_max{2};
     Real pdf_log_r_min{-12};
     Real pdf_log_r_max{2};
+    int spectrum_freq{};
 };
 
 struct PerturbationMode {
@@ -356,6 +361,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --pdf_log_chi_max <v>    Maximum log10(chi*) bin edge (default 2)\n"
         << "  --pdf_log_R_min <v>      Minimum log10(R*) bin edge (default -12)\n"
         << "  --pdf_log_R_max <v>      Maximum log10(R*) bin edge (default 2)\n"
+        << "  --spectrum_freq <n>      2D x-z scalar-spectrum interval; 0 disables output (default 0)\n"
         << "  --help                   Show this message\n";
 }
 
@@ -439,6 +445,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
             config.pdf_log_r_min = parse_real(flag, require_value(index, argc, argv));
         } else if (flag == "--pdf_log_R_max") {
             config.pdf_log_r_max = parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--spectrum_freq") {
+            config.spectrum_freq =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -493,6 +502,13 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     if (config.pdf_log_r_max <= config.pdf_log_r_min) {
         throw std::runtime_error("--pdf_log_R_max must be greater than --pdf_log_R_min");
     }
+#ifndef LB_CUBE_HAS_FFTW
+    if (config.spectrum_freq > 0) {
+        throw std::runtime_error(
+            "--spectrum_freq requested, but this executable was built without FFTW. "
+            "Reconfigure with -DLB_CUBE_ENABLE_FFTW=ON.");
+    }
+#endif
 
     return config;
 }
@@ -980,6 +996,8 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << ", " << config.pdf_log_chi_max << "]\n"
         << "log10(R*) range: [" << config.pdf_log_r_min
         << ", " << config.pdf_log_r_max << "]\n"
+        << "Spectrum frequency: " << config.spectrum_freq
+        << (config.spectrum_freq > 0 ? "" : " (disabled)") << '\n'
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -1077,6 +1095,7 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"pdf_log_chi_max\": " << json_number(config.pdf_log_chi_max) << ",\n"
         << "  \"pdf_log_R_min\": " << json_number(config.pdf_log_r_min) << ",\n"
         << "  \"pdf_log_R_max\": " << json_number(config.pdf_log_r_max) << ",\n"
+        << "  \"spectrum_freq\": " << config.spectrum_freq << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -2333,6 +2352,210 @@ void write_pdf_outputs(
         joint_r_chi);
 }
 
+void write_scalar_spectrum_outputs(
+    const Config& config,
+    const std::filesystem::path& output_root,
+    int step,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+#ifndef LB_CUBE_HAS_FFTW
+    (void)config;
+    (void)output_root;
+    (void)step;
+    (void)species_a;
+    (void)species_b;
+    throw std::runtime_error(
+        "scalar spectrum output requested, but LB-Cube was built without FFTW");
+#else
+    const auto spectrum_start = std::chrono::high_resolution_clock::now();
+    const std::filesystem::path output_dir =
+        output_root / std::format("step_{:08}", step);
+    std::filesystem::create_directories(output_dir);
+
+    const auto a_view = species_a.get_current_view();
+    const auto b_view = species_b.get_current_view();
+    const int nx = static_cast<int>(config.nx);
+    const int nz = static_cast<int>(config.nz);
+    const std::size_t real_plane_size = config.nx * config.nz;
+    const std::size_t complex_z = config.nz / 2 + 1;
+    const std::size_t spectrum_size = config.nx * complex_z;
+
+    std::vector<double> input(real_plane_size);
+    fftw_complex* output = static_cast<fftw_complex*>(
+        fftw_malloc(sizeof(fftw_complex) * spectrum_size));
+    if (output == nullptr) {
+        throw std::runtime_error("FFTW allocation failed for scalar spectrum output");
+    }
+
+    fftw_plan plan =
+        fftw_plan_dft_r2c_2d(nx, nz, input.data(), output, FFTW_ESTIMATE);
+    if (plan == nullptr) {
+        fftw_free(output);
+        throw std::runtime_error("FFTW plan creation failed for scalar spectrum output");
+    }
+
+    std::vector<long double> weighted_spectrum(spectrum_size, 0.0L);
+    long double sum_weights = 0.0L;
+    long double weighted_scalar_variance = 0.0L;
+    const long double inv_plane =
+        1.0L / static_cast<long double>(real_plane_size);
+    const long double inv_fft_norm =
+        1.0L / static_cast<long double>(real_plane_size * real_plane_size);
+
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        long double sum_z = 0.0L;
+        for (std::size_t z = 0; z < config.nz; ++z) {
+            for (std::size_t x = 0; x < config.nx; ++x) {
+                const Real concentration_a = concentration_at(a_view, x, y, z);
+                const Real concentration_b = concentration_at(b_view, x, y, z);
+                const Real mixture_fraction =
+                    Real{0.5} *
+                    (Real{1} + (concentration_a - concentration_b) / config.c0);
+                sum_z += static_cast<long double>(mixture_fraction);
+            }
+        }
+
+        const Real zbar = static_cast<Real>(sum_z * inv_plane);
+        const Real weight = Real{4} * zbar * (Real{1} - zbar);
+        sum_weights += static_cast<long double>(weight);
+
+        long double plane_zprime2 = 0.0L;
+        for (std::size_t x = 0; x < config.nx; ++x) {
+            for (std::size_t z = 0; z < config.nz; ++z) {
+                const Real concentration_a = concentration_at(a_view, x, y, z);
+                const Real concentration_b = concentration_at(b_view, x, y, z);
+                const Real mixture_fraction =
+                    Real{0.5} *
+                    (Real{1} + (concentration_a - concentration_b) / config.c0);
+                const Real zprime = mixture_fraction - zbar;
+                input[x * config.nz + z] = static_cast<double>(zprime);
+                plane_zprime2 += static_cast<long double>(zprime * zprime);
+            }
+        }
+
+        const long double plane_variance =
+            0.5L * plane_zprime2 * inv_plane;
+        weighted_scalar_variance += static_cast<long double>(weight) * plane_variance;
+
+        fftw_execute(plan);
+
+        for (std::size_t kx = 0; kx < config.nx; ++kx) {
+            for (std::size_t kz = 0; kz < complex_z; ++kz) {
+                const std::size_t index = kx * complex_z + kz;
+                const double real = output[index][0];
+                const double imag = output[index][1];
+                const long double magnitude2 =
+                    static_cast<long double>(real * real + imag * imag);
+                const bool has_distinct_negative_kz =
+                    kz != 0 && !(config.nz % 2 == 0 && kz == config.nz / 2);
+                const long double hermitian_multiplicity =
+                    has_distinct_negative_kz ? 2.0L : 1.0L;
+                const long double energy =
+                    0.5L * hermitian_multiplicity * magnitude2 * inv_fft_norm;
+                weighted_spectrum[index] += static_cast<long double>(weight) * energy;
+            }
+        }
+    }
+
+    if (sum_weights > 0.0L) {
+        for (long double& value : weighted_spectrum) {
+            value /= sum_weights;
+        }
+        weighted_scalar_variance /= sum_weights;
+    } else {
+        weighted_scalar_variance = 0.0L;
+    }
+
+    long double spectral_scalar_variance = 0.0L;
+    for (long double value : weighted_spectrum) {
+        spectral_scalar_variance += value;
+    }
+    const Real small_value = std::numeric_limits<Real>::min();
+    const Real weighted_variance_real =
+        static_cast<Real>(weighted_scalar_variance);
+    const Real spectral_variance_real =
+        static_cast<Real>(spectral_scalar_variance);
+    const Real parseval_relative_error =
+        std::abs(spectral_variance_real - weighted_variance_real) /
+        std::max(std::abs(weighted_variance_real), small_value);
+
+    std::ofstream spectrum{output_dir / "spectrum_Z_2D.csv"};
+    if (!spectrum) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "spectrum_Z_2D.csv").string());
+    }
+    spectrum << "kx_index,kz_index,kx,kz,kh,E_Z\n";
+    for (std::size_t i = 0; i < config.nx; ++i) {
+        const int kx_index =
+            i <= config.nx / 2 ? static_cast<int>(i)
+                               : static_cast<int>(i) - static_cast<int>(config.nx);
+        const Real kx =
+            Real{2} * std::numbers::pi_v<Real> * static_cast<Real>(kx_index) /
+            static_cast<Real>(config.nx);
+        for (std::size_t kz_index = 0; kz_index < complex_z; ++kz_index) {
+            const Real kz =
+                Real{2} * std::numbers::pi_v<Real> *
+                static_cast<Real>(kz_index) / static_cast<Real>(config.nz);
+            const Real kh = std::sqrt(kx * kx + kz * kz);
+            const Real energy =
+                static_cast<Real>(weighted_spectrum[i * complex_z + kz_index]);
+            spectrum
+                << kx_index << ',' << kz_index
+                << ',' << std::format("{:.17g}", static_cast<double>(kx))
+                << ',' << std::format("{:.17g}", static_cast<double>(kz))
+                << ',' << std::format("{:.17g}", static_cast<double>(kh))
+                << ',' << std::format("{:.17g}", static_cast<double>(energy))
+                << '\n';
+        }
+    }
+    spectrum.flush();
+    spectrum.close();
+
+    const auto spectrum_stop = std::chrono::high_resolution_clock::now();
+    const std::chrono::duration<double> spectrum_elapsed =
+        spectrum_stop - spectrum_start;
+
+    std::ofstream metadata{output_dir / "spectrum_metadata.json"};
+    if (!metadata) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "spectrum_metadata.json").string());
+    }
+    metadata
+        << "{\n"
+        << "  \"step\": " << step << ",\n"
+        << "  \"time\": " << json_number(static_cast<Real>(step)) << ",\n"
+        << "  \"Nx\": " << config.nx << ",\n"
+        << "  \"Ny\": " << config.ny << ",\n"
+        << "  \"Nz\": " << config.nz << ",\n"
+        << "  \"fft_library\": \"FFTW\",\n"
+        << "  \"fft_version\": \"" << fftw_version << "\",\n"
+        << "  \"fft_transform_type\": \"2D real-to-complex x-z plane transform\",\n"
+        << "  \"fft_planning_mode\": \"FFTW_ESTIMATE\",\n"
+        << "  \"fft_normalization\": \"FFTW forward transform is unnormalized; E_plane = 0.5 * hermitian_multiplicity * |Zhat|^2 / (Nx*Nz)^2\",\n"
+        << "  \"hermitian_multiplicity\": \"2 for stored kz modes with distinct negative-kz partners; 1 for kz=0 and Nyquist kz when Nz is even\",\n"
+        << "  \"mixing_layer_weight\": \"w(y) = 4 * Zbar(y) * (1 - Zbar(y))\",\n"
+        << "  \"sum_y_w\": " << json_number(static_cast<Real>(sum_weights)) << ",\n"
+        << "  \"weighted_scalar_variance\": "
+        << json_number(weighted_variance_real) << ",\n"
+        << "  \"spectral_scalar_variance\": "
+        << json_number(spectral_variance_real) << ",\n"
+        << "  \"parseval_relative_error\": "
+        << json_number(parseval_relative_error) << ",\n"
+        << "  \"spectrum_wall_time_seconds\": "
+        << json_number(static_cast<Real>(spectrum_elapsed.count())) << "\n"
+        << "}\n";
+    metadata.flush();
+    metadata.close();
+
+    fftw_destroy_plan(plan);
+    fftw_free(output);
+#endif
+}
+
 [[nodiscard]] ResolutionDiagnostics compute_resolution_diagnostics(
     const Config& config,
     const FlowDiagnostics& flow) {
@@ -2537,6 +2760,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const std::filesystem::path vtk_dir{"vtk_double_shear_3d"};
     const std::filesystem::path profile_dir{"profiles_double_shear_3d"};
     const std::filesystem::path pdf_dir{"pdfs_double_shear_3d"};
+    const std::filesystem::path spectrum_dir{"spectra_double_shear_3d"};
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
@@ -2580,6 +2804,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     }
     if (config.pdf_freq > 0) {
         write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
+    }
+    if (config.spectrum_freq > 0) {
+        write_scalar_spectrum_outputs(config, spectrum_dir, 0, species_a, species_b);
     }
 
     for (int step = 1; step <= config.steps; ++step) {
@@ -2683,6 +2910,14 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         if (config.pdf_freq > 0 && step % config.pdf_freq == 0) {
             write_pdf_outputs(config, pdf_dir, step, species_a, species_b);
         }
+        if (config.spectrum_freq > 0 && step % config.spectrum_freq == 0) {
+            write_scalar_spectrum_outputs(
+                config,
+                spectrum_dir,
+                step,
+                species_a,
+                species_b);
+        }
 
         if (!std::isfinite(flow.u_max) || !std::isfinite(flow.mean_kinetic_energy)) {
             std::cout << "[D3Q27_RLBM] Solver produced non-finite diagnostics at step "
@@ -2705,6 +2940,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << (config.profile_freq > 0 ? profile_dir.string() : "disabled") << '\n'
               << "PDF directory: "
               << (config.pdf_freq > 0 ? pdf_dir.string() : "disabled") << '\n'
+              << "Spectrum directory: "
+              << (config.spectrum_freq > 0 ? spectrum_dir.string() : "disabled") << '\n'
               << std::flush;
 }
 

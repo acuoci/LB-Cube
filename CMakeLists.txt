@@ -450,6 +450,14 @@ target_link_libraries(
         lbm::core
 )
 
+if(LB_CUBE_ENABLE_FFTW)
+    target_link_libraries(
+        lbm_turbulent_reactive_double_shear_3d
+        PRIVATE
+            lbm::fftw
+    )
+endif()
+
 target_compile_features(
     lbm_turbulent_reactive_double_shear_3d
     PRIVATE
