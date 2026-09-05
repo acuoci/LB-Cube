@@ -75,6 +75,13 @@ struct Config {
     int vtk_burst_length{1000};
     int vtk_burst_freq{100};
     int profile_freq{};
+    int pdf_freq{};
+    int pdf_bins{128};
+    int joint_pdf_bins{128};
+    Real pdf_log_chi_min{-12};
+    Real pdf_log_chi_max{2};
+    Real pdf_log_r_min{-12};
+    Real pdf_log_r_max{2};
 };
 
 struct PerturbationMode {
@@ -230,6 +237,22 @@ struct ProfilePlaneSums {
     long double ca_cb{};
 };
 
+struct PdfCounters {
+    std::uint64_t z_underflow{};
+    std::uint64_t z_overflow{};
+    std::uint64_t chi_zero{};
+    std::uint64_t chi_underflow{};
+    std::uint64_t chi_overflow{};
+    std::uint64_t chi_included{};
+    std::uint64_t r_zero{};
+    std::uint64_t r_underflow{};
+    std::uint64_t r_overflow{};
+    std::uint64_t r_included{};
+    std::uint64_t joint_z_chi_excluded{};
+    std::uint64_t joint_r_chi_excluded{};
+    std::uint64_t joint_r_chi_included{};
+};
+
 [[nodiscard]] std::size_t cell_count(const Config& config) {
     return config.nx * config.ny * config.nz;
 }
@@ -326,6 +349,13 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --vtk_burst_length <n>   Steps covered by burst output (default 1000)\n"
         << "  --vtk_burst_freq <n>     VTK interval during burst (default 100)\n"
         << "  --profile_freq <n>       y-profile CSV interval; 0 disables output (default 0)\n"
+        << "  --pdf_freq <n>           PDF output interval; 0 disables output (default 0)\n"
+        << "  --pdf_bins <n>           Marginal PDF bin count (default 128)\n"
+        << "  --joint_pdf_bins <n>     Joint PDF bin count per dimension (default 128)\n"
+        << "  --pdf_log_chi_min <v>    Minimum log10(chi*) bin edge (default -12)\n"
+        << "  --pdf_log_chi_max <v>    Maximum log10(chi*) bin edge (default 2)\n"
+        << "  --pdf_log_R_min <v>      Minimum log10(R*) bin edge (default -12)\n"
+        << "  --pdf_log_R_max <v>      Maximum log10(R*) bin edge (default 2)\n"
         << "  --help                   Show this message\n";
 }
 
@@ -394,6 +424,21 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--profile_freq") {
             config.profile_freq =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--pdf_freq") {
+            config.pdf_freq =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--pdf_bins") {
+            config.pdf_bins = parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--joint_pdf_bins") {
+            config.joint_pdf_bins = parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--pdf_log_chi_min") {
+            config.pdf_log_chi_min = parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--pdf_log_chi_max") {
+            config.pdf_log_chi_max = parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--pdf_log_R_min") {
+            config.pdf_log_r_min = parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--pdf_log_R_max") {
+            config.pdf_log_r_max = parse_real(flag, require_value(index, argc, argv));
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -441,6 +486,12 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     }
     if (config.perturb_width <= Real{}) {
         throw std::runtime_error("--perturb_width must be positive");
+    }
+    if (config.pdf_log_chi_max <= config.pdf_log_chi_min) {
+        throw std::runtime_error("--pdf_log_chi_max must be greater than --pdf_log_chi_min");
+    }
+    if (config.pdf_log_r_max <= config.pdf_log_r_min) {
+        throw std::runtime_error("--pdf_log_R_max must be greater than --pdf_log_R_min");
     }
 
     return config;
@@ -921,6 +972,14 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << ", VTK burst frequency: " << config.vtk_burst_freq << '\n'
         << "Profile frequency: " << config.profile_freq
         << (config.profile_freq > 0 ? "" : " (disabled)") << '\n'
+        << "PDF frequency: " << config.pdf_freq
+        << (config.pdf_freq > 0 ? "" : " (disabled)") << '\n'
+        << "PDF bins: " << config.pdf_bins
+        << ", joint PDF bins: " << config.joint_pdf_bins << '\n'
+        << "log10(chi*) range: [" << config.pdf_log_chi_min
+        << ", " << config.pdf_log_chi_max << "]\n"
+        << "log10(R*) range: [" << config.pdf_log_r_min
+        << ", " << config.pdf_log_r_max << "]\n"
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -1011,6 +1070,13 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"tau_delta\": " << json_number(config.tau_delta) << ",\n"
         << "  \"tau_chem\": " << json_number(config.tau_chem) << ",\n"
         << "  \"profile_freq\": " << config.profile_freq << ",\n"
+        << "  \"pdf_freq\": " << config.pdf_freq << ",\n"
+        << "  \"pdf_bins\": " << config.pdf_bins << ",\n"
+        << "  \"joint_pdf_bins\": " << config.joint_pdf_bins << ",\n"
+        << "  \"pdf_log_chi_min\": " << json_number(config.pdf_log_chi_min) << ",\n"
+        << "  \"pdf_log_chi_max\": " << json_number(config.pdf_log_chi_max) << ",\n"
+        << "  \"pdf_log_R_min\": " << json_number(config.pdf_log_r_min) << ",\n"
+        << "  \"pdf_log_R_max\": " << json_number(config.pdf_log_r_max) << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -1815,6 +1881,458 @@ void write_y_profile_csv(
     profile.close();
 }
 
+[[nodiscard]] std::size_t clamped_unit_bin(Real value, int bins) {
+    if (!(value > Real{})) {
+        return 0;
+    }
+    if (!(value < Real{1})) {
+        return static_cast<std::size_t>(bins - 1);
+    }
+
+    return std::min(
+        static_cast<std::size_t>(value * static_cast<Real>(bins)),
+        static_cast<std::size_t>(bins - 1));
+}
+
+[[nodiscard]] bool log_bin(
+    Real value,
+    Real log_min,
+    Real log_max,
+    int bins,
+    std::size_t& bin) {
+    if (value <= Real{} || !std::isfinite(value)) {
+        return false;
+    }
+
+    const Real log_value = std::log10(value);
+    if (log_value < log_min || log_value > log_max) {
+        return false;
+    }
+
+    const Real fraction = (log_value - log_min) / (log_max - log_min);
+    bin = std::min(
+        static_cast<std::size_t>(fraction * static_cast<Real>(bins)),
+        static_cast<std::size_t>(bins - 1));
+    return true;
+}
+
+void write_histogram_csv(
+    const std::filesystem::path& filename,
+    std::string_view variable,
+    Real range_min,
+    Real range_max,
+    const std::vector<std::uint64_t>& histogram,
+    std::uint64_t total_samples) {
+    std::ofstream file{filename};
+    if (!file) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    file << "variable,bin,bin_min,bin_max,bin_center,count,probability\n";
+    const Real width =
+        (range_max - range_min) / static_cast<Real>(histogram.size());
+    for (std::size_t bin = 0; bin < histogram.size(); ++bin) {
+        const Real bin_min = range_min + static_cast<Real>(bin) * width;
+        const Real bin_max = bin_min + width;
+        const Real bin_center = Real{0.5} * (bin_min + bin_max);
+        const Real probability =
+            static_cast<Real>(histogram[bin]) / static_cast<Real>(total_samples);
+        file << variable << ',' << bin
+             << ',' << std::format("{:.17g}", static_cast<double>(bin_min))
+             << ',' << std::format("{:.17g}", static_cast<double>(bin_max))
+             << ',' << std::format("{:.17g}", static_cast<double>(bin_center))
+             << ',' << histogram[bin]
+             << ',' << std::format("{:.17g}", static_cast<double>(probability))
+             << '\n';
+    }
+}
+
+void write_joint_histogram_csv(
+    const std::filesystem::path& filename,
+    std::string_view x_name,
+    std::string_view y_name,
+    Real x_min,
+    Real x_max,
+    Real y_min,
+    Real y_max,
+    int bins,
+    const std::vector<std::uint64_t>& histogram,
+    std::uint64_t total_samples) {
+    std::ofstream file{filename};
+    if (!file) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    file << x_name << "_center," << y_name
+         << "_center,count,probability\n";
+    const Real x_width = (x_max - x_min) / static_cast<Real>(bins);
+    const Real y_width = (y_max - y_min) / static_cast<Real>(bins);
+    for (int y_bin = 0; y_bin < bins; ++y_bin) {
+        const Real y_center =
+            y_min + (static_cast<Real>(y_bin) + Real{0.5}) * y_width;
+        for (int x_bin = 0; x_bin < bins; ++x_bin) {
+            const Real x_center =
+                x_min + (static_cast<Real>(x_bin) + Real{0.5}) * x_width;
+            const std::size_t index =
+                static_cast<std::size_t>(y_bin * bins + x_bin);
+            const Real probability =
+                static_cast<Real>(histogram[index]) /
+                static_cast<Real>(total_samples);
+            file << std::format("{:.17g}", static_cast<double>(x_center))
+                 << ',' << std::format("{:.17g}", static_cast<double>(y_center))
+                 << ',' << histogram[index]
+                 << ',' << std::format("{:.17g}", static_cast<double>(probability))
+                 << '\n';
+        }
+    }
+}
+
+void write_pdf_metadata_json(
+    const Config& config,
+    const std::filesystem::path& filename,
+    int step,
+    const PdfCounters& counters,
+    const std::vector<std::uint64_t>& pdf_z,
+    const std::vector<std::uint64_t>& pdf_log_chi,
+    const std::vector<std::uint64_t>& pdf_log_r,
+    const std::vector<std::uint64_t>& joint_ab,
+    const std::vector<std::uint64_t>& joint_z_chi,
+    const std::vector<std::uint64_t>& joint_r_chi) {
+    const auto sum_histogram = [](const std::vector<std::uint64_t>& histogram) {
+        std::uint64_t sum{};
+        for (std::uint64_t count : histogram) {
+            sum += count;
+        }
+        return sum;
+    };
+    const auto fraction = [](std::uint64_t count, std::uint64_t total) {
+        return total > 0 ? static_cast<Real>(count) / static_cast<Real>(total)
+                         : Real{};
+    };
+
+    const std::uint64_t total = static_cast<std::uint64_t>(cell_count(config));
+    std::ofstream metadata{filename};
+    if (!metadata) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    metadata
+        << "{\n"
+        << "  \"step\": " << step << ",\n"
+        << "  \"time\": " << json_number(static_cast<Real>(step)) << ",\n"
+        << "  \"total_samples\": " << total << ",\n"
+        << "  \"normalization\": \"probability = count / total_domain_cells\",\n"
+        << "  \"pdf_bins\": " << config.pdf_bins << ",\n"
+        << "  \"joint_pdf_bins\": " << config.joint_pdf_bins << ",\n"
+        << "  \"Z_range\": [0, 1],\n"
+        << "  \"a_range\": [0, 1],\n"
+        << "  \"b_range\": [0, 1],\n"
+        << "  \"log10_chi_star_range\": ["
+        << json_number(config.pdf_log_chi_min) << ", "
+        << json_number(config.pdf_log_chi_max) << "],\n"
+        << "  \"log10_R_star_range\": ["
+        << json_number(config.pdf_log_r_min) << ", "
+        << json_number(config.pdf_log_r_max) << "],\n"
+        << "  \"Z_underflow_fraction\": "
+        << json_number(fraction(counters.z_underflow, total)) << ",\n"
+        << "  \"Z_overflow_fraction\": "
+        << json_number(fraction(counters.z_overflow, total)) << ",\n"
+        << "  \"Z_included_probability\": "
+        << json_number(fraction(sum_histogram(pdf_z), total)) << ",\n"
+        << "  \"chi_zero_fraction\": "
+        << json_number(fraction(counters.chi_zero, total)) << ",\n"
+        << "  \"chi_underflow_fraction\": "
+        << json_number(fraction(counters.chi_underflow, total)) << ",\n"
+        << "  \"chi_overflow_fraction\": "
+        << json_number(fraction(counters.chi_overflow, total)) << ",\n"
+        << "  \"chi_included_probability\": "
+        << json_number(fraction(counters.chi_included, total)) << ",\n"
+        << "  \"R_zero_fraction\": "
+        << json_number(fraction(counters.r_zero, total)) << ",\n"
+        << "  \"R_underflow_fraction\": "
+        << json_number(fraction(counters.r_underflow, total)) << ",\n"
+        << "  \"R_overflow_fraction\": "
+        << json_number(fraction(counters.r_overflow, total)) << ",\n"
+        << "  \"R_included_probability\": "
+        << json_number(fraction(counters.r_included, total)) << ",\n"
+        << "  \"joint_Ca_Cb_included_probability\": "
+        << json_number(fraction(sum_histogram(joint_ab), total)) << ",\n"
+        << "  \"joint_Z_log_chi_included_probability\": "
+        << json_number(fraction(sum_histogram(joint_z_chi), total)) << ",\n"
+        << "  \"joint_Z_log_chi_excluded_fraction\": "
+        << json_number(fraction(counters.joint_z_chi_excluded, total)) << ",\n"
+        << "  \"joint_log_R_log_chi_included_probability\": "
+        << json_number(fraction(counters.joint_r_chi_included, total)) << ",\n"
+        << "  \"joint_log_R_log_chi_excluded_fraction\": "
+        << json_number(fraction(counters.joint_r_chi_excluded, total)) << ",\n"
+        << "  \"dimensionless_variables\": {\n"
+        << "    \"Z\": \"0.5 * (1 + (C_A - C_B) / C0)\",\n"
+        << "    \"a\": \"C_A / C0\",\n"
+        << "    \"b\": \"C_B / C0\",\n"
+        << "    \"chi_star\": \"chi_Z * delta0 / DeltaU\",\n"
+        << "    \"R_star\": \"k_react * C_A * C_B * delta0 / (C0 * DeltaU)\"\n"
+        << "  },\n"
+        << "  \"histogram_counts\": {\n"
+        << "    \"pdf_Z\": " << sum_histogram(pdf_z) << ",\n"
+        << "    \"pdf_log_chi\": " << sum_histogram(pdf_log_chi) << ",\n"
+        << "    \"pdf_log_R\": " << sum_histogram(pdf_log_r) << ",\n"
+        << "    \"joint_pdf_Ca_Cb\": " << sum_histogram(joint_ab) << ",\n"
+        << "    \"joint_pdf_Z_log_chi\": " << sum_histogram(joint_z_chi) << ",\n"
+        << "    \"joint_pdf_log_R_log_chi\": " << sum_histogram(joint_r_chi) << "\n"
+        << "  }\n"
+        << "}\n";
+}
+
+void write_pdf_outputs(
+    const Config& config,
+    const std::filesystem::path& output_root,
+    int step,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    const std::filesystem::path output_dir =
+        output_root / std::format("step_{:08}", step);
+    std::filesystem::create_directories(output_dir);
+
+    const auto a_view = species_a.get_current_view();
+    const auto b_view = species_b.get_current_view();
+    const std::size_t pdf_bins = static_cast<std::size_t>(config.pdf_bins);
+    const std::size_t joint_bins = static_cast<std::size_t>(config.joint_pdf_bins);
+    std::vector<std::uint64_t> pdf_z(pdf_bins);
+    std::vector<std::uint64_t> pdf_log_chi(pdf_bins);
+    std::vector<std::uint64_t> pdf_log_r(pdf_bins);
+    std::vector<std::uint64_t> joint_ab(joint_bins * joint_bins);
+    std::vector<std::uint64_t> joint_z_chi(joint_bins * joint_bins);
+    std::vector<std::uint64_t> joint_r_chi(joint_bins * joint_bins);
+    PdfCounters counters{};
+
+#pragma omp parallel
+    {
+        std::vector<std::uint64_t> local_pdf_z(pdf_bins);
+        std::vector<std::uint64_t> local_pdf_log_chi(pdf_bins);
+        std::vector<std::uint64_t> local_pdf_log_r(pdf_bins);
+        std::vector<std::uint64_t> local_joint_ab(joint_bins * joint_bins);
+        std::vector<std::uint64_t> local_joint_z_chi(joint_bins * joint_bins);
+        std::vector<std::uint64_t> local_joint_r_chi(joint_bins * joint_bins);
+        PdfCounters local{};
+
+#pragma omp for collapse(3) schedule(static) nowait
+        for (std::size_t z = 0; z < config.nz; ++z) {
+            for (std::size_t y = 0; y < config.ny; ++y) {
+                for (std::size_t x = 0; x < config.nx; ++x) {
+                    const Real concentration_a = concentration_at(a_view, x, y, z);
+                    const Real concentration_b = concentration_at(b_view, x, y, z);
+                    const Real a = concentration_a / config.c0;
+                    const Real b = concentration_b / config.c0;
+                    const Real mixture_fraction =
+                        Real{0.5} * (Real{1} + a - b);
+                    const Real reaction_rate =
+                        config.k_react * concentration_a * concentration_b;
+                    const Real reaction_rate_star =
+                        reaction_rate * config.delta0 / (config.c0 * config.delta_u);
+
+                    const std::size_t xp = (x + 1) % config.nx;
+                    const std::size_t xm = (x + config.nx - 1) % config.nx;
+                    const std::size_t yp = (y + 1) % config.ny;
+                    const std::size_t ym = (y + config.ny - 1) % config.ny;
+                    const std::size_t zp = (z + 1) % config.nz;
+                    const std::size_t zm = (z + config.nz - 1) % config.nz;
+                    const auto z_at = [&](std::size_t xi, std::size_t yi, std::size_t zi) {
+                        const Real ca = concentration_at(a_view, xi, yi, zi);
+                        const Real cb = concentration_at(b_view, xi, yi, zi);
+                        return Real{0.5} * (Real{1} + (ca - cb) / config.c0);
+                    };
+                    const Real dz_dx = Real{0.5} * (z_at(xp, y, z) - z_at(xm, y, z));
+                    const Real dz_dy = Real{0.5} * (z_at(x, yp, z) - z_at(x, ym, z));
+                    const Real dz_dz = Real{0.5} * (z_at(x, y, zp) - z_at(x, y, zm));
+                    const Real grad_z2 =
+                        dz_dx * dz_dx + dz_dy * dz_dy + dz_dz * dz_dz;
+                    const Real chi_star =
+                        Real{2} * config.scalar_diffusivity * grad_z2 *
+                        config.delta0 / config.delta_u;
+
+                    if (mixture_fraction < Real{}) {
+                        ++local.z_underflow;
+                    } else if (mixture_fraction > Real{1}) {
+                        ++local.z_overflow;
+                    }
+                    const std::size_t z_pdf_bin =
+                        clamped_unit_bin(mixture_fraction, config.pdf_bins);
+                    ++local_pdf_z[z_pdf_bin];
+
+                    const std::size_t a_bin =
+                        clamped_unit_bin(a, config.joint_pdf_bins);
+                    const std::size_t b_bin =
+                        clamped_unit_bin(b, config.joint_pdf_bins);
+                    ++local_joint_ab[b_bin * joint_bins + a_bin];
+
+                    std::size_t chi_pdf_bin{};
+                    const bool chi_included = log_bin(
+                        chi_star,
+                        config.pdf_log_chi_min,
+                        config.pdf_log_chi_max,
+                        config.pdf_bins,
+                        chi_pdf_bin);
+                    if (chi_included) {
+                        ++local.chi_included;
+                        ++local_pdf_log_chi[chi_pdf_bin];
+                    } else if (chi_star <= Real{} || !std::isfinite(chi_star)) {
+                        ++local.chi_zero;
+                    } else if (std::log10(chi_star) < config.pdf_log_chi_min) {
+                        ++local.chi_underflow;
+                    } else {
+                        ++local.chi_overflow;
+                    }
+
+                    std::size_t r_pdf_bin{};
+                    const bool r_included = log_bin(
+                        reaction_rate_star,
+                        config.pdf_log_r_min,
+                        config.pdf_log_r_max,
+                        config.pdf_bins,
+                        r_pdf_bin);
+                    if (r_included) {
+                        ++local.r_included;
+                        ++local_pdf_log_r[r_pdf_bin];
+                    } else if (reaction_rate_star <= Real{} ||
+                               !std::isfinite(reaction_rate_star)) {
+                        ++local.r_zero;
+                    } else if (std::log10(reaction_rate_star) < config.pdf_log_r_min) {
+                        ++local.r_underflow;
+                    } else {
+                        ++local.r_overflow;
+                    }
+
+                    std::size_t chi_joint_bin{};
+                    const bool chi_joint_included = log_bin(
+                        chi_star,
+                        config.pdf_log_chi_min,
+                        config.pdf_log_chi_max,
+                        config.joint_pdf_bins,
+                        chi_joint_bin);
+                    if (chi_joint_included) {
+                        const std::size_t z_joint_bin =
+                            clamped_unit_bin(mixture_fraction, config.joint_pdf_bins);
+                        ++local_joint_z_chi[chi_joint_bin * joint_bins + z_joint_bin];
+                    } else {
+                        ++local.joint_z_chi_excluded;
+                    }
+
+                    std::size_t r_joint_bin{};
+                    const bool r_joint_included = log_bin(
+                        reaction_rate_star,
+                        config.pdf_log_r_min,
+                        config.pdf_log_r_max,
+                        config.joint_pdf_bins,
+                        r_joint_bin);
+                    if (r_joint_included && chi_joint_included) {
+                        ++local.joint_r_chi_included;
+                        ++local_joint_r_chi[chi_joint_bin * joint_bins + r_joint_bin];
+                    } else {
+                        ++local.joint_r_chi_excluded;
+                    }
+                }
+            }
+        }
+
+#pragma omp critical
+        {
+            const auto merge_histogram =
+                [](std::vector<std::uint64_t>& target,
+                   const std::vector<std::uint64_t>& source) {
+                    for (std::size_t i = 0; i < target.size(); ++i) {
+                        target[i] += source[i];
+                    }
+                };
+            merge_histogram(pdf_z, local_pdf_z);
+            merge_histogram(pdf_log_chi, local_pdf_log_chi);
+            merge_histogram(pdf_log_r, local_pdf_log_r);
+            merge_histogram(joint_ab, local_joint_ab);
+            merge_histogram(joint_z_chi, local_joint_z_chi);
+            merge_histogram(joint_r_chi, local_joint_r_chi);
+            counters.z_underflow += local.z_underflow;
+            counters.z_overflow += local.z_overflow;
+            counters.chi_zero += local.chi_zero;
+            counters.chi_underflow += local.chi_underflow;
+            counters.chi_overflow += local.chi_overflow;
+            counters.chi_included += local.chi_included;
+            counters.r_zero += local.r_zero;
+            counters.r_underflow += local.r_underflow;
+            counters.r_overflow += local.r_overflow;
+            counters.r_included += local.r_included;
+            counters.joint_z_chi_excluded += local.joint_z_chi_excluded;
+            counters.joint_r_chi_excluded += local.joint_r_chi_excluded;
+            counters.joint_r_chi_included += local.joint_r_chi_included;
+        }
+    }
+
+    const std::uint64_t total_samples = static_cast<std::uint64_t>(cell_count(config));
+    write_histogram_csv(
+        output_dir / "pdf_Z.csv",
+        "Z",
+        Real{},
+        Real{1},
+        pdf_z,
+        total_samples);
+    write_histogram_csv(
+        output_dir / "pdf_log_chi.csv",
+        "log10_chi_star",
+        config.pdf_log_chi_min,
+        config.pdf_log_chi_max,
+        pdf_log_chi,
+        total_samples);
+    write_histogram_csv(
+        output_dir / "pdf_log_R.csv",
+        "log10_R_star",
+        config.pdf_log_r_min,
+        config.pdf_log_r_max,
+        pdf_log_r,
+        total_samples);
+    write_joint_histogram_csv(
+        output_dir / "joint_pdf_Ca_Cb.csv",
+        "a",
+        "b",
+        Real{},
+        Real{1},
+        Real{},
+        Real{1},
+        config.joint_pdf_bins,
+        joint_ab,
+        total_samples);
+    write_joint_histogram_csv(
+        output_dir / "joint_pdf_Z_log_chi.csv",
+        "Z",
+        "log10_chi_star",
+        Real{},
+        Real{1},
+        config.pdf_log_chi_min,
+        config.pdf_log_chi_max,
+        config.joint_pdf_bins,
+        joint_z_chi,
+        total_samples);
+    write_joint_histogram_csv(
+        output_dir / "joint_pdf_log_R_log_chi.csv",
+        "log10_R_star",
+        "log10_chi_star",
+        config.pdf_log_r_min,
+        config.pdf_log_r_max,
+        config.pdf_log_chi_min,
+        config.pdf_log_chi_max,
+        config.joint_pdf_bins,
+        joint_r_chi,
+        total_samples);
+    write_pdf_metadata_json(
+        config,
+        output_dir / "pdf_metadata.json",
+        step,
+        counters,
+        pdf_z,
+        pdf_log_chi,
+        pdf_log_r,
+        joint_ab,
+        joint_z_chi,
+        joint_r_chi);
+}
+
 [[nodiscard]] ResolutionDiagnostics compute_resolution_diagnostics(
     const Config& config,
     const FlowDiagnostics& flow) {
@@ -2018,6 +2536,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const Real omega_s = Real{1} / config.tau_s;
     const std::filesystem::path vtk_dir{"vtk_double_shear_3d"};
     const std::filesystem::path profile_dir{"profiles_double_shear_3d"};
+    const std::filesystem::path pdf_dir{"pdfs_double_shear_3d"};
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
@@ -2058,6 +2577,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
     if (config.profile_freq > 0) {
         write_y_profile_csv(config, profile_dir, 0, fluid, species_a, species_b);
+    }
+    if (config.pdf_freq > 0) {
+        write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
     }
 
     for (int step = 1; step <= config.steps; ++step) {
@@ -2158,6 +2680,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         if (config.profile_freq > 0 && step % config.profile_freq == 0) {
             write_y_profile_csv(config, profile_dir, step, fluid, species_a, species_b);
         }
+        if (config.pdf_freq > 0 && step % config.pdf_freq == 0) {
+            write_pdf_outputs(config, pdf_dir, step, species_a, species_b);
+        }
 
         if (!std::isfinite(flow.u_max) || !std::isfinite(flow.mean_kinetic_energy)) {
             std::cout << "[D3Q27_RLBM] Solver produced non-finite diagnostics at step "
@@ -2178,6 +2703,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << "\nVTK directory: " << vtk_dir.string() << '\n'
               << "Profile directory: "
               << (config.profile_freq > 0 ? profile_dir.string() : "disabled") << '\n'
+              << "PDF directory: "
+              << (config.pdf_freq > 0 ? pdf_dir.string() : "disabled") << '\n'
               << std::flush;
 }
 
