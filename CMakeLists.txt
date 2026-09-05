@@ -331,6 +331,28 @@ set_target_properties(
         CXX_EXTENSIONS NO
 )
 
+add_executable(lbm_turbulent_reactive_double_shear_3d src/turbulent_reactive_double_shear_3d.cpp)
+
+target_link_libraries(
+    lbm_turbulent_reactive_double_shear_3d
+    PRIVATE
+        lbm::core
+)
+
+target_compile_features(
+    lbm_turbulent_reactive_double_shear_3d
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_turbulent_reactive_double_shear_3d
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
 enable_testing()
 
 add_executable(lbm_validation_tests tests/test_validation.cpp)

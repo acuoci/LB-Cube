@@ -814,13 +814,17 @@ __host__ __device__ inline void collide_scalar_bgk(
  * @param fluid_velocity Advecting fluid velocity at the destination cell.
  * @param omega_s Scalar relaxation frequency for the odd non-equilibrium part.
  * @param source_term Local scalar source added over one time step.
+ * @param lower_bound Minimum admissible post-collision concentration.
+ * @param upper_bound Maximum admissible post-collision concentration.
  */
 template <IsLatticeModel ScalarLattice, std::floating_point Real>
 __host__ __device__ inline void collide_scalar_max_dissipation(
     std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)>& scalar_pops,
     const Eigen::Matrix<Real, ScalarLattice::D, 1>& fluid_velocity,
     Real omega_s,
-    Real source_term) {
+    Real source_term,
+    Real lower_bound = Real{},
+    Real upper_bound = Real{1}) {
     const Real concentration = compute_concentration<ScalarLattice, Real>(scalar_pops);
     std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> equilibrium{};
     std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> nonequilibrium{};
@@ -851,7 +855,9 @@ __host__ __device__ inline void collide_scalar_max_dissipation(
 
     enforce_scalar_concentration_bounds<ScalarLattice, Real>(
         scalar_pops,
-        fluid_velocity);
+        fluid_velocity,
+        lower_bound,
+        upper_bound);
 }
 
 /**

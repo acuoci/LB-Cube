@@ -357,6 +357,8 @@ inline void step_scalar_cpu(
  * @param species_b_mem Scalar population storage for reactant B.
  * @param omega_c Scalar relaxation frequency for both reactants.
  * @param k_react Second-order reaction-rate constant.
+ * @param concentration_upper_bound Maximum admissible concentration used by
+ * reaction-rate clamping and post-collision scalar boundedness limiting.
  */
 template <
     IsLatticeModel FluidLattice,
@@ -367,7 +369,8 @@ inline void step_reaction_AB(
     LatticeMemory<ScalarLattice, Real>& species_a_mem,
     LatticeMemory<ScalarLattice, Real>& species_b_mem,
     Real omega_c,
-    Real k_react) {
+    Real k_react,
+    Real concentration_upper_bound = Real{1}) {
     static_assert(FluidLattice::D == ScalarLattice::D);
 
     auto fluid_current = fluid_mem.get_current_view();
@@ -410,16 +413,32 @@ inline void step_reaction_AB(
                 const Real concentration_b_raw =
                     compute_concentration<ScalarLattice, Real>(b_pops);
                 const Real concentration_a =
-                    clamp_scalar_concentration<Real>(concentration_a_raw);
+                    clamp_scalar_concentration<Real>(
+                        concentration_a_raw,
+                        Real{},
+                        concentration_upper_bound);
                 const Real concentration_b =
-                    clamp_scalar_concentration<Real>(concentration_b_raw);
+                    clamp_scalar_concentration<Real>(
+                        concentration_b_raw,
+                        Real{},
+                        concentration_upper_bound);
                 const Real reaction_source =
                     compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
                 collide_scalar_max_dissipation<ScalarLattice, Real>(
-                    a_pops, fluid_macro.velocity, omega_c, reaction_source);
+                    a_pops,
+                    fluid_macro.velocity,
+                    omega_c,
+                    reaction_source,
+                    Real{},
+                    concentration_upper_bound);
                 collide_scalar_max_dissipation<ScalarLattice, Real>(
-                    b_pops, fluid_macro.velocity, omega_c, reaction_source);
+                    b_pops,
+                    fluid_macro.velocity,
+                    omega_c,
+                    reaction_source,
+                    Real{},
+                    concentration_upper_bound);
 
                 for (int i = 0; i < ScalarLattice::Q; ++i) {
                     const auto q = static_cast<std::size_t>(i);
@@ -466,16 +485,32 @@ inline void step_reaction_AB(
                     const Real concentration_b_raw =
                         compute_concentration<ScalarLattice, Real>(b_pops);
                     const Real concentration_a =
-                        clamp_scalar_concentration<Real>(concentration_a_raw);
+                        clamp_scalar_concentration<Real>(
+                            concentration_a_raw,
+                            Real{},
+                            concentration_upper_bound);
                     const Real concentration_b =
-                        clamp_scalar_concentration<Real>(concentration_b_raw);
+                        clamp_scalar_concentration<Real>(
+                            concentration_b_raw,
+                            Real{},
+                            concentration_upper_bound);
                     const Real reaction_source =
                         compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
                     collide_scalar_max_dissipation<ScalarLattice, Real>(
-                        a_pops, fluid_macro.velocity, omega_c, reaction_source);
+                        a_pops,
+                        fluid_macro.velocity,
+                        omega_c,
+                        reaction_source,
+                        Real{},
+                        concentration_upper_bound);
                     collide_scalar_max_dissipation<ScalarLattice, Real>(
-                        b_pops, fluid_macro.velocity, omega_c, reaction_source);
+                        b_pops,
+                        fluid_macro.velocity,
+                        omega_c,
+                        reaction_source,
+                        Real{},
+                        concentration_upper_bound);
 
                     for (int i = 0; i < ScalarLattice::Q; ++i) {
                         const auto q = static_cast<std::size_t>(i);
