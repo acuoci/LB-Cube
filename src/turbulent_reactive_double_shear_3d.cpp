@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 
+#include "double_shear_parameters.hpp"
 #include "lattice_core.hpp"
 #include "lattice_io.hpp"
 #include "lattice_memory.hpp"
@@ -41,6 +42,7 @@ using ScalarLattice = lbm::D3Q7;
 using Real = double;
 
 struct Config {
+    lbm::double_shear::ParameterizationMode mode{lbm::double_shear::ParameterizationMode::DirectLbm};
     std::size_t nx{128};
     std::size_t ny{128};
     std::size_t nz{128};
@@ -50,6 +52,15 @@ struct Config {
     Real c0{1.0};
     Real delta_ratio{0.0625};
     Real k_react{0.1};
+    Real re_delta{};
+    Real sc{};
+    Real da_delta{};
+    Real delta0{};
+    Real delta_u{};
+    Real viscosity{};
+    Real scalar_diffusivity{};
+    Real tau_delta{};
+    Real tau_chem{std::numeric_limits<Real>::infinity()};
     int steps{10000};
     int stat_freq{10};
     int screen_freq{100};
@@ -122,11 +133,25 @@ struct ScalarDiagnostics {
 void print_usage(std::ostream& stream, std::string_view executable) {
     stream
         << "Usage: " << executable << " [options]\n"
+        << "\n"
+        << "Parameterization modes are mutually exclusive:\n"
+        << "  Direct LBM mode: --tau_f, --tau_s, --k_react\n"
+        << "  Physical mode:   --Re_delta, --Sc, --Da_delta\n"
+        << "\n"
+        << "Definitions:\n"
+        << "  delta0   = delta_ratio * Ny\n"
+        << "  Re_delta = (2 U0) delta0 / nu\n"
+        << "  Sc       = nu / D\n"
+        << "  Da_delta = k_react C0 delta0 / (2 U0)\n"
+        << "\n"
         << "  --Nx <n>                 Grid nodes in x (default 128)\n"
         << "  --Ny <n>                 Grid nodes in y (default 128)\n"
         << "  --Nz <n>                 Grid nodes in z (default 128)\n"
         << "  --tau_f <value>          Fluid relaxation time (default 0.505)\n"
         << "  --tau_s <value>          Scalar relaxation time (default 0.5005)\n"
+        << "  --Re_delta <value>       Shear-layer Reynolds number for physical mode\n"
+        << "  --Sc <value>             Schmidt number for physical mode\n"
+        << "  --Da_delta <value>       Shear-layer Damkohler number for physical mode\n"
         << "  --U0 <value>             Shear velocity amplitude (default 0.05)\n"
         << "  --C0 <value>             Reference reactant concentration (default 1.0)\n"
         << "  --delta_ratio <value>    Initial shear thickness / Ny (default 0.0625)\n"
@@ -142,6 +167,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
 
 [[nodiscard]] Config parse_arguments(int argc, char** argv) {
     Config config{};
+    lbm::double_shear::ExplicitParameterFlags explicit_parameters{};
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view flag{argv[index]};
@@ -157,8 +183,10 @@ void print_usage(std::ostream& stream, std::string_view executable) {
             config.nz = parse_size(flag, require_value(index, argc, argv));
         } else if (flag == "--tau_f") {
             config.tau_f = parse_real(flag, require_value(index, argc, argv));
+            explicit_parameters.tau_f = true;
         } else if (flag == "--tau_s") {
             config.tau_s = parse_real(flag, require_value(index, argc, argv));
+            explicit_parameters.tau_s = true;
         } else if (flag == "--U0") {
             config.u0 = parse_real(flag, require_value(index, argc, argv));
         } else if (flag == "--C0") {
@@ -167,6 +195,16 @@ void print_usage(std::ostream& stream, std::string_view executable) {
             config.delta_ratio = parse_real(flag, require_value(index, argc, argv));
         } else if (flag == "--k_react") {
             config.k_react = parse_real(flag, require_value(index, argc, argv));
+            explicit_parameters.k_react = true;
+        } else if (flag == "--Re_delta") {
+            config.re_delta = parse_real(flag, require_value(index, argc, argv));
+            explicit_parameters.re_delta = true;
+        } else if (flag == "--Sc") {
+            config.sc = parse_real(flag, require_value(index, argc, argv));
+            explicit_parameters.sc = true;
+        } else if (flag == "--Da_delta") {
+            config.da_delta = parse_real(flag, require_value(index, argc, argv));
+            explicit_parameters.da_delta = true;
         } else if (flag == "--steps") {
             config.steps = parse_int(flag, require_value(index, argc, argv));
         } else if (flag == "--stat_freq") {
@@ -184,30 +222,38 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         }
     }
 
-    if (config.tau_f <= Real{0.5}) {
-        throw std::runtime_error("--tau_f must be greater than 0.5");
-    }
-    if (config.tau_s <= Real{0.5}) {
-        throw std::runtime_error("--tau_s must be greater than 0.5");
-    }
-    if (config.u0 <= Real{}) {
-        throw std::runtime_error("--U0 must be positive");
-    }
-    if (config.c0 <= Real{}) {
-        throw std::runtime_error("--C0 must be positive");
-    }
-    if (config.k_react < Real{}) {
-        throw std::runtime_error("--k_react must be non-negative");
-    }
-    if (config.delta_ratio <= Real{} || config.delta_ratio >= Real{0.25}) {
-        throw std::runtime_error("--delta_ratio must satisfy 0 < delta_ratio < 0.25");
-    }
+    const lbm::double_shear::ParameterInputs<Real> input{
+        .nx = config.nx,
+        .ny = config.ny,
+        .nz = config.nz,
+        .tau_f = config.tau_f,
+        .tau_s = config.tau_s,
+        .k_react = config.k_react,
+        .u0 = config.u0,
+        .c0 = config.c0,
+        .delta_ratio = config.delta_ratio,
+        .re_delta = config.re_delta,
+        .sc = config.sc,
+        .da_delta = config.da_delta
+    };
+    const lbm::double_shear::ResolvedParameters<Real> resolved =
+        lbm::double_shear::resolve_parameters<Real>(input, explicit_parameters);
+
+    config.mode = resolved.mode;
+    config.tau_f = resolved.tau_f;
+    config.tau_s = resolved.tau_s;
+    config.k_react = resolved.k_react;
+    config.re_delta = resolved.re_delta;
+    config.sc = resolved.sc;
+    config.da_delta = resolved.da_delta;
+    config.delta0 = resolved.delta0;
+    config.delta_u = resolved.delta_u;
+    config.viscosity = resolved.nu;
+    config.scalar_diffusivity = resolved.scalar_diffusivity;
+    config.tau_delta = resolved.tau_delta;
+    config.tau_chem = resolved.tau_chem;
 
     return config;
-}
-
-[[nodiscard]] Real delta0(const Config& config) {
-    return config.delta_ratio * static_cast<Real>(config.ny);
 }
 
 [[nodiscard]] Real y1(const Config& config) {
@@ -220,7 +266,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
 
 [[nodiscard]] Real shear_profile(const Config& config, std::size_t y) {
     const Real y_real = static_cast<Real>(y);
-    const Real thickness = delta0(config);
+    const Real thickness = config.delta0;
     return std::tanh((y_real - y1(config)) / thickness) -
            std::tanh((y_real - y2(config)) / thickness) -
            Real{1};
@@ -231,25 +277,12 @@ void print_usage(std::ostream& stream, std::string_view executable) {
 }
 
 void print_recap(const Config& config) {
-    const Real viscosity = FluidLattice::cs2 * (config.tau_f - Real{0.5});
-    const Real scalar_diffusivity = ScalarLattice::cs2 * (config.tau_s - Real{0.5});
-    const Real schmidt = viscosity / scalar_diffusivity;
-    const Real thickness = delta0(config);
-    const Real delta_u = Real{2} * config.u0;
-    const Real reynolds_delta = delta_u * thickness / viscosity;
-    const Real tau_delta = thickness / delta_u;
-    const Real tau_chem =
-        config.k_react > Real{} ?
-        Real{1} / (config.k_react * config.c0) :
-        std::numeric_limits<Real>::infinity();
-    const Real damkohler_delta =
-        config.k_react > Real{} ?
-        config.k_react * config.c0 * thickness / delta_u :
-        Real{};
     const Real mach = config.u0 / std::sqrt(static_cast<Real>(FluidLattice::cs2));
 
     std::cout
         << "LB-Cube production 3D reactive double shear layer\n"
+        << "Parameterization mode: "
+        << lbm::double_shear::to_string(config.mode) << '\n'
         << "Grid: " << config.nx << " x " << config.ny << " x " << config.nz
         << " (" << cell_count(config) << " cells)\n"
         << "Domain: triply periodic\n"
@@ -257,14 +290,16 @@ void print_recap(const Config& config) {
         << "Scalars: two D3Q7 reactant fields, A + B -> C\n"
         << "tau_f: " << config.tau_f << ", omega_f: " << Real{1} / config.tau_f << '\n'
         << "tau_s: " << config.tau_s << ", omega_s: " << Real{1} / config.tau_s << '\n'
-        << "U0: " << config.u0 << ", DeltaU: " << delta_u << '\n'
+        << "U0: " << config.u0 << ", DeltaU: " << config.delta_u << '\n'
         << "C0: " << config.c0 << ", k_react: " << config.k_react << '\n'
-        << "delta_ratio: " << config.delta_ratio << ", delta0: " << thickness << '\n'
+        << "delta_ratio: " << config.delta_ratio << ", delta0: " << config.delta0 << '\n'
         << "interfaces: y1=" << y1(config) << ", y2=" << y2(config) << '\n'
-        << "nu: " << viscosity << ", D: " << scalar_diffusivity << '\n'
-        << "Sc: " << schmidt << ", Re_delta: " << reynolds_delta << '\n'
-        << "tau_delta: " << tau_delta << ", tau_chem: " << tau_chem
-        << ", Da_delta: " << damkohler_delta << '\n'
+        << "nu: " << config.viscosity << ", D: " << config.scalar_diffusivity << '\n'
+        << "Re_delta: " << config.re_delta
+        << ", Sc: " << config.sc
+        << ", Da_delta: " << config.da_delta << '\n'
+        << "tau_delta: " << config.tau_delta
+        << ", tau_chem: " << config.tau_chem << '\n'
         << "Mach(U0): " << mach << '\n'
         << "steps: " << config.steps
         << ", stat_freq: " << config.stat_freq
@@ -276,8 +311,65 @@ void print_recap(const Config& config) {
     if (mach > Real{0.1}) {
         std::cout << "Warning: Mach(U0) exceeds 0.1; compressibility artifacts may be significant.\n";
     }
+    if (config.tau_f - Real{0.5} < Real{1.0e-3}) {
+        std::cout << "Warning: tau_f is very close to 0.5; fluid viscosity is near the stability limit.\n";
+    }
+    if (config.tau_s - Real{0.5} < Real{1.0e-3}) {
+        std::cout << "Warning: tau_s is very close to 0.5; scalar diffusivity is near the stability limit.\n";
+    }
 
     std::cout << std::flush;
+}
+
+void write_metadata_json(const Config& config) {
+    std::ofstream metadata{"metadata_double_shear_3d.json"};
+    if (!metadata) {
+        throw std::runtime_error("failed to open metadata_double_shear_3d.json");
+    }
+
+    metadata << std::format(
+        "{{\n"
+        "  \"parameterization_mode\": \"{}\",\n"
+        "  \"Nx\": {},\n"
+        "  \"Ny\": {},\n"
+        "  \"Nz\": {},\n"
+        "  \"Re_delta\": {:.17g},\n"
+        "  \"Sc\": {:.17g},\n"
+        "  \"Da_delta\": {:.17g},\n"
+        "  \"tau_f\": {:.17g},\n"
+        "  \"tau_s\": {:.17g},\n"
+        "  \"k_react\": {:.17g},\n"
+        "  \"nu\": {:.17g},\n"
+        "  \"D\": {:.17g},\n"
+        "  \"U0\": {:.17g},\n"
+        "  \"C0\": {:.17g},\n"
+        "  \"delta_ratio\": {:.17g},\n"
+        "  \"delta0\": {:.17g},\n"
+        "  \"DeltaU\": {:.17g},\n"
+        "  \"tau_delta\": {:.17g},\n"
+        "  \"tau_chem\": {:.17g}\n"
+        "}}\n",
+        lbm::double_shear::to_string(config.mode),
+        config.nx,
+        config.ny,
+        config.nz,
+        static_cast<double>(config.re_delta),
+        static_cast<double>(config.sc),
+        static_cast<double>(config.da_delta),
+        static_cast<double>(config.tau_f),
+        static_cast<double>(config.tau_s),
+        static_cast<double>(config.k_react),
+        static_cast<double>(config.viscosity),
+        static_cast<double>(config.scalar_diffusivity),
+        static_cast<double>(config.u0),
+        static_cast<double>(config.c0),
+        static_cast<double>(config.delta_ratio),
+        static_cast<double>(config.delta0),
+        static_cast<double>(config.delta_u),
+        static_cast<double>(config.tau_delta),
+        static_cast<double>(config.tau_chem));
+    metadata.flush();
+    metadata.close();
 }
 
 [[nodiscard]] lbm::MacroState<FluidLattice, Real> initial_fluid_macro(
@@ -600,6 +692,8 @@ void append_statistics(
 }
 
 void run_simulation(const Config& config) {
+    write_metadata_json(config);
+
     lbm::LatticeMemory<FluidLattice, Real> fluid{config.nx, config.ny, config.nz};
     lbm::LatticeMemory<ScalarLattice, Real> species_a{config.nx, config.ny, config.nz};
     lbm::LatticeMemory<ScalarLattice, Real> species_b{config.nx, config.ny, config.nz};
@@ -736,6 +830,7 @@ void run_simulation(const Config& config) {
 
     std::cout << "Simulation complete in " << elapsed.count()
               << " s.\nStatistics: statistics_double_shear_3d.csv"
+              << "\nMetadata: metadata_double_shear_3d.json"
               << "\nVTK directory: " << vtk_dir.string() << '\n'
               << std::flush;
 }

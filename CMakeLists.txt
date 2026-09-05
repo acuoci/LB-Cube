@@ -380,3 +380,28 @@ set_target_properties(
 
 include(GoogleTest)
 gtest_discover_tests(lbm_validation_tests)
+
+add_executable(lbm_double_shear_parameter_tests tests/test_double_shear_parameters.cpp)
+
+target_link_libraries(
+    lbm_double_shear_parameter_tests
+    PRIVATE
+        lbm::core
+        GTest::gtest_main
+)
+
+target_compile_features(
+    lbm_double_shear_parameter_tests
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_double_shear_parameter_tests
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
+gtest_discover_tests(lbm_double_shear_parameter_tests)
