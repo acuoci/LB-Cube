@@ -13,6 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(LB_CUBE_ENABLE_CUDA "Build the CUDA backend" ON)
 option(LB_CUBE_ENABLE_OPENMP "Enable OpenMP parallel CPU loops when available" ON)
+option(LB_CUBE_ENABLE_FFTW "Enable optional FFTW support for future spectral modules" OFF)
 option(USE_KOKKOS_MDSPAN "Use Kokkos standalone mdspan instead of native C++23 std::mdspan" OFF)
 set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
 set(LB_CUBE_OPENMP_CXX_FLAGS "" CACHE STRING "Manual OpenMP CXX compile flags, e.g. -fopenmp")
@@ -147,6 +148,116 @@ if(USE_KOKKOS_MDSPAN)
         INTERFACE
             std::mdspan
     )
+endif()
+
+if(LB_CUBE_ENABLE_FFTW)
+    add_library(lbm_fftw INTERFACE)
+    add_library(lbm::fftw ALIAS lbm_fftw)
+
+    set(LB_CUBE_FFTW_DETECTION_METHOD "")
+    set(LB_CUBE_FFTW_INCLUDE_DIRS "")
+    set(LB_CUBE_FFTW_LIBRARY_DIR_HINTS "")
+
+    find_package(FFTW3 QUIET CONFIG)
+    if(FFTW3_FOUND)
+        set(LB_CUBE_FFTW_DETECTION_METHOD "CMake config (${FFTW3_CONFIG})")
+        set(LB_CUBE_FFTW_INCLUDE_DIRS ${FFTW3_INCLUDE_DIRS})
+        set(LB_CUBE_FFTW_LIBRARY_DIR_HINTS ${FFTW3_LIBRARY_DIRS})
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(PC_FFTW3 QUIET fftw3)
+            if(PC_FFTW3_FOUND)
+                set(LB_CUBE_FFTW_DETECTION_METHOD "pkg-config (fftw3)")
+                set(LB_CUBE_FFTW_INCLUDE_DIRS ${PC_FFTW3_INCLUDE_DIRS})
+                set(LB_CUBE_FFTW_LIBRARY_DIR_HINTS ${PC_FFTW3_LIBRARY_DIRS})
+            endif()
+        endif()
+    endif()
+
+    find_path(
+        LB_CUBE_FFTW_INCLUDE_DIR
+        NAMES fftw3.h
+        HINTS ${LB_CUBE_FFTW_INCLUDE_DIRS}
+    )
+    find_library(
+        LB_CUBE_FFTW_LIBRARY
+        NAMES fftw3
+        HINTS ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS}
+    )
+
+    if(NOT LB_CUBE_FFTW_INCLUDE_DIR OR NOT LB_CUBE_FFTW_LIBRARY)
+        find_path(LB_CUBE_FFTW_INCLUDE_DIR NAMES fftw3.h)
+        find_library(LB_CUBE_FFTW_LIBRARY NAMES fftw3)
+        if(LB_CUBE_FFTW_INCLUDE_DIR AND LB_CUBE_FFTW_LIBRARY AND NOT LB_CUBE_FFTW_DETECTION_METHOD)
+            set(LB_CUBE_FFTW_DETECTION_METHOD "find_path/find_library fallback")
+        endif()
+    endif()
+
+    if(NOT LB_CUBE_FFTW_INCLUDE_DIR OR NOT LB_CUBE_FFTW_LIBRARY)
+        message(FATAL_ERROR "LB_CUBE_ENABLE_FFTW=ON, but FFTW double-precision headers/libraries were not found")
+    endif()
+    if(NOT LB_CUBE_FFTW_DETECTION_METHOD)
+        set(LB_CUBE_FFTW_DETECTION_METHOD "find_path/find_library fallback")
+    endif()
+
+    if(NOT TARGET FFTW3::fftw3)
+        add_library(FFTW3::fftw3 UNKNOWN IMPORTED)
+        set_target_properties(
+            FFTW3::fftw3
+            PROPERTIES
+                IMPORTED_LOCATION "${LB_CUBE_FFTW_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${LB_CUBE_FFTW_INCLUDE_DIR}"
+        )
+    endif()
+
+    target_link_libraries(
+        lbm_fftw
+        INTERFACE
+            FFTW3::fftw3
+    )
+    target_compile_definitions(
+        lbm_fftw
+        INTERFACE
+            LB_CUBE_HAS_FFTW=1
+    )
+
+    get_filename_component(LB_CUBE_FFTW_LIBRARY_DIR "${LB_CUBE_FFTW_LIBRARY}" DIRECTORY)
+    find_library(LB_CUBE_FFTW_FLOAT_LIBRARY NAMES fftw3f HINTS "${LB_CUBE_FFTW_LIBRARY_DIR}" ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS})
+    find_library(LB_CUBE_FFTW_LONG_DOUBLE_LIBRARY NAMES fftw3l HINTS "${LB_CUBE_FFTW_LIBRARY_DIR}" ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS})
+    find_library(LB_CUBE_FFTW_THREADS_LIBRARY NAMES fftw3_threads HINTS "${LB_CUBE_FFTW_LIBRARY_DIR}" ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS})
+    find_library(LB_CUBE_FFTW_FLOAT_THREADS_LIBRARY NAMES fftw3f_threads HINTS "${LB_CUBE_FFTW_LIBRARY_DIR}" ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS})
+    find_library(LB_CUBE_FFTW_OMP_LIBRARY NAMES fftw3_omp HINTS "${LB_CUBE_FFTW_LIBRARY_DIR}" ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS})
+    find_library(LB_CUBE_FFTW_MPI_LIBRARY NAMES fftw3_mpi HINTS "${LB_CUBE_FFTW_LIBRARY_DIR}" ${LB_CUBE_FFTW_LIBRARY_DIR_HINTS})
+
+    message(STATUS "FFTW: enabled")
+    message(STATUS "FFTW: detection method ${LB_CUBE_FFTW_DETECTION_METHOD}")
+    message(STATUS "FFTW: include directory ${LB_CUBE_FFTW_INCLUDE_DIR}")
+    message(STATUS "FFTW: double library ${LB_CUBE_FFTW_LIBRARY}")
+    message(STATUS "FFTW: float library ${LB_CUBE_FFTW_FLOAT_LIBRARY}")
+    message(STATUS "FFTW: long double library ${LB_CUBE_FFTW_LONG_DOUBLE_LIBRARY}")
+    message(STATUS "FFTW: threads library ${LB_CUBE_FFTW_THREADS_LIBRARY}")
+    message(STATUS "FFTW: float threads library ${LB_CUBE_FFTW_FLOAT_THREADS_LIBRARY}")
+    message(STATUS "FFTW: OpenMP library ${LB_CUBE_FFTW_OMP_LIBRARY}")
+    message(STATUS "FFTW: MPI library ${LB_CUBE_FFTW_MPI_LIBRARY}")
+
+    if(LB_CUBE_FFTW_THREADS_LIBRARY)
+        add_library(lbm_fftw_threads INTERFACE)
+        add_library(lbm::fftw_threads ALIAS lbm_fftw_threads)
+        target_link_libraries(
+            lbm_fftw_threads
+            INTERFACE
+                "${LB_CUBE_FFTW_THREADS_LIBRARY}"
+                lbm::fftw
+        )
+        target_compile_definitions(
+            lbm_fftw_threads
+            INTERFACE
+                LB_CUBE_HAS_FFTW_THREADS=1
+        )
+    endif()
+else()
+    message(STATUS "FFTW: disabled by LB_CUBE_ENABLE_FFTW=OFF")
 endif()
 
 if(LB_CUBE_ENABLE_CUDA)
@@ -354,6 +465,32 @@ set_target_properties(
 )
 
 enable_testing()
+
+if(LB_CUBE_ENABLE_FFTW)
+    add_executable(lbm_fftw_test tests/test_fftw.cpp)
+
+    target_link_libraries(
+        lbm_fftw_test
+        PRIVATE
+            lbm::fftw
+    )
+
+    target_compile_features(
+        lbm_fftw_test
+        PRIVATE
+            cxx_std_23
+    )
+
+    set_target_properties(
+        lbm_fftw_test
+        PROPERTIES
+            CXX_STANDARD 23
+            CXX_STANDARD_REQUIRED YES
+            CXX_EXTENSIONS NO
+    )
+
+    add_test(NAME lbm_fftw_test COMMAND lbm_fftw_test)
+endif()
 
 add_executable(lbm_validation_tests tests/test_validation.cpp)
 
