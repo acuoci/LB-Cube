@@ -2356,12 +2356,14 @@ void write_scalar_spectrum_outputs(
     const Config& config,
     const std::filesystem::path& output_root,
     int step,
+    const ResolutionDiagnostics& resolution,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
 #ifndef LB_CUBE_HAS_FFTW
     (void)config;
     (void)output_root;
     (void)step;
+    (void)resolution;
     (void)species_a;
     (void)species_b;
     throw std::runtime_error(
@@ -2470,6 +2472,51 @@ void write_scalar_spectrum_outputs(
     for (long double value : weighted_spectrum) {
         spectral_scalar_variance += value;
     }
+
+    std::vector<long double> spectrum_kx(config.nx, 0.0L);
+    std::vector<long double> spectrum_kz(complex_z, 0.0L);
+    std::vector<long double> spectrum_kh{};
+    std::vector<std::size_t> radial_mode_count{};
+    const Real radial_dk =
+        Real{2} * std::numbers::pi_v<Real> / static_cast<Real>(config.nx);
+    for (std::size_t i = 0; i < config.nx; ++i) {
+        const int kx_index =
+            i <= config.nx / 2 ? static_cast<int>(i)
+                               : static_cast<int>(i) - static_cast<int>(config.nx);
+        const Real kx =
+            Real{2} * std::numbers::pi_v<Real> * static_cast<Real>(kx_index) /
+            static_cast<Real>(config.nx);
+        for (std::size_t kz_index = 0; kz_index < complex_z; ++kz_index) {
+            const Real kz =
+                Real{2} * std::numbers::pi_v<Real> *
+                static_cast<Real>(kz_index) / static_cast<Real>(config.nz);
+            const Real kh = std::sqrt(kx * kx + kz * kz);
+            const std::size_t index = i * complex_z + kz_index;
+            const long double energy = weighted_spectrum[index];
+            const std::size_t shell =
+                static_cast<std::size_t>(std::floor(kh / radial_dk + Real{0.5}));
+
+            spectrum_kx[i] += energy;
+            spectrum_kz[kz_index] += energy;
+            if (shell >= spectrum_kh.size()) {
+                spectrum_kh.resize(shell + 1, 0.0L);
+                radial_mode_count.resize(shell + 1, 0);
+            }
+            spectrum_kh[shell] += energy;
+            ++radial_mode_count[shell];
+        }
+    }
+
+    const auto sum_long_double = [](const auto& values) {
+        long double sum = 0.0L;
+        for (const auto value : values) {
+            sum += static_cast<long double>(value);
+        }
+        return sum;
+    };
+    const long double sum_spectrum_kx = sum_long_double(spectrum_kx);
+    const long double sum_spectrum_kz = sum_long_double(spectrum_kz);
+    const long double sum_spectrum_kh = sum_long_double(spectrum_kh);
     const Real small_value = std::numeric_limits<Real>::min();
     const Real weighted_variance_real =
         static_cast<Real>(weighted_scalar_variance);
@@ -2478,6 +2525,23 @@ void write_scalar_spectrum_outputs(
     const Real parseval_relative_error =
         std::abs(spectral_variance_real - weighted_variance_real) /
         std::max(std::abs(weighted_variance_real), small_value);
+    const auto relative_difference_from_2d_sum =
+        [spectral_scalar_variance, small_value](long double reduced_sum) {
+            return static_cast<Real>(
+                std::abs(reduced_sum - spectral_scalar_variance) /
+                std::max(std::abs(spectral_scalar_variance),
+                         static_cast<long double>(small_value)));
+        };
+    const Real kx_sum_relative_difference =
+        relative_difference_from_2d_sum(sum_spectrum_kx);
+    const Real kz_sum_relative_difference =
+        relative_difference_from_2d_sum(sum_spectrum_kz);
+    const Real kh_sum_relative_difference =
+        relative_difference_from_2d_sum(sum_spectrum_kh);
+    const auto multiply_if_finite = [](Real value, Real scale) {
+        return std::isfinite(scale) ? value * scale
+                                    : std::numeric_limits<Real>::infinity();
+    };
 
     std::ofstream spectrum{output_dir / "spectrum_Z_2D.csv"};
     if (!spectrum) {
@@ -2513,6 +2577,86 @@ void write_scalar_spectrum_outputs(
     spectrum.flush();
     spectrum.close();
 
+    std::ofstream spectrum_kx_file{output_dir / "spectrum_Z_kx.csv"};
+    if (!spectrum_kx_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "spectrum_Z_kx.csv").string());
+    }
+    spectrum_kx_file << "kx_index,kx,kx_etaK,kx_etaB,E_Z\n";
+    for (std::size_t i = 0; i < config.nx; ++i) {
+        const int kx_index =
+            i <= config.nx / 2 ? static_cast<int>(i)
+                               : static_cast<int>(i) - static_cast<int>(config.nx);
+        const Real kx =
+            Real{2} * std::numbers::pi_v<Real> * static_cast<Real>(kx_index) /
+            static_cast<Real>(config.nx);
+        spectrum_kx_file
+            << kx_index
+            << ',' << std::format("{:.17g}", static_cast<double>(kx))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kx, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kx, resolution.eta_b)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(spectrum_kx[i])))
+            << '\n';
+    }
+    spectrum_kx_file.flush();
+    spectrum_kx_file.close();
+
+    std::ofstream spectrum_kz_file{output_dir / "spectrum_Z_kz.csv"};
+    if (!spectrum_kz_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "spectrum_Z_kz.csv").string());
+    }
+    spectrum_kz_file << "kz_index,kz,kz_etaK,kz_etaB,E_Z\n";
+    for (std::size_t kz_index = 0; kz_index < complex_z; ++kz_index) {
+        const Real kz =
+            Real{2} * std::numbers::pi_v<Real> *
+            static_cast<Real>(kz_index) / static_cast<Real>(config.nz);
+        spectrum_kz_file
+            << kz_index
+            << ',' << std::format("{:.17g}", static_cast<double>(kz))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kz, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kz, resolution.eta_b)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(spectrum_kz[kz_index])))
+            << '\n';
+    }
+    spectrum_kz_file.flush();
+    spectrum_kz_file.close();
+
+    std::ofstream spectrum_kh_file{output_dir / "spectrum_Z_kh.csv"};
+    if (!spectrum_kh_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "spectrum_Z_kh.csv").string());
+    }
+    spectrum_kh_file << "shell_index,kh_center,kh_etaK,kh_etaB,mode_count,E_Z\n";
+    for (std::size_t shell = 0; shell < spectrum_kh.size(); ++shell) {
+        const Real kh_center = static_cast<Real>(shell) * radial_dk;
+        spectrum_kh_file
+            << shell
+            << ',' << std::format("{:.17g}", static_cast<double>(kh_center))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kh_center, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kh_center, resolution.eta_b)))
+            << ',' << radial_mode_count[shell]
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(spectrum_kh[shell])))
+            << '\n';
+    }
+    spectrum_kh_file.flush();
+    spectrum_kh_file.close();
+
     const auto spectrum_stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> spectrum_elapsed =
         spectrum_stop - spectrum_start;
@@ -2545,6 +2689,22 @@ void write_scalar_spectrum_outputs(
         << json_number(spectral_variance_real) << ",\n"
         << "  \"parseval_relative_error\": "
         << json_number(parseval_relative_error) << ",\n"
+        << "  \"sum_E_Z_2D\": " << json_number(spectral_variance_real) << ",\n"
+        << "  \"sum_E_Z_kx\": "
+        << json_number(static_cast<Real>(sum_spectrum_kx)) << ",\n"
+        << "  \"sum_E_Z_kz\": "
+        << json_number(static_cast<Real>(sum_spectrum_kz)) << ",\n"
+        << "  \"sum_E_Z_kh\": "
+        << json_number(static_cast<Real>(sum_spectrum_kh)) << ",\n"
+        << "  \"kx_sum_relative_difference\": "
+        << json_number(kx_sum_relative_difference) << ",\n"
+        << "  \"kz_sum_relative_difference\": "
+        << json_number(kz_sum_relative_difference) << ",\n"
+        << "  \"kh_sum_relative_difference\": "
+        << json_number(kh_sum_relative_difference) << ",\n"
+        << "  \"radial_shell_binning\": \"shell = floor(kh / (2*pi/Nx) + 0.5); intended for cubic domains with Nx=Nz\",\n"
+        << "  \"eta_K\": " << json_number(resolution.eta_k) << ",\n"
+        << "  \"eta_B\": " << json_number(resolution.eta_b) << ",\n"
         << "  \"spectrum_wall_time_seconds\": "
         << json_number(static_cast<Real>(spectrum_elapsed.count())) << "\n"
         << "}\n";
@@ -2806,7 +2966,13 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
     }
     if (config.spectrum_freq > 0) {
-        write_scalar_spectrum_outputs(config, spectrum_dir, 0, species_a, species_b);
+        write_scalar_spectrum_outputs(
+            config,
+            spectrum_dir,
+            0,
+            compute_resolution_diagnostics(config, flow),
+            species_a,
+            species_b);
     }
 
     for (int step = 1; step <= config.steps; ++step) {
@@ -2911,10 +3077,13 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
             write_pdf_outputs(config, pdf_dir, step, species_a, species_b);
         }
         if (config.spectrum_freq > 0 && step % config.spectrum_freq == 0) {
+            const FlowDiagnostics spectrum_flow =
+                step % config.stat_freq == 0 ? flow : compute_flow_diagnostics(config, fluid);
             write_scalar_spectrum_outputs(
                 config,
                 spectrum_dir,
                 step,
+                compute_resolution_diagnostics(config, spectrum_flow),
                 species_a,
                 species_b);
         }
