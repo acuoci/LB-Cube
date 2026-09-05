@@ -16,6 +16,15 @@ option(LB_CUBE_ENABLE_OPENMP "Enable OpenMP parallel CPU loops when available" O
 option(LB_CUBE_ENABLE_FFTW "Enable optional FFTW support for future spectral modules" OFF)
 option(USE_KOKKOS_MDSPAN "Use Kokkos standalone mdspan instead of native C++23 std::mdspan" OFF)
 set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
+set(LB_CUBE_FFTW_ROOT "" CACHE PATH "Manual FFTW installation prefix, e.g. /path/to/fftw")
+set(LB_CUBE_FFTW_INCLUDE_DIR "" CACHE PATH "Manual FFTW include directory containing fftw3.h")
+set(LB_CUBE_FFTW_LIBRARY "" CACHE FILEPATH "Manual FFTW double-precision library, e.g. /path/to/libfftw3.so or libfftw3.a")
+set(LB_CUBE_FFTW_FLOAT_LIBRARY "" CACHE FILEPATH "Optional manual FFTW single-precision library")
+set(LB_CUBE_FFTW_LONG_DOUBLE_LIBRARY "" CACHE FILEPATH "Optional manual FFTW long-double library")
+set(LB_CUBE_FFTW_THREADS_LIBRARY "" CACHE FILEPATH "Optional manual FFTW threads library")
+set(LB_CUBE_FFTW_FLOAT_THREADS_LIBRARY "" CACHE FILEPATH "Optional manual FFTW single-precision threads library")
+set(LB_CUBE_FFTW_OMP_LIBRARY "" CACHE FILEPATH "Optional manual FFTW OpenMP library")
+set(LB_CUBE_FFTW_MPI_LIBRARY "" CACHE FILEPATH "Optional manual FFTW MPI library")
 set(LB_CUBE_OPENMP_CXX_FLAGS "" CACHE STRING "Manual OpenMP CXX compile flags, e.g. -fopenmp")
 set(LB_CUBE_OPENMP_LINK_FLAGS "" CACHE STRING "Manual OpenMP linker flags, e.g. -fopenmp")
 set(LB_CUBE_OPENMP_LIBRARIES "" CACHE STRING "Manual OpenMP libraries, e.g. /path/to/libgomp.so")
@@ -158,19 +167,44 @@ if(LB_CUBE_ENABLE_FFTW)
     set(LB_CUBE_FFTW_INCLUDE_DIRS "")
     set(LB_CUBE_FFTW_LIBRARY_DIR_HINTS "")
 
+    if(LB_CUBE_FFTW_ROOT)
+        list(APPEND LB_CUBE_FFTW_INCLUDE_DIRS
+            "${LB_CUBE_FFTW_ROOT}/include"
+        )
+        list(APPEND LB_CUBE_FFTW_LIBRARY_DIR_HINTS
+            "${LB_CUBE_FFTW_ROOT}/lib"
+            "${LB_CUBE_FFTW_ROOT}/lib64"
+        )
+    endif()
+
+    foreach(fftw_cache_var IN ITEMS
+        LB_CUBE_FFTW_INCLUDE_DIR
+        LB_CUBE_FFTW_LIBRARY
+        LB_CUBE_FFTW_FLOAT_LIBRARY
+        LB_CUBE_FFTW_LONG_DOUBLE_LIBRARY
+        LB_CUBE_FFTW_THREADS_LIBRARY
+        LB_CUBE_FFTW_FLOAT_THREADS_LIBRARY
+        LB_CUBE_FFTW_OMP_LIBRARY
+        LB_CUBE_FFTW_MPI_LIBRARY
+    )
+        if(DEFINED CACHE{${fftw_cache_var}} AND "${${fftw_cache_var}}" STREQUAL "")
+            unset(${fftw_cache_var} CACHE)
+        endif()
+    endforeach()
+
     find_package(FFTW3 QUIET CONFIG)
     if(FFTW3_FOUND)
         set(LB_CUBE_FFTW_DETECTION_METHOD "CMake config (${FFTW3_CONFIG})")
-        set(LB_CUBE_FFTW_INCLUDE_DIRS ${FFTW3_INCLUDE_DIRS})
-        set(LB_CUBE_FFTW_LIBRARY_DIR_HINTS ${FFTW3_LIBRARY_DIRS})
+        list(APPEND LB_CUBE_FFTW_INCLUDE_DIRS ${FFTW3_INCLUDE_DIRS})
+        list(APPEND LB_CUBE_FFTW_LIBRARY_DIR_HINTS ${FFTW3_LIBRARY_DIRS})
     else()
         find_package(PkgConfig QUIET)
         if(PkgConfig_FOUND)
             pkg_check_modules(PC_FFTW3 QUIET fftw3)
             if(PC_FFTW3_FOUND)
                 set(LB_CUBE_FFTW_DETECTION_METHOD "pkg-config (fftw3)")
-                set(LB_CUBE_FFTW_INCLUDE_DIRS ${PC_FFTW3_INCLUDE_DIRS})
-                set(LB_CUBE_FFTW_LIBRARY_DIR_HINTS ${PC_FFTW3_LIBRARY_DIRS})
+                list(APPEND LB_CUBE_FFTW_INCLUDE_DIRS ${PC_FFTW3_INCLUDE_DIRS})
+                list(APPEND LB_CUBE_FFTW_LIBRARY_DIR_HINTS ${PC_FFTW3_LIBRARY_DIRS})
             endif()
         endif()
     endif()
@@ -195,9 +229,20 @@ if(LB_CUBE_ENABLE_FFTW)
     endif()
 
     if(NOT LB_CUBE_FFTW_INCLUDE_DIR OR NOT LB_CUBE_FFTW_LIBRARY)
-        message(FATAL_ERROR "LB_CUBE_ENABLE_FFTW=ON, but FFTW double-precision headers/libraries were not found")
+        message(FATAL_ERROR
+            "LB_CUBE_ENABLE_FFTW=ON, but FFTW double-precision headers/libraries were not found.\n"
+            "Detected/selected include directory: '${LB_CUBE_FFTW_INCLUDE_DIR}'\n"
+            "Detected/selected double library: '${LB_CUBE_FFTW_LIBRARY}'\n"
+            "Provide either a prefix:\n"
+            "  -DLB_CUBE_FFTW_ROOT=/path/to/fftw\n"
+            "or explicit paths:\n"
+            "  -DLB_CUBE_FFTW_INCLUDE_DIR=/path/to/fftw/include\n"
+            "  -DLB_CUBE_FFTW_LIBRARY=/path/to/fftw/lib/libfftw3.so\n"
+            "Use libfftw3.a instead of libfftw3.so if your cluster provides only static libraries.")
     endif()
-    if(NOT LB_CUBE_FFTW_DETECTION_METHOD)
+    if(LB_CUBE_FFTW_ROOT)
+        set(LB_CUBE_FFTW_DETECTION_METHOD "manual prefix/cache hints")
+    elseif(NOT LB_CUBE_FFTW_DETECTION_METHOD)
         set(LB_CUBE_FFTW_DETECTION_METHOD "find_path/find_library fallback")
     endif()
 
