@@ -74,6 +74,7 @@ struct Config {
     int vtk_freq{1000};
     int vtk_burst_length{1000};
     int vtk_burst_freq{100};
+    int profile_freq{};
 };
 
 struct PerturbationMode {
@@ -212,6 +213,23 @@ struct ScalarBudgetDiagnostics {
     Real tau_eff_star{};
 };
 
+struct ProfilePlaneSums {
+    long double ux{};
+    long double uy{};
+    long double uz{};
+    long double ux2{};
+    long double uy2{};
+    long double uz2{};
+    long double ca{};
+    long double cb{};
+    long double cc{};
+    long double z{};
+    long double z2{};
+    long double chi_z{};
+    long double reaction_rate{};
+    long double ca_cb{};
+};
+
 [[nodiscard]] std::size_t cell_count(const Config& config) {
     return config.nx * config.ny * config.nz;
 }
@@ -239,6 +257,15 @@ struct ScalarBudgetDiagnostics {
     const int parsed = std::stoi(std::string{value}, &parsed_chars);
     if (parsed_chars != value.size() || parsed <= 0) {
         throw std::runtime_error(std::format("{} must be a positive integer", flag));
+    }
+    return parsed;
+}
+
+[[nodiscard]] int parse_nonnegative_int(std::string_view flag, std::string_view value) {
+    std::size_t parsed_chars{};
+    const int parsed = std::stoi(std::string{value}, &parsed_chars);
+    if (parsed_chars != value.size() || parsed < 0) {
+        throw std::runtime_error(std::format("{} must be a non-negative integer", flag));
     }
     return parsed;
 }
@@ -298,6 +325,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --vtk_freq <n>           Regular binary VTK interval (default 1000)\n"
         << "  --vtk_burst_length <n>   Steps covered by burst output (default 1000)\n"
         << "  --vtk_burst_freq <n>     VTK interval during burst (default 100)\n"
+        << "  --profile_freq <n>       y-profile CSV interval; 0 disables output (default 0)\n"
         << "  --help                   Show this message\n";
 }
 
@@ -363,6 +391,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
             config.vtk_burst_length = parse_int(flag, require_value(index, argc, argv));
         } else if (flag == "--vtk_burst_freq") {
             config.vtk_burst_freq = parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--profile_freq") {
+            config.profile_freq =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -888,6 +919,8 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << "VTK regular frequency: " << config.vtk_freq << '\n'
         << "VTK burst length: " << config.vtk_burst_length
         << ", VTK burst frequency: " << config.vtk_burst_freq << '\n'
+        << "Profile frequency: " << config.profile_freq
+        << (config.profile_freq > 0 ? "" : " (disabled)") << '\n'
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -977,6 +1010,7 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"DeltaU\": " << json_number(config.delta_u) << ",\n"
         << "  \"tau_delta\": " << json_number(config.tau_delta) << ",\n"
         << "  \"tau_chem\": " << json_number(config.tau_chem) << ",\n"
+        << "  \"profile_freq\": " << config.profile_freq << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -1642,6 +1676,145 @@ void write_binary_vtk(
     vtk << '\n';
 }
 
+void write_y_profile_csv(
+    const Config& config,
+    const std::filesystem::path& output_dir,
+    int step,
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    std::filesystem::create_directories(output_dir);
+    const std::filesystem::path filename =
+        output_dir / std::format("profile_{:08}.csv", step);
+    std::ofstream profile{filename};
+    if (!profile) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    const auto fluid_view = fluid.get_current_view();
+    const auto a_view = species_a.get_current_view();
+    const auto b_view = species_b.get_current_view();
+    std::vector<ProfilePlaneSums> planes(config.ny);
+
+#pragma omp parallel for schedule(static)
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        ProfilePlaneSums sums{};
+
+        for (std::size_t z = 0; z < config.nz; ++z) {
+            for (std::size_t x = 0; x < config.nx; ++x) {
+                const lbm::MacroState<FluidLattice, Real> macro =
+                    macro_at<FluidLattice>(fluid_view, x, y, z);
+                const Real ux = macro.velocity[0];
+                const Real uy = macro.velocity[1];
+                const Real uz = macro.velocity[2];
+                const Real concentration_a = concentration_at(a_view, x, y, z);
+                const Real concentration_b = concentration_at(b_view, x, y, z);
+                const Real concentration_c =
+                    product_concentration(config, concentration_a, concentration_b);
+                const Real mixture_fraction =
+                    Real{0.5} * (Real{1} + (concentration_a - concentration_b) / config.c0);
+                const Real local_rate = config.k_react * concentration_a * concentration_b;
+
+                const std::size_t xp = (x + 1) % config.nx;
+                const std::size_t xm = (x + config.nx - 1) % config.nx;
+                const std::size_t yp = (y + 1) % config.ny;
+                const std::size_t ym = (y + config.ny - 1) % config.ny;
+                const std::size_t zp = (z + 1) % config.nz;
+                const std::size_t zm = (z + config.nz - 1) % config.nz;
+                const auto z_at = [&](std::size_t xi, std::size_t yi, std::size_t zi) {
+                    const Real ca = concentration_at(a_view, xi, yi, zi);
+                    const Real cb = concentration_at(b_view, xi, yi, zi);
+                    return Real{0.5} * (Real{1} + (ca - cb) / config.c0);
+                };
+                const Real dz_dx = Real{0.5} * (z_at(xp, y, z) - z_at(xm, y, z));
+                const Real dz_dy = Real{0.5} * (z_at(x, yp, z) - z_at(x, ym, z));
+                const Real dz_dz = Real{0.5} * (z_at(x, y, zp) - z_at(x, y, zm));
+                const Real grad_z2 = dz_dx * dz_dx + dz_dy * dz_dy + dz_dz * dz_dz;
+                const Real chi_z = Real{2} * config.scalar_diffusivity * grad_z2;
+
+                sums.ux += static_cast<long double>(ux);
+                sums.uy += static_cast<long double>(uy);
+                sums.uz += static_cast<long double>(uz);
+                sums.ux2 += static_cast<long double>(ux * ux);
+                sums.uy2 += static_cast<long double>(uy * uy);
+                sums.uz2 += static_cast<long double>(uz * uz);
+                sums.ca += static_cast<long double>(concentration_a);
+                sums.cb += static_cast<long double>(concentration_b);
+                sums.cc += static_cast<long double>(concentration_c);
+                sums.z += static_cast<long double>(mixture_fraction);
+                sums.z2 += static_cast<long double>(mixture_fraction * mixture_fraction);
+                sums.chi_z += static_cast<long double>(chi_z);
+                sums.reaction_rate += static_cast<long double>(local_rate);
+                sums.ca_cb += static_cast<long double>(concentration_a * concentration_b);
+            }
+        }
+
+        planes[y] = sums;
+    }
+
+    profile
+        << "y,y_over_L,"
+        << "mean_ux,mean_uy,mean_uz,"
+        << "ux_rms_fluct,uy_rms_fluct,uz_rms_fluct,k_fluc,"
+        << "mean_Ca,mean_Cb,mean_Cc,"
+        << "mean_Z,var_Z,"
+        << "mean_chi_Z,"
+        << "mean_reaction_rate,"
+        << "cov_AB\n";
+
+    const long double inv_plane =
+        1.0L / static_cast<long double>(config.nx * config.nz);
+    const auto finite_variance = [](Real mean_square, Real mean) {
+        return std::max(Real{}, mean_square - mean * mean);
+    };
+
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        const ProfilePlaneSums& sums = planes[y];
+        const Real mean_ux = static_cast<Real>(sums.ux * inv_plane);
+        const Real mean_uy = static_cast<Real>(sums.uy * inv_plane);
+        const Real mean_uz = static_cast<Real>(sums.uz * inv_plane);
+        const Real ux_var =
+            finite_variance(static_cast<Real>(sums.ux2 * inv_plane), mean_ux);
+        const Real uy_var =
+            finite_variance(static_cast<Real>(sums.uy2 * inv_plane), mean_uy);
+        const Real uz_var =
+            finite_variance(static_cast<Real>(sums.uz2 * inv_plane), mean_uz);
+        const Real mean_ca = static_cast<Real>(sums.ca * inv_plane);
+        const Real mean_cb = static_cast<Real>(sums.cb * inv_plane);
+        const Real mean_z = static_cast<Real>(sums.z * inv_plane);
+
+        profile
+            << y << ','
+            << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(y) / static_cast<Real>(config.ny)))
+            << ',' << std::format("{:.17g}", static_cast<double>(mean_ux))
+            << ',' << std::format("{:.17g}", static_cast<double>(mean_uy))
+            << ',' << std::format("{:.17g}", static_cast<double>(mean_uz))
+            << ',' << std::format("{:.17g}", static_cast<double>(std::sqrt(ux_var)))
+            << ',' << std::format("{:.17g}", static_cast<double>(std::sqrt(uy_var)))
+            << ',' << std::format("{:.17g}", static_cast<double>(std::sqrt(uz_var)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   Real{0.5} * (ux_var + uy_var + uz_var)))
+            << ',' << std::format("{:.17g}", static_cast<double>(mean_ca))
+            << ',' << std::format("{:.17g}", static_cast<double>(mean_cb))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(sums.cc * inv_plane)))
+            << ',' << std::format("{:.17g}", static_cast<double>(mean_z))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   finite_variance(static_cast<Real>(sums.z2 * inv_plane), mean_z)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(sums.chi_z * inv_plane)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(sums.reaction_rate * inv_plane)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(sums.ca_cb * inv_plane) - mean_ca * mean_cb))
+            << '\n';
+    }
+
+    profile.flush();
+    profile.close();
+}
+
 [[nodiscard]] ResolutionDiagnostics compute_resolution_diagnostics(
     const Config& config,
     const FlowDiagnostics& flow) {
@@ -1844,6 +2017,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const Real omega_f = Real{1} / config.tau_f;
     const Real omega_s = Real{1} / config.tau_s;
     const std::filesystem::path vtk_dir{"vtk_double_shear_3d"};
+    const std::filesystem::path profile_dir{"profiles_double_shear_3d"};
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
@@ -1882,6 +2056,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         initial_mean_z,
         initial_mean_rho);
     write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
+    if (config.profile_freq > 0) {
+        write_y_profile_csv(config, profile_dir, 0, fluid, species_a, species_b);
+    }
 
     for (int step = 1; step <= config.steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, lbm::CollisionType::RLBM>(fluid, omega_f);
@@ -1978,6 +2155,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         if (is_burst_vtk) {
             ++burst_steps_recorded;
         }
+        if (config.profile_freq > 0 && step % config.profile_freq == 0) {
+            write_y_profile_csv(config, profile_dir, step, fluid, species_a, species_b);
+        }
 
         if (!std::isfinite(flow.u_max) || !std::isfinite(flow.mean_kinetic_energy)) {
             std::cout << "[D3Q27_RLBM] Solver produced non-finite diagnostics at step "
@@ -1996,6 +2176,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << " s.\nStatistics: statistics_double_shear_3d.csv"
               << "\nMetadata: metadata_double_shear_3d.json"
               << "\nVTK directory: " << vtk_dir.string() << '\n'
+              << "Profile directory: "
+              << (config.profile_freq > 0 ? profile_dir.string() : "disabled") << '\n'
               << std::flush;
 }
 
