@@ -182,6 +182,14 @@ struct ResolutionDiagnostics {
     Real dx_over_eta_b{};
 };
 
+struct ScalarBudgetDiagnostics {
+    Real variance_decay_rate{};
+    Real budget_ratio{};
+    Real numerical_dissipation_fraction{};
+    Real tau_eff{};
+    Real tau_eff_star{};
+};
+
 [[nodiscard]] std::size_t cell_count(const Config& config) {
     return config.nx * config.ny * config.nz;
 }
@@ -1509,6 +1517,38 @@ void write_binary_vtk(
         Real{1} / eta_b};
 }
 
+[[nodiscard]] ScalarBudgetDiagnostics compute_scalar_budget_diagnostics(
+    const Config& config,
+    int previous_statistics_step,
+    Real previous_var_z,
+    int current_step,
+    const ScalarDiagnostics& scalar) {
+    if (current_step <= previous_statistics_step) {
+        return {};
+    }
+
+    const Real delta_t =
+        static_cast<Real>(current_step - previous_statistics_step);
+    const Real variance_decay_rate = -(scalar.var_z - previous_var_z) / delta_t;
+    const Real budget_ratio =
+        scalar.mean_chi_z > Real{} ? variance_decay_rate / scalar.mean_chi_z : Real{};
+    const Real numerical_dissipation_fraction =
+        variance_decay_rate > Real{}
+            ? Real{1} - scalar.mean_chi_z / variance_decay_rate
+            : Real{};
+    const Real tau_eff =
+        variance_decay_rate > Real{} ? scalar.var_z / variance_decay_rate : Real{};
+    const Real tau_eff_star =
+        variance_decay_rate > Real{} ? tau_eff * config.delta_u / config.delta0 : Real{};
+
+    return {
+        variance_decay_rate,
+        budget_ratio,
+        numerical_dissipation_fraction,
+        tau_eff,
+        tau_eff_star};
+}
+
 void append_statistics(
     std::ofstream& statistics,
     const Config& config,
@@ -1516,10 +1556,11 @@ void append_statistics(
     Real simulation_time,
     const FlowDiagnostics& flow,
     Real kinetic_energy_decay_rate,
-    const ScalarDiagnostics& scalar) {
+    const ScalarDiagnostics& scalar,
+    const ScalarBudgetDiagnostics& scalar_budget) {
     const ResolutionDiagnostics resolution = compute_resolution_diagnostics(config, flow);
     statistics << std::format(
-        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
+        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
         step,
         static_cast<double>(simulation_time),
         static_cast<double>(flow.u_max),
@@ -1547,6 +1588,8 @@ void append_statistics(
         static_cast<double>(scalar.reaction_efficiency),
         static_cast<double>(scalar.mean_z),
         static_cast<double>(scalar.var_z),
+        static_cast<double>(scalar_budget.variance_decay_rate),
+        static_cast<double>(scalar_budget.budget_ratio),
         static_cast<double>(scalar.min_z),
         static_cast<double>(scalar.max_z),
         static_cast<double>(scalar.mean_chi_z),
@@ -1555,6 +1598,9 @@ void append_statistics(
         static_cast<double>(scalar.var_chi_z),
         static_cast<double>(scalar.tau_mix),
         static_cast<double>(scalar.tau_mix_star),
+        static_cast<double>(scalar_budget.numerical_dissipation_fraction),
+        static_cast<double>(scalar_budget.tau_eff),
+        static_cast<double>(scalar_budget.tau_eff_star),
         static_cast<double>(scalar.da_mix),
         static_cast<double>(scalar.cov_ab),
         static_cast<double>(scalar.segregation_index),
@@ -1589,9 +1635,11 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         << "mean_Ca,var_Ca,min_Ca,max_Ca,"
         << "mean_Cb,var_Cb,min_Cb,max_Cb,"
         << "mean_Cc,var_Cc,rate_true,rate_mixed,reaction_efficiency,"
-        << "mean_Z,var_Z,min_Z,max_Z,"
+        << "mean_Z,var_Z,scalar_variance_decay_rate,scalar_budget_ratio,"
+        << "min_Z,max_Z,"
         << "mean_chi_Z,rms_chi_Z,max_chi_Z,var_chi_Z,"
-        << "tau_mix,tau_mix_star,Da_mix,"
+        << "tau_mix,tau_mix_star,scalar_numerical_dissipation_fraction,"
+        << "tau_eff,tau_eff_star,Da_mix,"
         << "cov_AB,I_seg,rho_AB,"
         << "eta_K,eta_B,dx_over_etaK,dx_over_etaB,"
         << "mean_gradZ2,mean_gradZ4,F_gradZ"
@@ -1607,11 +1655,14 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const FlowDiagnostics initial_flow = flow;
     Real kinetic_energy_previous = flow.mean_kinetic_energy;
     Real latest_kinetic_energy_decay_rate{};
+    ScalarBudgetDiagnostics scalar_budget{};
     bool burst_active = false;
     int burst_steps_recorded = 0;
 
     ScalarDiagnostics scalar =
         compute_scalar_diagnostics(config, species_a, species_b);
+    Real previous_var_z = scalar.var_z;
+    int previous_statistics_step = 0;
     std::cout << "Initial profile check: "
               << "ux(y=0)=" << config.u0 * shear_profile(config, 0)
               << ", ux(y=Ny/2)=" << config.u0 * shear_profile(config, config.ny / 2)
@@ -1629,7 +1680,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         Real{},
         flow,
         latest_kinetic_energy_decay_rate,
-        scalar);
+        scalar,
+        scalar_budget);
     write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
 
     for (int step = 1; step <= config.steps; ++step) {
@@ -1650,6 +1702,12 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
             kinetic_energy_previous = flow.mean_kinetic_energy;
 
             scalar = compute_scalar_diagnostics(config, species_a, species_b);
+            scalar_budget = compute_scalar_budget_diagnostics(
+                config,
+                previous_statistics_step,
+                previous_var_z,
+                step,
+                scalar);
             append_statistics(
                 statistics,
                 config,
@@ -1657,7 +1715,10 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 static_cast<Real>(step),
                 flow,
                 latest_kinetic_energy_decay_rate,
-                scalar);
+                scalar,
+                scalar_budget);
+            previous_var_z = scalar.var_z;
+            previous_statistics_step = step;
 
             if (!burst_active &&
                 flow.mean_kinetic_energy < Real{0.95} * initial_flow.mean_kinetic_energy) {
@@ -1681,7 +1742,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 compute_resolution_diagnostics(config, flow);
 
             std::cout << std::format(
-                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} dE/dt: {:.6g} Burst: {} MLUPS: {:.6g}\n",
+                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} dE/dt: {:.6g} Burst: {} MLUPS: {:.6g}\n",
                 step,
                 config.steps,
                 static_cast<double>(flow.u_max),
@@ -1691,6 +1752,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 static_cast<double>(flow.enstrophy),
                 static_cast<double>(flow.epsilon),
                 static_cast<double>(scalar.mean_chi_z),
+                static_cast<double>(scalar_budget.budget_ratio),
                 static_cast<double>(scalar.tau_mix_star),
                 static_cast<double>(scalar.da_mix),
                 static_cast<double>(resolution.dx_over_eta_b),
