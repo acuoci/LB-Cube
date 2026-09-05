@@ -139,6 +139,7 @@ struct FlowDiagnostics {
     Real uz_rms{};
     Real uperp_rms{};
     Real enstrophy{};
+    Real epsilon{};
 };
 
 struct ScalarDiagnostics {
@@ -155,6 +156,30 @@ struct ScalarDiagnostics {
     Real rate_true{};
     Real rate_mixed{};
     Real reaction_efficiency{};
+    Real mean_z{};
+    Real var_z{};
+    Real min_z{};
+    Real max_z{};
+    Real mean_chi_z{};
+    Real rms_chi_z{};
+    Real max_chi_z{};
+    Real var_chi_z{};
+    Real tau_mix{};
+    Real tau_mix_star{};
+    Real da_mix{};
+    Real cov_ab{};
+    Real segregation_index{};
+    Real rho_ab{};
+    Real mean_grad_z2{};
+    Real mean_grad_z4{};
+    Real grad_z_flatness{};
+};
+
+struct ResolutionDiagnostics {
+    Real eta_k{};
+    Real eta_b{};
+    Real dx_over_eta_k{};
+    Real dx_over_eta_b{};
 };
 
 [[nodiscard]] std::size_t cell_count(const Config& config) {
@@ -1120,10 +1145,11 @@ template <lbm::IsLatticeModel Lattice>
 
     long double fluctuation_kinetic_energy = 0.0L;
     long double enstrophy = 0.0L;
+    long double viscous_dissipation = 0.0L;
 
     // Second pass: fluctuations relative to instantaneous plane means and
     // vorticity from centered periodic finite differences with dx=dy=dz=1.
-#pragma omp parallel for collapse(3) schedule(static) reduction(+ : fluctuation_kinetic_energy, enstrophy, invalid_count)
+#pragma omp parallel for collapse(3) schedule(static) reduction(+ : fluctuation_kinetic_energy, enstrophy, viscous_dissipation, invalid_count)
     for (std::size_t z = 0; z < config.nz; ++z) {
         for (std::size_t y = 0; y < config.ny; ++y) {
             for (std::size_t x = 0; x < config.nx; ++x) {
@@ -1159,14 +1185,25 @@ template <lbm::IsLatticeModel Lattice>
                 const Real d_uz_dx = Real{0.5} * (vx_plus[2] - vx_minus[2]);
                 const Real d_uy_dx = Real{0.5} * (vx_plus[1] - vx_minus[1]);
                 const Real d_ux_dy = Real{0.5} * (vy_plus[0] - vy_minus[0]);
+                const Real d_ux_dx = Real{0.5} * (vx_plus[0] - vx_minus[0]);
+                const Real d_uy_dy = Real{0.5} * (vy_plus[1] - vy_minus[1]);
+                const Real d_uz_dz = Real{0.5} * (vz_plus[2] - vz_minus[2]);
 
                 const Real omega_x = d_uz_dy - d_uy_dz;
                 const Real omega_y = d_ux_dz - d_uz_dx;
                 const Real omega_z = d_uy_dx - d_ux_dy;
                 const Real vorticity_squared =
                     omega_x * omega_x + omega_y * omega_y + omega_z * omega_z;
+                const Real local_epsilon =
+                    config.viscosity *
+                    (Real{2} * d_ux_dx * d_ux_dx +
+                     Real{2} * d_uy_dy * d_uy_dy +
+                     Real{2} * d_uz_dz * d_uz_dz +
+                     (d_ux_dy + d_uy_dx) * (d_ux_dy + d_uy_dx) +
+                     (d_ux_dz + d_uz_dx) * (d_ux_dz + d_uz_dx) +
+                     (d_uy_dz + d_uz_dy) * (d_uy_dz + d_uz_dy));
 
-                if (!std::isfinite(vorticity_squared)) {
+                if (!std::isfinite(vorticity_squared) || !std::isfinite(local_epsilon)) {
                     ++invalid_count;
                     continue;
                 }
@@ -1174,12 +1211,14 @@ template <lbm::IsLatticeModel Lattice>
                 fluctuation_kinetic_energy +=
                     static_cast<long double>(Real{0.5} * fluctuation_speed_squared);
                 enstrophy += static_cast<long double>(Real{0.5} * vorticity_squared);
+                viscous_dissipation += static_cast<long double>(local_epsilon);
             }
         }
     }
 
     if (invalid_count > 0) {
         return {
+            std::numeric_limits<Real>::infinity(),
             std::numeric_limits<Real>::infinity(),
             std::numeric_limits<Real>::infinity(),
             std::numeric_limits<Real>::infinity(),
@@ -1198,7 +1237,8 @@ template <lbm::IsLatticeModel Lattice>
         std::sqrt(static_cast<Real>(sum_uy2 * inv_cells)),
         std::sqrt(static_cast<Real>(sum_uz2 * inv_cells)),
         std::sqrt(static_cast<Real>((sum_uy2 + sum_uz2) * inv_cells)),
-        static_cast<Real>(enstrophy * inv_cells)};
+        static_cast<Real>(enstrophy * inv_cells),
+        static_cast<Real>(viscous_dissipation * inv_cells)};
 }
 
 [[nodiscard]] ScalarDiagnostics compute_scalar_diagnostics(
@@ -1215,12 +1255,22 @@ template <lbm::IsLatticeModel Lattice>
     long double sum_cb2 = 0.0L;
     long double sum_cc2 = 0.0L;
     long double sum_rate = 0.0L;
+    long double sum_cacb = 0.0L;
+    long double sum_z = 0.0L;
+    long double sum_z2 = 0.0L;
+    long double sum_chi_z = 0.0L;
+    long double sum_chi_z2 = 0.0L;
+    long double sum_grad_z2 = 0.0L;
+    long double sum_grad_z4 = 0.0L;
     Real min_ca = std::numeric_limits<Real>::infinity();
     Real max_ca = -std::numeric_limits<Real>::infinity();
     Real min_cb = std::numeric_limits<Real>::infinity();
     Real max_cb = -std::numeric_limits<Real>::infinity();
+    Real min_z = std::numeric_limits<Real>::infinity();
+    Real max_z = -std::numeric_limits<Real>::infinity();
+    Real max_chi_z{};
 
-#pragma omp parallel for collapse(3) schedule(static) reduction(+ : sum_ca, sum_cb, sum_cc, sum_ca2, sum_cb2, sum_cc2, sum_rate) reduction(min : min_ca, min_cb) reduction(max : max_ca, max_cb)
+#pragma omp parallel for collapse(3) schedule(static) reduction(+ : sum_ca, sum_cb, sum_cc, sum_ca2, sum_cb2, sum_cc2, sum_rate, sum_cacb, sum_z, sum_z2, sum_chi_z, sum_chi_z2, sum_grad_z2, sum_grad_z4) reduction(min : min_ca, min_cb, min_z) reduction(max : max_ca, max_cb, max_z, max_chi_z)
     for (std::size_t z = 0; z < config.nz; ++z) {
         for (std::size_t y = 0; y < config.ny; ++y) {
             for (std::size_t x = 0; x < config.nx; ++x) {
@@ -1229,6 +1279,24 @@ template <lbm::IsLatticeModel Lattice>
                 const Real concentration_c =
                     product_concentration(config, concentration_a, concentration_b);
                 const Real local_rate = config.k_react * concentration_a * concentration_b;
+                const Real mixture_fraction =
+                    Real{0.5} * (Real{1} + (concentration_a - concentration_b) / config.c0);
+                const std::size_t xp = (x + 1) % config.nx;
+                const std::size_t xm = (x + config.nx - 1) % config.nx;
+                const std::size_t yp = (y + 1) % config.ny;
+                const std::size_t ym = (y + config.ny - 1) % config.ny;
+                const std::size_t zp = (z + 1) % config.nz;
+                const std::size_t zm = (z + config.nz - 1) % config.nz;
+                const auto z_at = [&](std::size_t xi, std::size_t yi, std::size_t zi) {
+                    const Real ca = concentration_at(a_view, xi, yi, zi);
+                    const Real cb = concentration_at(b_view, xi, yi, zi);
+                    return Real{0.5} * (Real{1} + (ca - cb) / config.c0);
+                };
+                const Real dz_dx = Real{0.5} * (z_at(xp, y, z) - z_at(xm, y, z));
+                const Real dz_dy = Real{0.5} * (z_at(x, yp, z) - z_at(x, ym, z));
+                const Real dz_dz = Real{0.5} * (z_at(x, y, zp) - z_at(x, y, zm));
+                const Real grad_z2 = dz_dx * dz_dx + dz_dy * dz_dy + dz_dz * dz_dz;
+                const Real chi_z = Real{2} * config.scalar_diffusivity * grad_z2;
 
                 sum_ca += static_cast<long double>(concentration_a);
                 sum_cb += static_cast<long double>(concentration_b);
@@ -1237,10 +1305,20 @@ template <lbm::IsLatticeModel Lattice>
                 sum_cb2 += static_cast<long double>(concentration_b * concentration_b);
                 sum_cc2 += static_cast<long double>(concentration_c * concentration_c);
                 sum_rate += static_cast<long double>(local_rate);
+                sum_cacb += static_cast<long double>(concentration_a * concentration_b);
+                sum_z += static_cast<long double>(mixture_fraction);
+                sum_z2 += static_cast<long double>(mixture_fraction * mixture_fraction);
+                sum_chi_z += static_cast<long double>(chi_z);
+                sum_chi_z2 += static_cast<long double>(chi_z * chi_z);
+                sum_grad_z2 += static_cast<long double>(grad_z2);
+                sum_grad_z4 += static_cast<long double>(grad_z2 * grad_z2);
                 min_ca = std::min(min_ca, concentration_a);
                 max_ca = std::max(max_ca, concentration_a);
                 min_cb = std::min(min_cb, concentration_b);
                 max_cb = std::max(max_cb, concentration_b);
+                min_z = std::min(min_z, mixture_fraction);
+                max_z = std::max(max_z, mixture_fraction);
+                max_chi_z = std::max(max_chi_z, chi_z);
             }
         }
     }
@@ -1256,21 +1334,63 @@ template <lbm::IsLatticeModel Lattice>
     const Real rate_mixed = config.k_react * mean_ca * mean_cb;
     const Real reaction_efficiency =
         rate_mixed > Real{} ? rate_true / rate_mixed : Real{};
+    const Real mean_cacb = static_cast<Real>(sum_cacb * inv_cells);
+    const Real mean_z = static_cast<Real>(sum_z * inv_cells);
+    const Real mean_z2 = static_cast<Real>(sum_z2 * inv_cells);
+    const Real var_z = std::max(Real{}, mean_z2 - mean_z * mean_z);
+    const Real mean_chi_z = static_cast<Real>(sum_chi_z * inv_cells);
+    const Real mean_chi_z2 = static_cast<Real>(sum_chi_z2 * inv_cells);
+    const Real var_chi_z = std::max(Real{}, mean_chi_z2 - mean_chi_z * mean_chi_z);
+    const Real tau_mix =
+        mean_chi_z > Real{} ? var_z / mean_chi_z : std::numeric_limits<Real>::infinity();
+    const Real tau_mix_star =
+        std::isfinite(tau_mix) ? tau_mix * config.delta_u / config.delta0
+                               : std::numeric_limits<Real>::infinity();
+    const Real da_mix = config.k_react > Real{} ? config.k_react * config.c0 * tau_mix
+                                                : Real{};
+    const Real var_ca = std::max(Real{}, mean_ca2 - mean_ca * mean_ca);
+    const Real var_cb = std::max(Real{}, mean_cb2 - mean_cb * mean_cb);
+    const Real cov_ab = mean_cacb - mean_ca * mean_cb;
+    const Real segregation_index =
+        mean_ca * mean_cb > Real{} ? -cov_ab / (mean_ca * mean_cb) : Real{};
+    const Real rho_ab =
+        var_ca > Real{} && var_cb > Real{} ? cov_ab / std::sqrt(var_ca * var_cb) : Real{};
+    const Real mean_grad_z2 = static_cast<Real>(sum_grad_z2 * inv_cells);
+    const Real mean_grad_z4 = static_cast<Real>(sum_grad_z4 * inv_cells);
+    const Real grad_z_flatness =
+        mean_grad_z2 > Real{} ? mean_grad_z4 / (mean_grad_z2 * mean_grad_z2) : Real{};
 
     return {
         mean_ca,
-        mean_ca2 - mean_ca * mean_ca,
+        var_ca,
         min_ca,
         max_ca,
         mean_cb,
-        mean_cb2 - mean_cb * mean_cb,
+        var_cb,
         min_cb,
         max_cb,
         mean_cc,
-        mean_cc2 - mean_cc * mean_cc,
+        std::max(Real{}, mean_cc2 - mean_cc * mean_cc),
         rate_true,
         rate_mixed,
-        reaction_efficiency};
+        reaction_efficiency,
+        mean_z,
+        var_z,
+        min_z,
+        max_z,
+        mean_chi_z,
+        std::sqrt(mean_chi_z2),
+        max_chi_z,
+        var_chi_z,
+        tau_mix,
+        tau_mix_star,
+        da_mix,
+        cov_ab,
+        segregation_index,
+        rho_ab,
+        mean_grad_z2,
+        mean_grad_z4,
+        grad_z_flatness};
 }
 
 void write_big_endian_double(std::ostream& stream, double value) {
@@ -1367,26 +1487,51 @@ void write_binary_vtk(
     vtk << '\n';
 }
 
+[[nodiscard]] ResolutionDiagnostics compute_resolution_diagnostics(
+    const Config& config,
+    const FlowDiagnostics& flow) {
+    if (flow.epsilon <= Real{} || !std::isfinite(flow.epsilon)) {
+        return {
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            Real{},
+            Real{}};
+    }
+
+    const Real eta_k =
+        std::pow(config.viscosity * config.viscosity * config.viscosity / flow.epsilon,
+                 Real{0.25});
+    const Real eta_b = eta_k / std::sqrt(config.sc);
+    return {
+        eta_k,
+        eta_b,
+        Real{1} / eta_k,
+        Real{1} / eta_b};
+}
+
 void append_statistics(
     std::ofstream& statistics,
+    const Config& config,
     int step,
     Real simulation_time,
     const FlowDiagnostics& flow,
-    Real dissipation_rate,
+    Real kinetic_energy_decay_rate,
     const ScalarDiagnostics& scalar) {
+    const ResolutionDiagnostics resolution = compute_resolution_diagnostics(config, flow);
     statistics << std::format(
-        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
+        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
         step,
         static_cast<double>(simulation_time),
         static_cast<double>(flow.u_max),
         static_cast<double>(flow.mean_kinetic_energy),
-        static_cast<double>(dissipation_rate),
+        static_cast<double>(kinetic_energy_decay_rate),
         static_cast<double>(flow.transverse_kinetic_energy),
         static_cast<double>(flow.fluctuation_kinetic_energy),
         static_cast<double>(flow.uy_rms),
         static_cast<double>(flow.uz_rms),
         static_cast<double>(flow.uperp_rms),
         static_cast<double>(flow.enstrophy),
+        static_cast<double>(flow.epsilon),
         static_cast<double>(scalar.mean_ca),
         static_cast<double>(scalar.var_ca),
         static_cast<double>(scalar.min_ca),
@@ -1399,7 +1544,28 @@ void append_statistics(
         static_cast<double>(scalar.var_cc),
         static_cast<double>(scalar.rate_true),
         static_cast<double>(scalar.rate_mixed),
-        static_cast<double>(scalar.reaction_efficiency))
+        static_cast<double>(scalar.reaction_efficiency),
+        static_cast<double>(scalar.mean_z),
+        static_cast<double>(scalar.var_z),
+        static_cast<double>(scalar.min_z),
+        static_cast<double>(scalar.max_z),
+        static_cast<double>(scalar.mean_chi_z),
+        static_cast<double>(scalar.rms_chi_z),
+        static_cast<double>(scalar.max_chi_z),
+        static_cast<double>(scalar.var_chi_z),
+        static_cast<double>(scalar.tau_mix),
+        static_cast<double>(scalar.tau_mix_star),
+        static_cast<double>(scalar.da_mix),
+        static_cast<double>(scalar.cov_ab),
+        static_cast<double>(scalar.segregation_index),
+        static_cast<double>(scalar.rho_ab),
+        static_cast<double>(resolution.eta_k),
+        static_cast<double>(resolution.eta_b),
+        static_cast<double>(resolution.dx_over_eta_k),
+        static_cast<double>(resolution.dx_over_eta_b),
+        static_cast<double>(scalar.mean_grad_z2),
+        static_cast<double>(scalar.mean_grad_z4),
+        static_cast<double>(scalar.grad_z_flatness))
                << std::endl;
     statistics.flush();
 }
@@ -1418,11 +1584,17 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         throw std::runtime_error("failed to open statistics_double_shear_3d.csv");
     }
     statistics
-        << "step,time,u_max,E_k,dissipation_rate,"
-        << "E_perp,E_fluc,uy_rms,uz_rms,uperp_rms,enstrophy,"
+        << "step,time,u_max,E_k,kinetic_energy_decay_rate,"
+        << "E_perp,E_fluc,uy_rms,uz_rms,uperp_rms,enstrophy,epsilon,"
         << "mean_Ca,var_Ca,min_Ca,max_Ca,"
         << "mean_Cb,var_Cb,min_Cb,max_Cb,"
-        << "mean_Cc,var_Cc,rate_true,rate_mixed,reaction_efficiency"
+        << "mean_Cc,var_Cc,rate_true,rate_mixed,reaction_efficiency,"
+        << "mean_Z,var_Z,min_Z,max_Z,"
+        << "mean_chi_Z,rms_chi_Z,max_chi_Z,var_chi_Z,"
+        << "tau_mix,tau_mix_star,Da_mix,"
+        << "cov_AB,I_seg,rho_AB,"
+        << "eta_K,eta_B,dx_over_etaK,dx_over_etaB,"
+        << "mean_gradZ2,mean_gradZ4,F_gradZ"
         << std::endl;
     statistics.flush();
 
@@ -1434,29 +1606,30 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
     const FlowDiagnostics initial_flow = flow;
     Real kinetic_energy_previous = flow.mean_kinetic_energy;
-    Real latest_dissipation_rate{};
+    Real latest_kinetic_energy_decay_rate{};
     bool burst_active = false;
     int burst_steps_recorded = 0;
 
-    const ScalarDiagnostics initial_scalar =
+    ScalarDiagnostics scalar =
         compute_scalar_diagnostics(config, species_a, species_b);
     std::cout << "Initial profile check: "
               << "ux(y=0)=" << config.u0 * shear_profile(config, 0)
               << ", ux(y=Ny/2)=" << config.u0 * shear_profile(config, config.ny / 2)
-              << ", min_Ca=" << initial_scalar.min_ca
-              << ", max_Ca=" << initial_scalar.max_ca
-              << ", min_Cb=" << initial_scalar.min_cb
-              << ", max_Cb=" << initial_scalar.max_cb
-              << ", mean_Ca=" << initial_scalar.mean_ca
-              << ", mean_Cb=" << initial_scalar.mean_cb << '\n'
+              << ", min_Ca=" << scalar.min_ca
+              << ", max_Ca=" << scalar.max_ca
+              << ", min_Cb=" << scalar.min_cb
+              << ", max_Cb=" << scalar.max_cb
+              << ", mean_Ca=" << scalar.mean_ca
+              << ", mean_Cb=" << scalar.mean_cb << '\n'
               << std::flush;
     append_statistics(
         statistics,
+        config,
         0,
         Real{},
         flow,
-        latest_dissipation_rate,
-        initial_scalar);
+        latest_kinetic_energy_decay_rate,
+        scalar);
     write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
 
     for (int step = 1; step <= config.steps; ++step) {
@@ -1471,19 +1644,19 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
 
         if (step % config.stat_freq == 0) {
             flow = compute_flow_diagnostics(config, fluid);
-            latest_dissipation_rate =
+            latest_kinetic_energy_decay_rate =
                 (kinetic_energy_previous - flow.mean_kinetic_energy) /
                 static_cast<Real>(config.stat_freq);
             kinetic_energy_previous = flow.mean_kinetic_energy;
 
-            const ScalarDiagnostics scalar =
-                compute_scalar_diagnostics(config, species_a, species_b);
+            scalar = compute_scalar_diagnostics(config, species_a, species_b);
             append_statistics(
                 statistics,
+                config,
                 step,
                 static_cast<Real>(step),
                 flow,
-                latest_dissipation_rate,
+                latest_kinetic_energy_decay_rate,
                 scalar);
 
             if (!burst_active &&
@@ -1504,9 +1677,11 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 static_cast<double>(step) *
                 3.0;
             const double mlups = updates / elapsed.count() / 1.0e6;
+            const ResolutionDiagnostics resolution =
+                compute_resolution_diagnostics(config, flow);
 
             std::cout << std::format(
-                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} Diss: {:.6g} Burst: {} MLUPS: {:.6g}\n",
+                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} dE/dt: {:.6g} Burst: {} MLUPS: {:.6g}\n",
                 step,
                 config.steps,
                 static_cast<double>(flow.u_max),
@@ -1514,7 +1689,12 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 static_cast<double>(flow.transverse_kinetic_energy),
                 static_cast<double>(flow.fluctuation_kinetic_energy),
                 static_cast<double>(flow.enstrophy),
-                static_cast<double>(latest_dissipation_rate),
+                static_cast<double>(flow.epsilon),
+                static_cast<double>(scalar.mean_chi_z),
+                static_cast<double>(scalar.tau_mix_star),
+                static_cast<double>(scalar.da_mix),
+                static_cast<double>(resolution.dx_over_eta_b),
+                static_cast<double>(latest_kinetic_energy_decay_rate),
                 burst_active ? "ON" : "OFF",
                 mlups)
                       << std::flush;
