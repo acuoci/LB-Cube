@@ -105,6 +105,16 @@ struct PerturbationDiagnostics {
     Real max_plane_mean_abs_ux{};
     Real max_plane_mean_abs_uy{};
     Real max_plane_mean_abs_uz{};
+    Real max_plane_rms{};
+    std::size_t max_plane_rms_y{};
+    Real y1_plane_rms{};
+    Real y2_plane_rms{};
+    Real y1_plane_rms_ux{};
+    Real y1_plane_rms_uy{};
+    Real y1_plane_rms_uz{};
+    Real y2_plane_rms_ux{};
+    Real y2_plane_rms_uy{};
+    Real y2_plane_rms_uz{};
     Real divergence_rms{};
     Real normalized_divergence{};
     Real localization_energy_max{};
@@ -123,6 +133,12 @@ struct PerturbationDefinition {
 struct FlowDiagnostics {
     Real u_max{};
     Real mean_kinetic_energy{};
+    Real transverse_kinetic_energy{};
+    Real fluctuation_kinetic_energy{};
+    Real uy_rms{};
+    Real uz_rms{};
+    Real uperp_rms{};
+    Real enstrophy{};
 };
 
 struct ScalarDiagnostics {
@@ -590,6 +606,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     std::vector<long double> plane_sum_ux(config.ny, 0.0L);
     std::vector<long double> plane_sum_uy(config.ny, 0.0L);
     std::vector<long double> plane_sum_uz(config.ny, 0.0L);
+    std::vector<long double> plane_sum_ux2(config.ny, 0.0L);
+    std::vector<long double> plane_sum_uy2(config.ny, 0.0L);
+    std::vector<long double> plane_sum_uz2(config.ny, 0.0L);
     std::vector<long double> plane_energy(config.ny, 0.0L);
 
     long double final_sum_ux = 0.0L;
@@ -605,6 +624,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         long double local_sum_ux = 0.0L;
         long double local_sum_uy = 0.0L;
         long double local_sum_uz = 0.0L;
+        long double local_sum_ux2 = 0.0L;
+        long double local_sum_uy2 = 0.0L;
+        long double local_sum_uz2 = 0.0L;
         long double local_energy = 0.0L;
 
         for (std::size_t z = 0; z < config.nz; ++z) {
@@ -641,6 +663,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
                 local_sum_ux += static_cast<long double>(velocity.ux);
                 local_sum_uy += static_cast<long double>(velocity.uy);
                 local_sum_uz += static_cast<long double>(velocity.uz);
+                local_sum_ux2 += static_cast<long double>(velocity.ux * velocity.ux);
+                local_sum_uy2 += static_cast<long double>(velocity.uy * velocity.uy);
+                local_sum_uz2 += static_cast<long double>(velocity.uz * velocity.uz);
                 local_energy += static_cast<long double>(Real{0.5} * velocity_squared);
                 final_sum_ux += static_cast<long double>(velocity.ux);
                 final_sum_uy += static_cast<long double>(velocity.uy);
@@ -655,6 +680,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         plane_sum_ux[y] = local_sum_ux;
         plane_sum_uy[y] = local_sum_uy;
         plane_sum_uz[y] = local_sum_uz;
+        plane_sum_ux2[y] = local_sum_ux2;
+        plane_sum_uy2[y] = local_sum_uy2;
+        plane_sum_uz2[y] = local_sum_uz2;
         plane_energy[y] =
             local_energy / static_cast<long double>(config.nx * config.nz);
     }
@@ -696,10 +724,48 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     auto upper_peak = std::max_element(plane_energy.begin() + static_cast<std::ptrdiff_t>(config.ny / 2), plane_energy.end());
     perturbation.diagnostics.localization_energy_max =
         static_cast<Real>(*std::max_element(plane_energy.begin(), plane_energy.end()));
+    perturbation.diagnostics.max_plane_rms =
+        std::sqrt(Real{2} * perturbation.diagnostics.localization_energy_max);
+    perturbation.diagnostics.max_plane_rms_y =
+        static_cast<std::size_t>(std::distance(
+            plane_energy.begin(),
+            std::max_element(plane_energy.begin(), plane_energy.end())));
     perturbation.diagnostics.localization_peak_y1 =
         static_cast<std::size_t>(std::distance(plane_energy.begin(), lower_peak));
     perturbation.diagnostics.localization_peak_y2 =
         static_cast<std::size_t>(std::distance(plane_energy.begin(), upper_peak));
+
+    const std::size_t y_lower = config.ny / 4;
+    const std::size_t y_upper = 3 * config.ny / 4;
+    const auto plane_component_rms = [inv_plane](long double component_square_sum) {
+        return std::sqrt(static_cast<Real>(component_square_sum * inv_plane));
+    };
+    perturbation.diagnostics.y1_plane_rms_ux =
+        plane_component_rms(plane_sum_ux2[y_lower]);
+    perturbation.diagnostics.y1_plane_rms_uy =
+        plane_component_rms(plane_sum_uy2[y_lower]);
+    perturbation.diagnostics.y1_plane_rms_uz =
+        plane_component_rms(plane_sum_uz2[y_lower]);
+    perturbation.diagnostics.y2_plane_rms_ux =
+        plane_component_rms(plane_sum_ux2[y_upper]);
+    perturbation.diagnostics.y2_plane_rms_uy =
+        plane_component_rms(plane_sum_uy2[y_upper]);
+    perturbation.diagnostics.y2_plane_rms_uz =
+        plane_component_rms(plane_sum_uz2[y_upper]);
+    perturbation.diagnostics.y1_plane_rms = std::sqrt(
+        perturbation.diagnostics.y1_plane_rms_ux *
+            perturbation.diagnostics.y1_plane_rms_ux +
+        perturbation.diagnostics.y1_plane_rms_uy *
+            perturbation.diagnostics.y1_plane_rms_uy +
+        perturbation.diagnostics.y1_plane_rms_uz *
+            perturbation.diagnostics.y1_plane_rms_uz);
+    perturbation.diagnostics.y2_plane_rms = std::sqrt(
+        perturbation.diagnostics.y2_plane_rms_ux *
+            perturbation.diagnostics.y2_plane_rms_ux +
+        perturbation.diagnostics.y2_plane_rms_uy *
+            perturbation.diagnostics.y2_plane_rms_uy +
+        perturbation.diagnostics.y2_plane_rms_uz *
+            perturbation.diagnostics.y2_plane_rms_uz);
 
     long double layer_energy = 0.0L;
     long double bulk_energy = 0.0L;
@@ -785,6 +851,18 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << "  RMS perturbation uy:      " << pert.rms_uy << '\n'
         << "  RMS perturbation uz:      " << pert.rms_uz << '\n'
         << "  RMS perturbation total:   " << pert.achieved_rms << '\n'
+        << "  max_y RMS/DeltaU:         " << pert.max_plane_rms / config.delta_u
+        << " at y=" << pert.max_plane_rms_y << '\n'
+        << "  y1 RMS/DeltaU:            " << pert.y1_plane_rms / config.delta_u << '\n'
+        << "  y2 RMS/DeltaU:            " << pert.y2_plane_rms / config.delta_u << '\n'
+        << "  y1 comp RMS/DeltaU:       "
+        << pert.y1_plane_rms_ux / config.delta_u << ", "
+        << pert.y1_plane_rms_uy / config.delta_u << ", "
+        << pert.y1_plane_rms_uz / config.delta_u << '\n'
+        << "  y2 comp RMS/DeltaU:       "
+        << pert.y2_plane_rms_ux / config.delta_u << ", "
+        << pert.y2_plane_rms_uy / config.delta_u << ", "
+        << pert.y2_plane_rms_uz / config.delta_u << '\n'
         << "  max plane-mean |ux'|:     " << pert.max_plane_mean_abs_ux << '\n'
         << "  max plane-mean |uy'|:     " << pert.max_plane_mean_abs_uy << '\n'
         << "  max plane-mean |uz'|:     " << pert.max_plane_mean_abs_uz << '\n'
@@ -859,6 +937,16 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"rms_upert_x\": " << json_number(pert.rms_ux) << ",\n"
         << "  \"rms_upert_y\": " << json_number(pert.rms_uy) << ",\n"
         << "  \"rms_upert_z\": " << json_number(pert.rms_uz) << ",\n"
+        << "  \"max_plane_rms_upert\": " << json_number(pert.max_plane_rms) << ",\n"
+        << "  \"max_plane_rms_upert_y\": " << pert.max_plane_rms_y << ",\n"
+        << "  \"y1_plane_rms_upert\": " << json_number(pert.y1_plane_rms) << ",\n"
+        << "  \"y2_plane_rms_upert\": " << json_number(pert.y2_plane_rms) << ",\n"
+        << "  \"y1_plane_rms_upert_x\": " << json_number(pert.y1_plane_rms_ux) << ",\n"
+        << "  \"y1_plane_rms_upert_y\": " << json_number(pert.y1_plane_rms_uy) << ",\n"
+        << "  \"y1_plane_rms_upert_z\": " << json_number(pert.y1_plane_rms_uz) << ",\n"
+        << "  \"y2_plane_rms_upert_x\": " << json_number(pert.y2_plane_rms_ux) << ",\n"
+        << "  \"y2_plane_rms_upert_y\": " << json_number(pert.y2_plane_rms_uy) << ",\n"
+        << "  \"y2_plane_rms_upert_z\": " << json_number(pert.y2_plane_rms_uz) << ",\n"
         << "  \"max_plane_mean_abs_upert_x\": " << json_number(pert.max_plane_mean_abs_ux) << ",\n"
         << "  \"max_plane_mean_abs_upert_y\": " << json_number(pert.max_plane_mean_abs_uy) << ",\n"
         << "  \"max_plane_mean_abs_upert_z\": " << json_number(pert.max_plane_mean_abs_uz) << ",\n"
@@ -968,16 +1056,30 @@ template <lbm::IsLatticeModel Lattice>
     const Config& config,
     const lbm::LatticeMemory<FluidLattice, Real>& fluid) {
     const auto view = fluid.get_current_view();
+    std::vector<long double> plane_sum_ux(config.ny, 0.0L);
+    std::vector<long double> plane_sum_uy(config.ny, 0.0L);
+    std::vector<long double> plane_sum_uz(config.ny, 0.0L);
     long double kinetic_energy = 0.0L;
+    long double transverse_kinetic_energy = 0.0L;
+    long double sum_uy2 = 0.0L;
+    long double sum_uz2 = 0.0L;
     Real u_max{};
     int invalid_count = 0;
 
-#pragma omp parallel for collapse(3) schedule(static) reduction(+ : kinetic_energy, invalid_count) reduction(max : u_max)
-    for (std::size_t z = 0; z < config.nz; ++z) {
-        for (std::size_t y = 0; y < config.ny; ++y) {
+    // First pass: global velocity moments and x-z plane means for each y.
+#pragma omp parallel for schedule(static) reduction(+ : kinetic_energy, transverse_kinetic_energy, sum_uy2, sum_uz2, invalid_count) reduction(max : u_max)
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        long double local_sum_ux = 0.0L;
+        long double local_sum_uy = 0.0L;
+        long double local_sum_uz = 0.0L;
+
+        for (std::size_t z = 0; z < config.nz; ++z) {
             for (std::size_t x = 0; x < config.nx; ++x) {
                 const lbm::MacroState<FluidLattice, Real> macro =
                     macro_at<FluidLattice>(view, x, y, z);
+                const Real ux = macro.velocity[0];
+                const Real uy = macro.velocity[1];
+                const Real uz = macro.velocity[2];
                 const Real speed_squared = macro.velocity.squaredNorm();
                 const Real speed = std::sqrt(speed_squared);
 
@@ -988,7 +1090,90 @@ template <lbm::IsLatticeModel Lattice>
 
                 kinetic_energy +=
                     static_cast<long double>(Real{0.5} * macro.density * speed_squared);
+                transverse_kinetic_energy +=
+                    static_cast<long double>(Real{0.5} * (uy * uy + uz * uz));
+                sum_uy2 += static_cast<long double>(uy * uy);
+                sum_uz2 += static_cast<long double>(uz * uz);
+                local_sum_ux += static_cast<long double>(ux);
+                local_sum_uy += static_cast<long double>(uy);
+                local_sum_uz += static_cast<long double>(uz);
                 u_max = std::max(u_max, speed);
+            }
+        }
+
+        plane_sum_ux[y] = local_sum_ux;
+        plane_sum_uy[y] = local_sum_uy;
+        plane_sum_uz[y] = local_sum_uz;
+    }
+
+    const long double inv_cells = 1.0L / static_cast<long double>(cell_count(config));
+    const long double inv_plane =
+        1.0L / static_cast<long double>(config.nx * config.nz);
+    std::vector<Real> plane_mean_ux(config.ny, Real{});
+    std::vector<Real> plane_mean_uy(config.ny, Real{});
+    std::vector<Real> plane_mean_uz(config.ny, Real{});
+    for (std::size_t y = 0; y < config.ny; ++y) {
+        plane_mean_ux[y] = static_cast<Real>(plane_sum_ux[y] * inv_plane);
+        plane_mean_uy[y] = static_cast<Real>(plane_sum_uy[y] * inv_plane);
+        plane_mean_uz[y] = static_cast<Real>(plane_sum_uz[y] * inv_plane);
+    }
+
+    long double fluctuation_kinetic_energy = 0.0L;
+    long double enstrophy = 0.0L;
+
+    // Second pass: fluctuations relative to instantaneous plane means and
+    // vorticity from centered periodic finite differences with dx=dy=dz=1.
+#pragma omp parallel for collapse(3) schedule(static) reduction(+ : fluctuation_kinetic_energy, enstrophy, invalid_count)
+    for (std::size_t z = 0; z < config.nz; ++z) {
+        for (std::size_t y = 0; y < config.ny; ++y) {
+            for (std::size_t x = 0; x < config.nx; ++x) {
+                const lbm::MacroState<FluidLattice, Real> macro =
+                    macro_at<FluidLattice>(view, x, y, z);
+                const Real ux_fluc = macro.velocity[0] - plane_mean_ux[y];
+                const Real uy_fluc = macro.velocity[1] - plane_mean_uy[y];
+                const Real uz_fluc = macro.velocity[2] - plane_mean_uz[y];
+                const Real fluctuation_speed_squared =
+                    ux_fluc * ux_fluc + uy_fluc * uy_fluc + uz_fluc * uz_fluc;
+
+                if (!std::isfinite(fluctuation_speed_squared)) {
+                    ++invalid_count;
+                    continue;
+                }
+
+                const std::size_t xp = (x + 1) % config.nx;
+                const std::size_t xm = (x + config.nx - 1) % config.nx;
+                const std::size_t yp = (y + 1) % config.ny;
+                const std::size_t ym = (y + config.ny - 1) % config.ny;
+                const std::size_t zp = (z + 1) % config.nz;
+                const std::size_t zm = (z + config.nz - 1) % config.nz;
+                const auto vx_plus = macro_at<FluidLattice>(view, xp, y, z).velocity;
+                const auto vx_minus = macro_at<FluidLattice>(view, xm, y, z).velocity;
+                const auto vy_plus = macro_at<FluidLattice>(view, x, yp, z).velocity;
+                const auto vy_minus = macro_at<FluidLattice>(view, x, ym, z).velocity;
+                const auto vz_plus = macro_at<FluidLattice>(view, x, y, zp).velocity;
+                const auto vz_minus = macro_at<FluidLattice>(view, x, y, zm).velocity;
+
+                const Real d_uz_dy = Real{0.5} * (vy_plus[2] - vy_minus[2]);
+                const Real d_uy_dz = Real{0.5} * (vz_plus[1] - vz_minus[1]);
+                const Real d_ux_dz = Real{0.5} * (vz_plus[0] - vz_minus[0]);
+                const Real d_uz_dx = Real{0.5} * (vx_plus[2] - vx_minus[2]);
+                const Real d_uy_dx = Real{0.5} * (vx_plus[1] - vx_minus[1]);
+                const Real d_ux_dy = Real{0.5} * (vy_plus[0] - vy_minus[0]);
+
+                const Real omega_x = d_uz_dy - d_uy_dz;
+                const Real omega_y = d_ux_dz - d_uz_dx;
+                const Real omega_z = d_uy_dx - d_ux_dy;
+                const Real vorticity_squared =
+                    omega_x * omega_x + omega_y * omega_y + omega_z * omega_z;
+
+                if (!std::isfinite(vorticity_squared)) {
+                    ++invalid_count;
+                    continue;
+                }
+
+                fluctuation_kinetic_energy +=
+                    static_cast<long double>(Real{0.5} * fluctuation_speed_squared);
+                enstrophy += static_cast<long double>(Real{0.5} * vorticity_squared);
             }
         }
     }
@@ -996,12 +1181,24 @@ template <lbm::IsLatticeModel Lattice>
     if (invalid_count > 0) {
         return {
             std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
+            std::numeric_limits<Real>::infinity(),
             std::numeric_limits<Real>::infinity()};
     }
 
     return {
         u_max,
-        static_cast<Real>(kinetic_energy / static_cast<long double>(cell_count(config)))};
+        static_cast<Real>(kinetic_energy * inv_cells),
+        static_cast<Real>(transverse_kinetic_energy * inv_cells),
+        static_cast<Real>(fluctuation_kinetic_energy * inv_cells),
+        std::sqrt(static_cast<Real>(sum_uy2 * inv_cells)),
+        std::sqrt(static_cast<Real>(sum_uz2 * inv_cells)),
+        std::sqrt(static_cast<Real>((sum_uy2 + sum_uz2) * inv_cells)),
+        static_cast<Real>(enstrophy * inv_cells)};
 }
 
 [[nodiscard]] ScalarDiagnostics compute_scalar_diagnostics(
@@ -1178,12 +1375,18 @@ void append_statistics(
     Real dissipation_rate,
     const ScalarDiagnostics& scalar) {
     statistics << std::format(
-        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
+        "{},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g},{:.17g}",
         step,
         static_cast<double>(simulation_time),
         static_cast<double>(flow.u_max),
         static_cast<double>(flow.mean_kinetic_energy),
         static_cast<double>(dissipation_rate),
+        static_cast<double>(flow.transverse_kinetic_energy),
+        static_cast<double>(flow.fluctuation_kinetic_energy),
+        static_cast<double>(flow.uy_rms),
+        static_cast<double>(flow.uz_rms),
+        static_cast<double>(flow.uperp_rms),
+        static_cast<double>(flow.enstrophy),
         static_cast<double>(scalar.mean_ca),
         static_cast<double>(scalar.var_ca),
         static_cast<double>(scalar.min_ca),
@@ -1216,6 +1419,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     }
     statistics
         << "step,time,u_max,E_k,dissipation_rate,"
+        << "E_perp,E_fluc,uy_rms,uz_rms,uperp_rms,enstrophy,"
         << "mean_Ca,var_Ca,min_Ca,max_Ca,"
         << "mean_Cb,var_Cb,min_Cb,max_Cb,"
         << "mean_Cc,var_Cc,rate_true,rate_mixed,reaction_efficiency"
@@ -1302,11 +1506,14 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
             const double mlups = updates / elapsed.count() / 1.0e6;
 
             std::cout << std::format(
-                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Dissipation: {:.6g} Burst: {} MLUPS: {:.6g}\n",
+                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} Diss: {:.6g} Burst: {} MLUPS: {:.6g}\n",
                 step,
                 config.steps,
                 static_cast<double>(flow.u_max),
                 static_cast<double>(flow.mean_kinetic_energy),
+                static_cast<double>(flow.transverse_kinetic_energy),
+                static_cast<double>(flow.fluctuation_kinetic_energy),
+                static_cast<double>(flow.enstrophy),
                 static_cast<double>(latest_dissipation_rate),
                 burst_active ? "ON" : "OFF",
                 mlups)
