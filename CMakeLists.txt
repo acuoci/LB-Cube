@@ -595,3 +595,28 @@ set_target_properties(
 )
 
 gtest_discover_tests(lbm_double_shear_parameter_tests)
+
+add_executable(lbm_box_filter_tests tests/test_box_filter.cpp)
+
+target_link_libraries(
+    lbm_box_filter_tests
+    PRIVATE
+        lbm::core
+        GTest::gtest_main
+)
+
+target_compile_features(
+    lbm_box_filter_tests
+    PRIVATE
+        cxx_std_23
+)
+
+set_target_properties(
+    lbm_box_filter_tests
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+)
+
+gtest_discover_tests(lbm_box_filter_tests)
