@@ -2605,7 +2605,14 @@ void write_filter_statistics_header(std::ofstream& file) {
     file << "step,time,filter_width,Delta_over_delta0,Delta_over_etaK,"
          << "Delta_over_etaB,mean_A,mean_Abar,mean_B,mean_Bbar,mean_AB,"
          << "mean_ABbar,mean_R,mean_Rbar_direct,mean_kABbar,"
-         << "max_abs_Rbar_identity_error,relative_Rbar_identity_error"
+         << "max_abs_Rbar_identity_error,relative_Rbar_identity_error,"
+         << "mean_AbarBbar,mean_tau_AB,rms_tau_AB,min_tau_AB,max_tau_AB,"
+         << "mean_R_exact_filtered,mean_R_LES_naive,mean_R_SGS,"
+         << "LES_reaction_efficiency,LES_reaction_overprediction_factor,"
+         << "SGS_reaction_fraction,SGS_reaction_magnitude_fraction,"
+         << "max_abs_reaction_decomposition_error,"
+         << "relative_reaction_decomposition_error,covariance_identity_error,"
+         << "LES_efficiency_identity_error"
          << std::endl;
     file.flush();
 }
@@ -2734,26 +2741,58 @@ void write_filter_statistics(
     long double sum_r{};
     long double sum_r_bar_direct{};
     long double sum_k_ab_bar{};
+    long double sum_a_bar_b_bar{};
+    long double sum_tau_ab{};
+    long double sum_tau_ab2{};
+    long double sum_r_les_naive{};
+    long double sum_r_sgs{};
     Real max_abs_identity_error{};
     Real max_abs_r_bar_direct{};
+    Real min_tau_ab{std::numeric_limits<Real>::max()};
+    Real max_tau_ab{std::numeric_limits<Real>::lowest()};
+    Real max_abs_reaction_decomposition_error{};
+    Real max_abs_r_exact_filtered{};
     bool reaction_finite = true;
 
-#pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar) reduction(max: max_abs_identity_error, max_abs_r_bar_direct) reduction(&&: reaction_finite)
+#pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar, sum_a_bar_b_bar, sum_tau_ab, sum_tau_ab2, sum_r_les_naive, sum_r_sgs) reduction(max: max_abs_identity_error, max_abs_r_bar_direct, max_tau_ab, max_abs_reaction_decomposition_error, max_abs_r_exact_filtered) reduction(min: min_tau_ab) reduction(&&: reaction_finite)
     for (std::size_t index = 0; index < cells; ++index) {
         const Real reaction = field_a[index];
         const Real reaction_bar_direct = field_b[index];
         const Real reaction_from_filtered_ab = config.k_react * filtered_ab[index];
         const Real identity_error =
             std::abs(reaction_bar_direct - reaction_from_filtered_ab);
+        const Real a_bar_b_bar = filtered_a[index] * filtered_b[index];
+        const Real tau_ab = filtered_ab[index] - a_bar_b_bar;
+        const Real reaction_les_naive = config.k_react * a_bar_b_bar;
+        const Real reaction_sgs = config.k_react * tau_ab;
+        const Real reaction_decomposition_error =
+            std::abs(reaction_from_filtered_ab - reaction_les_naive - reaction_sgs);
         sum_r += static_cast<long double>(reaction);
         sum_r_bar_direct += static_cast<long double>(reaction_bar_direct);
         sum_k_ab_bar += static_cast<long double>(reaction_from_filtered_ab);
+        sum_a_bar_b_bar += static_cast<long double>(a_bar_b_bar);
+        sum_tau_ab += static_cast<long double>(tau_ab);
+        sum_tau_ab2 += static_cast<long double>(tau_ab * tau_ab);
+        sum_r_les_naive += static_cast<long double>(reaction_les_naive);
+        sum_r_sgs += static_cast<long double>(reaction_sgs);
         max_abs_identity_error = std::max(max_abs_identity_error, identity_error);
         max_abs_r_bar_direct =
             std::max(max_abs_r_bar_direct, std::abs(reaction_bar_direct));
+        min_tau_ab = std::min(min_tau_ab, tau_ab);
+        max_tau_ab = std::max(max_tau_ab, tau_ab);
+        max_abs_reaction_decomposition_error = std::max(
+            max_abs_reaction_decomposition_error,
+            reaction_decomposition_error);
+        max_abs_r_exact_filtered = std::max(
+            max_abs_r_exact_filtered,
+            std::abs(reaction_from_filtered_ab));
         reaction_finite = reaction_finite && std::isfinite(reaction) &&
                           std::isfinite(reaction_bar_direct) &&
-                          std::isfinite(reaction_from_filtered_ab);
+                          std::isfinite(reaction_from_filtered_ab) &&
+                          std::isfinite(a_bar_b_bar) &&
+                          std::isfinite(tau_ab) &&
+                          std::isfinite(reaction_les_naive) &&
+                          std::isfinite(reaction_sgs);
     }
 
     if (!reaction_finite) {
@@ -2769,9 +2808,52 @@ void write_filter_statistics(
     const Real mean_r = static_cast<Real>(sum_r * inv_cells);
     const Real mean_r_bar_direct = static_cast<Real>(sum_r_bar_direct * inv_cells);
     const Real mean_k_ab_bar = static_cast<Real>(sum_k_ab_bar * inv_cells);
+    const Real mean_a_bar_b_bar = static_cast<Real>(sum_a_bar_b_bar * inv_cells);
+    const Real mean_tau_ab = static_cast<Real>(sum_tau_ab * inv_cells);
+    const Real rms_tau_ab =
+        std::sqrt(std::max(Real{}, static_cast<Real>(sum_tau_ab2 * inv_cells)));
+    const Real mean_r_exact_filtered = mean_k_ab_bar;
+    const Real mean_r_les_naive = static_cast<Real>(sum_r_les_naive * inv_cells);
+    const Real mean_r_sgs = static_cast<Real>(sum_r_sgs * inv_cells);
+    const Real les_reaction_efficiency =
+        mean_a_bar_b_bar > Real{} ? mean_ab_bar / mean_a_bar_b_bar : Real{};
+    const Real les_reaction_overprediction_factor =
+        mean_ab_bar > Real{} ? mean_a_bar_b_bar / mean_ab_bar : Real{};
+    const bool has_filtered_reaction =
+        std::abs(mean_r_exact_filtered) > std::numeric_limits<Real>::min();
+    const Real sgs_reaction_fraction =
+        has_filtered_reaction
+            ? mean_r_sgs / mean_r_exact_filtered
+            : Real{};
+    const Real sgs_reaction_magnitude_fraction =
+        has_filtered_reaction
+            ? std::abs(mean_r_sgs) / std::abs(mean_r_exact_filtered)
+            : Real{};
     const Real relative_identity_error =
         max_abs_identity_error /
         std::max(max_abs_r_bar_direct, std::numeric_limits<Real>::min());
+    const Real relative_reaction_decomposition_error =
+        max_abs_reaction_decomposition_error /
+        std::max(max_abs_r_exact_filtered, std::numeric_limits<Real>::min());
+    const Real covariance_identity_error =
+        std::abs(mean_ab_bar - mean_a_bar_b_bar - mean_tau_ab);
+    Real les_efficiency_identity_error{};
+    if (les_reaction_efficiency != Real{} &&
+        les_reaction_overprediction_factor != Real{}) {
+        les_efficiency_identity_error = std::max(
+            les_efficiency_identity_error,
+            std::abs(les_reaction_efficiency *
+                     les_reaction_overprediction_factor - Real{1}));
+    }
+    if (has_filtered_reaction &&
+        std::abs(Real{1} - sgs_reaction_fraction) >
+        std::numeric_limits<Real>::min()) {
+        const Real efficiency_from_sgs =
+            Real{1} / (Real{1} - sgs_reaction_fraction);
+        les_efficiency_identity_error = std::max(
+            les_efficiency_identity_error,
+            std::abs(les_reaction_efficiency - efficiency_from_sgs));
+    }
     const Real filter_delta = static_cast<Real>(config.filter_width);
     const Real delta_over_eta_k =
         std::isfinite(resolution.eta_k) && resolution.eta_k > Real{}
@@ -2799,6 +2881,22 @@ void write_filter_statistics(
          << ',' << std::format("{:.17g}", static_cast<double>(mean_k_ab_bar))
          << ',' << std::format("{:.17g}", static_cast<double>(max_abs_identity_error))
          << ',' << std::format("{:.17g}", static_cast<double>(relative_identity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_a_bar_b_bar))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_tau_ab))
+         << ',' << std::format("{:.17g}", static_cast<double>(rms_tau_ab))
+         << ',' << std::format("{:.17g}", static_cast<double>(min_tau_ab))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_tau_ab))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_r_exact_filtered))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_r_les_naive))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_r_sgs))
+         << ',' << std::format("{:.17g}", static_cast<double>(les_reaction_efficiency))
+         << ',' << std::format("{:.17g}", static_cast<double>(les_reaction_overprediction_factor))
+         << ',' << std::format("{:.17g}", static_cast<double>(sgs_reaction_fraction))
+         << ',' << std::format("{:.17g}", static_cast<double>(sgs_reaction_magnitude_fraction))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_abs_reaction_decomposition_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(relative_reaction_decomposition_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(covariance_identity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(les_efficiency_identity_error))
          << std::endl;
     file.flush();
 }
