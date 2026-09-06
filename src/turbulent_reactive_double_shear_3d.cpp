@@ -78,8 +78,6 @@ struct Config {
     int stat_freq{10};
     int screen_freq{100};
     int vtk_freq{1000};
-    int vtk_burst_length{1000};
-    int vtk_burst_freq{100};
     int profile_freq{};
     int pdf_freq{};
     int pdf_bins{128};
@@ -433,9 +431,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --steps <n>              Total simulation steps (default 10000)\n"
         << "  --stat_freq <n>          CSV statistics interval (default 10)\n"
         << "  --screen_freq <n>        Console telemetry interval (default 100)\n"
-        << "  --vtk_freq <n>           Regular binary VTK interval (default 1000)\n"
-        << "  --vtk_burst_length <n>   Steps covered by burst output (default 1000)\n"
-        << "  --vtk_burst_freq <n>     VTK interval during burst (default 100)\n"
+        << "  --vtk_freq <n>           Binary VTK interval; 0 disables output (default 1000)\n"
         << "  --profile_freq <n>       y-profile CSV interval; 0 disables output (default 0)\n"
         << "  --pdf_freq <n>           PDF output interval; 0 disables output (default 0)\n"
         << "  --pdf_bins <n>           Marginal PDF bin count (default 128)\n"
@@ -517,11 +513,8 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--screen_freq") {
             config.screen_freq = parse_int(flag, require_value(index, argc, argv));
         } else if (flag == "--vtk_freq") {
-            config.vtk_freq = parse_int(flag, require_value(index, argc, argv));
-        } else if (flag == "--vtk_burst_length") {
-            config.vtk_burst_length = parse_int(flag, require_value(index, argc, argv));
-        } else if (flag == "--vtk_burst_freq") {
-            config.vtk_burst_freq = parse_int(flag, require_value(index, argc, argv));
+            config.vtk_freq =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
         } else if (flag == "--profile_freq") {
             config.profile_freq =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
@@ -1138,9 +1131,8 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << "steps: " << config.steps
         << ", stat_freq: " << config.stat_freq
         << ", screen_freq: " << config.screen_freq << '\n'
-        << "VTK regular frequency: " << config.vtk_freq << '\n'
-        << "VTK burst length: " << config.vtk_burst_length
-        << ", VTK burst frequency: " << config.vtk_burst_freq << '\n'
+        << "VTK frequency: " << config.vtk_freq
+        << (config.vtk_freq > 0 ? "" : " (disabled)") << '\n'
         << "Profile frequency: " << config.profile_freq
         << (config.profile_freq > 0 ? "" : " (disabled)") << '\n'
         << "PDF frequency: " << config.pdf_freq
@@ -5212,12 +5204,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
-    const FlowDiagnostics initial_flow = flow;
     Real kinetic_energy_previous = flow.mean_kinetic_energy;
     Real latest_kinetic_energy_decay_rate{};
     ScalarBudgetDiagnostics scalar_budget{};
-    bool burst_active = false;
-    int burst_steps_recorded = 0;
 
     ScalarDiagnostics scalar =
         compute_scalar_diagnostics(config, species_a, species_b);
@@ -5246,7 +5235,9 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         scalar_budget,
         initial_mean_z,
         initial_mean_rho);
-    write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
+    if (config.vtk_freq > 0) {
+        write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
+    }
     if (config.profile_freq > 0) {
         write_y_profile_csv(config, profile_dir, 0, fluid, species_a, species_b);
     }
@@ -5313,14 +5304,6 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
             previous_var_z = scalar.var_z;
             previous_statistics_step = step;
 
-            if (!burst_active &&
-                flow.mean_kinetic_energy < Real{0.95} * initial_flow.mean_kinetic_energy) {
-                burst_active = true;
-                burst_steps_recorded = 0;
-                std::cout << "[VTK burst] triggered at step " << step
-                          << ", E_k=" << flow.mean_kinetic_energy << '\n'
-                          << std::flush;
-            }
         }
 
         if (step % config.screen_freq == 0) {
@@ -5335,7 +5318,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 compute_resolution_diagnostics(config, flow);
 
             std::cout << std::format(
-                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} theta: {:.6g} dZ: {:.6g} ReTheta: {:.6g} Mach: {:.6g} dE/dt: {:.6g} Burst: {} MLUPS: {:.6g}\n",
+                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} theta: {:.6g} dZ: {:.6g} ReTheta: {:.6g} Mach: {:.6g} dE/dt: {:.6g} MLUPS: {:.6g}\n",
                 step,
                 config.steps,
                 static_cast<double>(flow.u_max),
@@ -5354,21 +5337,12 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 static_cast<double>(flow.re_theta),
                 static_cast<double>(flow.mach_max),
                 static_cast<double>(latest_kinetic_energy_decay_rate),
-                burst_active ? "ON" : "OFF",
                 mlups)
                       << std::flush;
         }
 
-        const bool is_regular_vtk = step % config.vtk_freq == 0;
-        const bool is_burst_vtk =
-            burst_active &&
-            burst_steps_recorded < config.vtk_burst_length &&
-            step % config.vtk_burst_freq == 0;
-        if (is_regular_vtk || is_burst_vtk) {
+        if (config.vtk_freq > 0 && step % config.vtk_freq == 0) {
             write_binary_vtk(config, vtk_dir, step, fluid, species_a, species_b);
-        }
-        if (is_burst_vtk) {
-            ++burst_steps_recorded;
         }
         if (config.profile_freq > 0 && step % config.profile_freq == 0) {
             write_y_profile_csv(config, profile_dir, step, fluid, species_a, species_b);
@@ -5422,7 +5396,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     std::cout << "Simulation complete in " << elapsed.count()
               << " s.\nStatistics: statistics_double_shear_3d.csv"
               << "\nMetadata: metadata_double_shear_3d.json"
-              << "\nVTK directory: " << vtk_dir.string() << '\n'
+              << "\nVTK directory: "
+              << (config.vtk_freq > 0 ? vtk_dir.string() : "disabled") << '\n'
               << "Profile directory: "
               << (config.profile_freq > 0 ? profile_dir.string() : "disabled") << '\n'
               << "PDF directory: "
