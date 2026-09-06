@@ -94,6 +94,10 @@ struct Config {
     int filter_conditional_bins{64};
     Real filter_log_tau_zz_min{-12};
     Real filter_log_tau_zz_max{0};
+    int filter_pdf_bins{128};
+    int filter_joint_pdf_bins{128};
+    Real filter_tau_ab_min{-0.5};
+    Real filter_tau_ab_max{0.5};
 };
 
 struct PerturbationMode {
@@ -447,6 +451,10 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --filter_conditional_bins <n>  Filtered conditional bin count (default 64)\n"
         << "  --filter_log_tauZZ_min <v>     Minimum log10(tau_ZZ) conditional edge (default -12)\n"
         << "  --filter_log_tauZZ_max <v>     Maximum log10(tau_ZZ) conditional edge (default 0)\n"
+        << "  --filter_pdf_bins <n>          SGS marginal PDF bin count (default 128)\n"
+        << "  --filter_joint_pdf_bins <n>    SGS joint PDF bin count per dimension (default 128)\n"
+        << "  --filter_tauAB_min <v>         Minimum tau_AB PDF bin edge (default -0.5)\n"
+        << "  --filter_tauAB_max <v>         Maximum tau_AB PDF bin edge (default 0.5)\n"
         << "  --help                   Show this message\n";
 }
 
@@ -568,6 +576,17 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--filter_log_tauZZ_max") {
             config.filter_log_tau_zz_max =
                 parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_pdf_bins") {
+            config.filter_pdf_bins = parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_joint_pdf_bins") {
+            config.filter_joint_pdf_bins =
+                parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_tauAB_min") {
+            config.filter_tau_ab_min =
+                parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_tauAB_max") {
+            config.filter_tau_ab_max =
+                parse_real(flag, require_value(index, argc, argv));
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -633,6 +652,10 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     if (config.filter_log_tau_zz_max <= config.filter_log_tau_zz_min) {
         throw std::runtime_error(
             "--filter_log_tauZZ_max must be greater than --filter_log_tauZZ_min");
+    }
+    if (config.filter_tau_ab_max <= config.filter_tau_ab_min) {
+        throw std::runtime_error(
+            "--filter_tauAB_max must be greater than --filter_tauAB_min");
     }
 #ifndef LB_CUBE_HAS_FFTW
     if (config.spectrum_freq > 0) {
@@ -1138,6 +1161,10 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << "log10(tau_ZZ) conditional range: ["
         << config.filter_log_tau_zz_min << ", "
         << config.filter_log_tau_zz_max << "]\n"
+        << "Filter PDF bins: " << config.filter_pdf_bins
+        << ", joint filter PDF bins: " << config.filter_joint_pdf_bins << '\n'
+        << "tau_AB PDF range: [" << config.filter_tau_ab_min
+        << ", " << config.filter_tau_ab_max << "]\n"
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -1243,6 +1270,10 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"filter_conditional_bins\": " << config.filter_conditional_bins << ",\n"
         << "  \"filter_log_tauZZ_min\": " << json_number(config.filter_log_tau_zz_min) << ",\n"
         << "  \"filter_log_tauZZ_max\": " << json_number(config.filter_log_tau_zz_max) << ",\n"
+        << "  \"filter_pdf_bins\": " << config.filter_pdf_bins << ",\n"
+        << "  \"filter_joint_pdf_bins\": " << config.filter_joint_pdf_bins << ",\n"
+        << "  \"filter_tauAB_min\": " << json_number(config.filter_tau_ab_min) << ",\n"
+        << "  \"filter_tauAB_max\": " << json_number(config.filter_tau_ab_max) << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -2977,9 +3008,285 @@ void write_filter_conditional_outputs(
     }
 }
 
+void write_filter_pdf_outputs(
+    const Config& config,
+    const std::filesystem::path& output_root,
+    int step,
+    int filter_width_int,
+    const ResolutionDiagnostics& resolution,
+    Real mean_tau_ab,
+    Real mean_tau_zz,
+    Real min_tau_ab,
+    Real max_tau_ab,
+    Real min_tau_zz,
+    Real max_tau_zz,
+    const std::vector<std::uint64_t>& tau_ab_counts,
+    const std::vector<std::uint64_t>& log_tau_zz_counts,
+    const std::vector<std::uint64_t>& joint_counts,
+    std::uint64_t tau_ab_underflow_count,
+    std::uint64_t tau_ab_overflow_count,
+    std::uint64_t tau_zz_zero_count,
+    std::uint64_t tau_zz_underflow_count,
+    std::uint64_t tau_zz_overflow_count) {
+    const std::size_t cells = cell_count(config);
+    const long double inv_cells = 1.0L / static_cast<long double>(cells);
+    const int pdf_bins = config.filter_pdf_bins;
+    const int joint_bins = config.filter_joint_pdf_bins;
+    const Real tau_ab_min = config.filter_tau_ab_min;
+    const Real tau_ab_max = config.filter_tau_ab_max;
+    const Real tau_ab_bin_width =
+        (tau_ab_max - tau_ab_min) / static_cast<Real>(pdf_bins);
+    const Real joint_tau_ab_bin_width =
+        (tau_ab_max - tau_ab_min) / static_cast<Real>(joint_bins);
+    const Real log_tau_zz_min = config.filter_log_tau_zz_min;
+    const Real log_tau_zz_max = config.filter_log_tau_zz_max;
+    const Real log_tau_zz_bin_width =
+        (log_tau_zz_max - log_tau_zz_min) / static_cast<Real>(pdf_bins);
+    const Real joint_log_tau_zz_bin_width =
+        (log_tau_zz_max - log_tau_zz_min) / static_cast<Real>(joint_bins);
+    const Real filter_delta = static_cast<Real>(filter_width_int);
+    const Real delta_over_eta_k =
+        std::isfinite(resolution.eta_k) && resolution.eta_k > Real{}
+            ? filter_delta / resolution.eta_k
+            : Real{};
+    const Real delta_over_eta_b =
+        std::isfinite(resolution.eta_b) && resolution.eta_b > Real{}
+            ? filter_delta / resolution.eta_b
+            : Real{};
+
+    std::uint64_t tau_ab_included_count{};
+    std::uint64_t tau_zz_included_count{};
+    std::uint64_t joint_included_count{};
+    long double mean_tau_ab_from_pdf{};
+    long double mean_tau_zz_from_pdf{};
+    for (int bin = 0; bin < pdf_bins; ++bin) {
+        const Real tau_ab_center =
+            tau_ab_min + (static_cast<Real>(bin) + Real{0.5}) * tau_ab_bin_width;
+        const Real log_tau_zz_center =
+            log_tau_zz_min +
+            (static_cast<Real>(bin) + Real{0.5}) * log_tau_zz_bin_width;
+        const Real tau_zz_center = std::pow(Real{10}, log_tau_zz_center);
+        tau_ab_included_count += tau_ab_counts[bin];
+        tau_zz_included_count += log_tau_zz_counts[bin];
+        mean_tau_ab_from_pdf +=
+            static_cast<long double>(tau_ab_counts[bin]) * tau_ab_center;
+        mean_tau_zz_from_pdf +=
+            static_cast<long double>(log_tau_zz_counts[bin]) * tau_zz_center;
+    }
+    mean_tau_ab_from_pdf *= inv_cells;
+    mean_tau_zz_from_pdf *= inv_cells;
+    for (const std::uint64_t count : joint_counts) {
+        joint_included_count += count;
+    }
+
+    const std::uint64_t tau_ab_classified_count =
+        tau_ab_included_count + tau_ab_underflow_count + tau_ab_overflow_count;
+    const std::uint64_t tau_zz_classified_count =
+        tau_zz_included_count + tau_zz_zero_count +
+        tau_zz_underflow_count + tau_zz_overflow_count;
+    if (tau_ab_classified_count != cells) {
+        throw std::runtime_error(
+            "filtered tau_AB PDF counts do not sum to the domain size");
+    }
+    if (tau_zz_classified_count != cells) {
+        throw std::runtime_error(
+            "filtered tau_ZZ PDF counts do not sum to the domain size");
+    }
+
+    const Real tau_ab_underflow_fraction = static_cast<Real>(
+        static_cast<long double>(tau_ab_underflow_count) * inv_cells);
+    const Real tau_ab_overflow_fraction = static_cast<Real>(
+        static_cast<long double>(tau_ab_overflow_count) * inv_cells);
+    const Real tau_ab_included_probability = static_cast<Real>(
+        static_cast<long double>(tau_ab_included_count) * inv_cells);
+    const Real tau_zz_zero_fraction = static_cast<Real>(
+        static_cast<long double>(tau_zz_zero_count) * inv_cells);
+    const Real tau_zz_underflow_fraction = static_cast<Real>(
+        static_cast<long double>(tau_zz_underflow_count) * inv_cells);
+    const Real tau_zz_overflow_fraction = static_cast<Real>(
+        static_cast<long double>(tau_zz_overflow_count) * inv_cells);
+    const Real tau_zz_included_probability = static_cast<Real>(
+        static_cast<long double>(tau_zz_included_count) * inv_cells);
+    const Real joint_included_probability = static_cast<Real>(
+        static_cast<long double>(joint_included_count) * inv_cells);
+    const Real joint_excluded_probability =
+        Real{1} - joint_included_probability;
+    const Real tau_ab_normalization_error = std::abs(
+        tau_ab_included_probability + tau_ab_underflow_fraction +
+        tau_ab_overflow_fraction - Real{1});
+    const Real tau_zz_normalization_error = std::abs(
+        tau_zz_included_probability + tau_zz_zero_fraction +
+        tau_zz_underflow_fraction + tau_zz_overflow_fraction - Real{1});
+    const Real joint_probability_sum_error = std::abs(
+        joint_included_probability -
+        static_cast<Real>(static_cast<long double>(joint_included_count) *
+                          inv_cells));
+    const Real mean_tau_ab_pdf_error =
+        std::abs(static_cast<Real>(mean_tau_ab_from_pdf) - mean_tau_ab);
+    const Real mean_tau_zz_pdf_error =
+        std::abs(static_cast<Real>(mean_tau_zz_from_pdf) - mean_tau_zz);
+
+    const std::filesystem::path output_dir =
+        output_root / std::format("step_{:08}", step);
+    std::filesystem::create_directories(output_dir);
+    const std::string width_label = std::format("w{:04}", filter_width_int);
+
+    {
+        std::ofstream file{
+            output_dir / std::format("pdf_tauAB_{}.csv", width_label)};
+        if (!file) {
+            throw std::runtime_error("failed to open filtered tau_AB PDF output");
+        }
+        file << "tauAB_center,count,probability\n";
+        for (int bin = 0; bin < pdf_bins; ++bin) {
+            const Real center =
+                tau_ab_min +
+                (static_cast<Real>(bin) + Real{0.5}) * tau_ab_bin_width;
+            const Real probability = static_cast<Real>(
+                static_cast<long double>(tau_ab_counts[bin]) * inv_cells);
+            file << std::format("{:.17g}", static_cast<double>(center))
+                 << ',' << tau_ab_counts[bin]
+                 << ',' << std::format("{:.17g}", static_cast<double>(probability))
+                 << '\n';
+        }
+        file.flush();
+    }
+
+    {
+        std::ofstream file{
+            output_dir / std::format("pdf_log_tauZZ_{}.csv", width_label)};
+        if (!file) {
+            throw std::runtime_error(
+                "failed to open filtered tau_ZZ PDF output");
+        }
+        file << "log10_tauZZ_center,tauZZ_center,count,probability\n";
+        for (int bin = 0; bin < pdf_bins; ++bin) {
+            const Real log_center =
+                log_tau_zz_min +
+                (static_cast<Real>(bin) + Real{0.5}) * log_tau_zz_bin_width;
+            const Real tau_center = std::pow(Real{10}, log_center);
+            const Real probability = static_cast<Real>(
+                static_cast<long double>(log_tau_zz_counts[bin]) * inv_cells);
+            file << std::format("{:.17g}", static_cast<double>(log_center))
+                 << ',' << std::format("{:.17g}", static_cast<double>(tau_center))
+                 << ',' << log_tau_zz_counts[bin]
+                 << ',' << std::format("{:.17g}", static_cast<double>(probability))
+                 << '\n';
+        }
+        file.flush();
+    }
+
+    {
+        std::ofstream file{
+            output_dir /
+            std::format("joint_pdf_tauAB_log_tauZZ_{}.csv", width_label)};
+        if (!file) {
+            throw std::runtime_error(
+                "failed to open filtered tau_AB/tau_ZZ joint PDF output");
+        }
+        file << "tauAB_center,log10_tauZZ_center,tauZZ_center,count,probability\n";
+        for (int tau_bin = 0; tau_bin < joint_bins; ++tau_bin) {
+            const Real tau_center =
+                tau_ab_min +
+                (static_cast<Real>(tau_bin) + Real{0.5}) *
+                    joint_tau_ab_bin_width;
+            for (int log_bin = 0; log_bin < joint_bins; ++log_bin) {
+                const Real log_center =
+                    log_tau_zz_min +
+                    (static_cast<Real>(log_bin) + Real{0.5}) *
+                        joint_log_tau_zz_bin_width;
+                const Real tau_zz_center = std::pow(Real{10}, log_center);
+                const std::size_t index =
+                    static_cast<std::size_t>(tau_bin) *
+                    static_cast<std::size_t>(joint_bins) +
+                    static_cast<std::size_t>(log_bin);
+                const Real probability = static_cast<Real>(
+                    static_cast<long double>(joint_counts[index]) * inv_cells);
+                file << std::format("{:.17g}", static_cast<double>(tau_center))
+                     << ','
+                     << std::format("{:.17g}", static_cast<double>(log_center))
+                     << ','
+                     << std::format("{:.17g}", static_cast<double>(tau_zz_center))
+                     << ',' << joint_counts[index]
+                     << ','
+                     << std::format("{:.17g}", static_cast<double>(probability))
+                     << '\n';
+            }
+        }
+        file.flush();
+    }
+
+    {
+        std::ofstream metadata{
+            output_dir / std::format("filter_pdf_metadata_{}.json", width_label)};
+        if (!metadata) {
+            throw std::runtime_error(
+                "failed to open filtered SGS PDF metadata output");
+        }
+        metadata
+            << "{\n"
+            << "  \"step\": " << step << ",\n"
+            << "  \"time\": " << json_number(static_cast<Real>(step)) << ",\n"
+            << "  \"filter_width\": " << filter_width_int << ",\n"
+            << "  \"Delta_over_delta0\": "
+            << json_number(filter_delta / config.delta0) << ",\n"
+            << "  \"Delta_over_etaK\": " << json_number(delta_over_eta_k) << ",\n"
+            << "  \"Delta_over_etaB\": " << json_number(delta_over_eta_b) << ",\n"
+            << "  \"filter_pdf_bins\": " << pdf_bins << ",\n"
+            << "  \"filter_joint_pdf_bins\": " << joint_bins << ",\n"
+            << "  \"tauAB_range\": ["
+            << json_number(tau_ab_min) << ", " << json_number(tau_ab_max)
+            << "],\n"
+            << "  \"log10_tauZZ_range\": ["
+            << json_number(log_tau_zz_min) << ", "
+            << json_number(log_tau_zz_max) << "],\n"
+            << "  \"tauAB_underflow_fraction\": "
+            << json_number(tau_ab_underflow_fraction) << ",\n"
+            << "  \"tauAB_overflow_fraction\": "
+            << json_number(tau_ab_overflow_fraction) << ",\n"
+            << "  \"tauAB_included_probability\": "
+            << json_number(tau_ab_included_probability) << ",\n"
+            << "  \"tauZZ_zero_fraction\": "
+            << json_number(tau_zz_zero_fraction) << ",\n"
+            << "  \"tauZZ_underflow_fraction\": "
+            << json_number(tau_zz_underflow_fraction) << ",\n"
+            << "  \"tauZZ_overflow_fraction\": "
+            << json_number(tau_zz_overflow_fraction) << ",\n"
+            << "  \"tauZZ_included_probability\": "
+            << json_number(tau_zz_included_probability) << ",\n"
+            << "  \"joint_included_probability\": "
+            << json_number(joint_included_probability) << ",\n"
+            << "  \"joint_excluded_probability\": "
+            << json_number(joint_excluded_probability) << ",\n"
+            << "  \"tauAB_pdf_normalization_error\": "
+            << json_number(tau_ab_normalization_error) << ",\n"
+            << "  \"tauZZ_pdf_normalization_error\": "
+            << json_number(tau_zz_normalization_error) << ",\n"
+            << "  \"joint_probability_sum_error\": "
+            << json_number(joint_probability_sum_error) << ",\n"
+            << "  \"mean_tau_AB\": " << json_number(mean_tau_ab) << ",\n"
+            << "  \"mean_tau_AB_from_pdf\": "
+            << json_number(static_cast<Real>(mean_tau_ab_from_pdf)) << ",\n"
+            << "  \"mean_tau_AB_pdf_error\": "
+            << json_number(mean_tau_ab_pdf_error) << ",\n"
+            << "  \"mean_tau_ZZ\": " << json_number(mean_tau_zz) << ",\n"
+            << "  \"mean_tau_ZZ_from_pdf\": "
+            << json_number(static_cast<Real>(mean_tau_zz_from_pdf)) << ",\n"
+            << "  \"mean_tau_ZZ_pdf_error\": "
+            << json_number(mean_tau_zz_pdf_error) << ",\n"
+            << "  \"observed_tauAB_min\": " << json_number(min_tau_ab) << ",\n"
+            << "  \"observed_tauAB_max\": " << json_number(max_tau_ab) << ",\n"
+            << "  \"observed_tauZZ_min\": " << json_number(min_tau_zz) << ",\n"
+            << "  \"observed_tauZZ_max\": " << json_number(max_tau_zz) << "\n"
+            << "}\n";
+        metadata.flush();
+    }
+}
+
 void write_filter_statistics(
     std::ofstream& file,
     const std::filesystem::path& conditional_output_root,
+    const std::filesystem::path& pdf_output_root,
     const Config& config,
     int step,
     const ResolutionDiagnostics& resolution,
@@ -3389,6 +3696,25 @@ void write_filter_statistics(
     const Real log_tau_zz_bin_width =
         (log_tau_zz_max - log_tau_zz_min) /
         static_cast<Real>(conditional_bins);
+    const int pdf_bins = config.filter_pdf_bins;
+    const int joint_bins = config.filter_joint_pdf_bins;
+    const Real tau_ab_min = config.filter_tau_ab_min;
+    const Real tau_ab_max = config.filter_tau_ab_max;
+    const Real tau_ab_pdf_bin_width =
+        (tau_ab_max - tau_ab_min) / static_cast<Real>(pdf_bins);
+    const Real tau_ab_joint_bin_width =
+        (tau_ab_max - tau_ab_min) / static_cast<Real>(joint_bins);
+    const Real log_tau_zz_pdf_bin_width =
+        (log_tau_zz_max - log_tau_zz_min) / static_cast<Real>(pdf_bins);
+    const Real log_tau_zz_joint_bin_width =
+        (log_tau_zz_max - log_tau_zz_min) / static_cast<Real>(joint_bins);
+    std::vector<std::uint64_t> pdf_tau_ab_counts(pdf_bins);
+    std::vector<std::uint64_t> pdf_log_tau_zz_counts(pdf_bins);
+    std::vector<std::uint64_t> joint_tau_ab_tau_zz_counts(
+        static_cast<std::size_t>(joint_bins) *
+        static_cast<std::size_t>(joint_bins));
+    std::uint64_t tau_ab_underflow_count{};
+    std::uint64_t tau_ab_overflow_count{};
 
 #pragma omp parallel
     {
@@ -3402,6 +3728,13 @@ void write_filter_statistics(
         std::uint64_t local_tau_zz_overflow_count{};
         long double local_excluded_log_tau_zz_sum_tau_ab{};
         bool local_conditional_finite = true;
+        std::vector<std::uint64_t> local_pdf_tau_ab_counts(pdf_bins);
+        std::vector<std::uint64_t> local_pdf_log_tau_zz_counts(pdf_bins);
+        std::vector<std::uint64_t> local_joint_counts(
+            static_cast<std::size_t>(joint_bins) *
+            static_cast<std::size_t>(joint_bins));
+        std::uint64_t local_tau_ab_underflow_count{};
+        std::uint64_t local_tau_ab_overflow_count{};
 
 #pragma omp for schedule(static)
         for (std::size_t index = 0; index < cells; ++index) {
@@ -3429,6 +3762,24 @@ void write_filter_statistics(
             local_zbar_sum_rho_ab_sgs[z_bin] +=
                 static_cast<long double>(rho_ab_sgs);
 
+            bool tau_ab_inside = false;
+            int tau_ab_joint_bin = 0;
+            if (tau_ab < tau_ab_min) {
+                ++local_tau_ab_underflow_count;
+            } else if (tau_ab > tau_ab_max) {
+                ++local_tau_ab_overflow_count;
+            } else {
+                int tau_ab_pdf_bin = static_cast<int>(
+                    std::floor((tau_ab - tau_ab_min) / tau_ab_pdf_bin_width));
+                tau_ab_pdf_bin = std::clamp(tau_ab_pdf_bin, 0, pdf_bins - 1);
+                ++local_pdf_tau_ab_counts[tau_ab_pdf_bin];
+                tau_ab_joint_bin = static_cast<int>(
+                    std::floor((tau_ab - tau_ab_min) / tau_ab_joint_bin_width));
+                tau_ab_joint_bin =
+                    std::clamp(tau_ab_joint_bin, 0, joint_bins - 1);
+                tau_ab_inside = true;
+            }
+
             if (local_tau_zz <= Real{}) {
                 ++local_tau_zz_zero_count;
                 local_excluded_log_tau_zz_sum_tau_ab +=
@@ -3451,6 +3802,23 @@ void write_filter_statistics(
                     ++local_log_tau_zz_counts[log_bin];
                     local_log_tau_zz_sum_tau_ab[log_bin] +=
                         static_cast<long double>(tau_ab);
+                    int pdf_log_bin = static_cast<int>(
+                        std::floor((log_tau_zz - log_tau_zz_min) /
+                                   log_tau_zz_pdf_bin_width));
+                    pdf_log_bin = std::clamp(pdf_log_bin, 0, pdf_bins - 1);
+                    ++local_pdf_log_tau_zz_counts[pdf_log_bin];
+                    if (tau_ab_inside) {
+                        int joint_log_bin = static_cast<int>(
+                            std::floor((log_tau_zz - log_tau_zz_min) /
+                                       log_tau_zz_joint_bin_width));
+                        joint_log_bin =
+                            std::clamp(joint_log_bin, 0, joint_bins - 1);
+                        const std::size_t joint_index =
+                            static_cast<std::size_t>(tau_ab_joint_bin) *
+                            static_cast<std::size_t>(joint_bins) +
+                            static_cast<std::size_t>(joint_log_bin);
+                        ++local_joint_counts[joint_index];
+                    }
                 }
             }
 
@@ -3471,9 +3839,20 @@ void write_filter_statistics(
                 log_tau_zz_sum_tau_ab[bin] +=
                     local_log_tau_zz_sum_tau_ab[bin];
             }
+            for (int bin = 0; bin < pdf_bins; ++bin) {
+                pdf_tau_ab_counts[bin] += local_pdf_tau_ab_counts[bin];
+                pdf_log_tau_zz_counts[bin] +=
+                    local_pdf_log_tau_zz_counts[bin];
+            }
+            for (std::size_t bin = 0; bin < joint_tau_ab_tau_zz_counts.size();
+                 ++bin) {
+                joint_tau_ab_tau_zz_counts[bin] += local_joint_counts[bin];
+            }
             tau_zz_zero_count += local_tau_zz_zero_count;
             tau_zz_underflow_count += local_tau_zz_underflow_count;
             tau_zz_overflow_count += local_tau_zz_overflow_count;
+            tau_ab_underflow_count += local_tau_ab_underflow_count;
+            tau_ab_overflow_count += local_tau_ab_overflow_count;
             excluded_log_tau_zz_sum_tau_ab +=
                 local_excluded_log_tau_zz_sum_tau_ab;
             conditional_finite = conditional_finite && local_conditional_finite;
@@ -3500,6 +3879,26 @@ void write_filter_statistics(
         tau_zz_underflow_count,
         tau_zz_overflow_count,
         excluded_log_tau_zz_sum_tau_ab);
+    write_filter_pdf_outputs(
+        config,
+        pdf_output_root,
+        step,
+        filter_width_int,
+        resolution,
+        mean_tau_ab,
+        mean_tau_zz,
+        min_tau_ab,
+        max_tau_ab,
+        min_tau_zz,
+        max_tau_zz,
+        pdf_tau_ab_counts,
+        pdf_log_tau_zz_counts,
+        joint_tau_ab_tau_zz_counts,
+        tau_ab_underflow_count,
+        tau_ab_overflow_count,
+        tau_zz_zero_count,
+        tau_zz_underflow_count,
+        tau_zz_overflow_count);
 
     file << step
          << ',' << std::format("{:.17g}", static_cast<double>(step))
@@ -4809,6 +5208,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const std::filesystem::path spectrum_dir{"spectra_double_shear_3d"};
     const std::filesystem::path filter_conditional_dir{
         "filter_conditionals_double_shear_3d"};
+    const std::filesystem::path filter_pdf_dir{"filter_pdfs_double_shear_3d"};
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
@@ -4857,6 +5257,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         write_filter_statistics(
             filter_statistics,
             filter_conditional_dir,
+            filter_pdf_dir,
             config,
             0,
             compute_resolution_diagnostics(config, flow),
@@ -4981,6 +5382,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
             write_filter_statistics(
                 filter_statistics,
                 filter_conditional_dir,
+                filter_pdf_dir,
                 config,
                 step,
                 compute_resolution_diagnostics(config, filter_flow),
@@ -5034,6 +5436,10 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << "\nFilter conditionals: "
               << (filtering_enabled(config)
                       ? filter_conditional_dir.string()
+                      : "disabled")
+              << "\nFilter PDFs: "
+              << (filtering_enabled(config)
+                      ? filter_pdf_dir.string()
                       : "disabled")
               << '\n'
               << std::flush;
