@@ -89,7 +89,7 @@ struct Config {
     Real pdf_log_r_min{-12};
     Real pdf_log_r_max{2};
     int spectrum_freq{};
-    int filter_width{};
+    std::vector<int> filter_widths{};
     int filter_freq{};
 };
 
@@ -302,6 +302,78 @@ struct PdfCounters {
     return parsed;
 }
 
+[[nodiscard]] std::vector<int> parse_filter_widths(
+    std::string_view flag,
+    std::string_view value) {
+    if (value.empty()) {
+        throw std::runtime_error(std::format("{} must not be empty", flag));
+    }
+
+    std::vector<int> widths;
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        const std::size_t comma = value.find(',', begin);
+        const std::size_t end =
+            comma == std::string_view::npos ? value.size() : comma;
+        const std::string_view token = value.substr(begin, end - begin);
+        if (token.empty()) {
+            throw std::runtime_error(
+                std::format("{} contains an empty list entry", flag));
+        }
+
+        const int width = parse_int(flag, token);
+        if (width <= 0 || width % 2 == 0) {
+            throw std::runtime_error(
+                std::format("{} entries must be positive odd integers", flag));
+        }
+        widths.push_back(width);
+
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        begin = comma + 1;
+    }
+
+    std::ranges::sort(widths);
+    if (std::ranges::adjacent_find(widths) != widths.end()) {
+        throw std::runtime_error(
+            std::format("{} must not contain duplicate widths", flag));
+    }
+
+    return widths;
+}
+
+[[nodiscard]] bool filtering_enabled(const Config& config) {
+    return !config.filter_widths.empty();
+}
+
+[[nodiscard]] std::string filter_widths_to_string(const Config& config) {
+    if (config.filter_widths.empty()) {
+        return "disabled";
+    }
+
+    std::string result;
+    for (std::size_t i = 0; i < config.filter_widths.size(); ++i) {
+        if (i > 0) {
+            result += ',';
+        }
+        result += std::to_string(config.filter_widths[i]);
+    }
+    return result;
+}
+
+[[nodiscard]] std::string filter_widths_to_json(const Config& config) {
+    std::string result = "[";
+    for (std::size_t i = 0; i < config.filter_widths.size(); ++i) {
+        if (i > 0) {
+            result += ", ";
+        }
+        result += std::to_string(config.filter_widths[i]);
+    }
+    result += "]";
+    return result;
+}
+
 [[nodiscard]] std::uint64_t parse_uint64(std::string_view flag, std::string_view value) {
     std::size_t parsed_chars{};
     const std::uint64_t parsed = std::stoull(std::string{value}, &parsed_chars);
@@ -366,7 +438,8 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --pdf_log_R_min <v>      Minimum log10(R*) bin edge (default -12)\n"
         << "  --pdf_log_R_max <v>      Maximum log10(R*) bin edge (default 2)\n"
         << "  --spectrum_freq <n>      2D x-z scalar-spectrum interval; 0 disables output (default 0)\n"
-        << "  --filter_width <n>       Diagnostic scalar box-filter width; 0 disables filtering (default 0)\n"
+        << "  --filter_widths <list>   Comma-separated odd box-filter widths, e.g. 3,5,9 (default disabled)\n"
+        << "  --filter_width <n>       Backward-compatible single-width alias; reject with --filter_widths\n"
         << "  --filter_freq <n>        Diagnostic scalar filtering interval; 0 disables filtering (default 0)\n"
         << "  --help                   Show this message\n";
 }
@@ -374,6 +447,8 @@ void print_usage(std::ostream& stream, std::string_view executable) {
 [[nodiscard]] Config parse_arguments(int argc, char** argv) {
     Config config{};
     lbm::double_shear::ExplicitParameterFlags explicit_parameters{};
+    bool filter_widths_explicit = false;
+    bool legacy_filter_width_explicit = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view flag{argv[index]};
@@ -454,9 +529,27 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--spectrum_freq") {
             config.spectrum_freq =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_widths") {
+            if (filter_widths_explicit) {
+                throw std::runtime_error("--filter_widths was specified more than once");
+            }
+            config.filter_widths =
+                parse_filter_widths(flag, require_value(index, argc, argv));
+            filter_widths_explicit = true;
         } else if (flag == "--filter_width") {
-            config.filter_width =
+            if (legacy_filter_width_explicit) {
+                throw std::runtime_error("--filter_width was specified more than once");
+            }
+            const int width =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
+            if (width > 0 && width % 2 == 0) {
+                throw std::runtime_error(
+                    "--filter_width must be 0 or a positive odd integer");
+            }
+            if (width > 0) {
+                config.filter_widths = {width};
+            }
+            legacy_filter_width_explicit = true;
         } else if (flag == "--filter_freq") {
             config.filter_freq =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
@@ -514,12 +607,13 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     if (config.pdf_log_r_max <= config.pdf_log_r_min) {
         throw std::runtime_error("--pdf_log_R_max must be greater than --pdf_log_R_min");
     }
-    if ((config.filter_width > 0) != (config.filter_freq > 0)) {
+    if (filter_widths_explicit && legacy_filter_width_explicit) {
         throw std::runtime_error(
-            "--filter_width and --filter_freq must either both be positive or both be zero");
+            "choose either --filter_widths or the backward-compatible --filter_width alias, not both");
     }
-    if (config.filter_width > 0 && config.filter_width % 2 == 0) {
-        throw std::runtime_error("--filter_width must be 0 or a positive odd integer");
+    if (filtering_enabled(config) != (config.filter_freq > 0)) {
+        throw std::runtime_error(
+            "--filter_widths/--filter_width and --filter_freq must either both enable filtering or both be disabled");
     }
 #ifndef LB_CUBE_HAS_FFTW
     if (config.spectrum_freq > 0) {
@@ -1017,8 +1111,8 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << ", " << config.pdf_log_r_max << "]\n"
         << "Spectrum frequency: " << config.spectrum_freq
         << (config.spectrum_freq > 0 ? "" : " (disabled)") << '\n'
-        << "Filter width: " << config.filter_width
-        << (config.filter_width > 0 ? "" : " (disabled)") << '\n'
+        << "Filter widths: " << filter_widths_to_string(config)
+        << (filtering_enabled(config) ? "" : " (disabled)") << '\n'
         << "Filter frequency: " << config.filter_freq
         << (config.filter_freq > 0 ? "" : " (disabled)") << '\n'
         << "Initial perturbation:\n"
@@ -1119,7 +1213,9 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"pdf_log_R_min\": " << json_number(config.pdf_log_r_min) << ",\n"
         << "  \"pdf_log_R_max\": " << json_number(config.pdf_log_r_max) << ",\n"
         << "  \"spectrum_freq\": " << config.spectrum_freq << ",\n"
-        << "  \"filter_width\": " << config.filter_width << ",\n"
+        << "  \"filter_width\": "
+        << (config.filter_widths.empty() ? 0 : config.filter_widths.front()) << ",\n"
+        << "  \"filter_widths\": " << filter_widths_to_json(config) << ",\n"
         << "  \"filter_freq\": " << config.filter_freq << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
@@ -2652,9 +2748,11 @@ void write_filter_statistics(
     std::vector<Real> field_a(cells);
     std::vector<Real> field_b(cells);
     std::vector<Real> field_ab(cells);
+    std::vector<Real> field_r(cells);
     std::vector<Real> filtered_a(cells);
     std::vector<Real> filtered_b(cells);
     std::vector<Real> filtered_ab(cells);
+    std::vector<Real> filtered_r(cells);
     std::vector<Real> filter_tmp1(cells);
     std::vector<Real> filter_tmp2(cells);
 
@@ -2673,6 +2771,7 @@ void write_filter_statistics(
                 field_a[index] = concentration_a;
                 field_b[index] = concentration_b;
                 field_ab[index] = concentration_ab;
+                field_r[index] = config.k_react * concentration_ab;
                 sum_a += static_cast<long double>(concentration_a);
                 sum_b += static_cast<long double>(concentration_b);
                 sum_ab += static_cast<long double>(concentration_ab);
@@ -2680,7 +2779,8 @@ void write_filter_statistics(
         }
     }
 
-    const auto filter_width = static_cast<std::size_t>(config.filter_width);
+    for (const int filter_width_int : config.filter_widths) {
+    const auto filter_width = static_cast<std::size_t>(filter_width_int);
     lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_a), config),
         scalar_field_view(filtered_a, config),
@@ -2714,7 +2814,7 @@ void write_filter_statistics(
         all_finite = all_finite && std::isfinite(filtered_a[index]) &&
                      std::isfinite(filtered_b[index]) &&
                      std::isfinite(filtered_ab[index]);
-        if (config.filter_width == 1) {
+        if (filter_width_int == 1) {
             max_width_one_identity_error = std::max(
                 max_width_one_identity_error,
                 std::abs(filtered_a[index] - field_a[index]));
@@ -2730,20 +2830,13 @@ void write_filter_statistics(
     if (!all_finite) {
         throw std::runtime_error("non-finite value detected in filtered scalar fields");
     }
-    if (config.filter_width == 1 && max_width_one_identity_error != Real{}) {
+    if (filter_width_int == 1 && max_width_one_identity_error != Real{}) {
         throw std::runtime_error("filter_width=1 did not reproduce scalar fields exactly");
     }
 
-    // Reuse `field_a` as the unfiltered reaction field and `field_b` as
-    // Rbar_direct. This avoids two extra full-domain temporaries while keeping
-    // the diagnostic out-of-place for each individual filter application.
-#pragma omp parallel for schedule(static)
-    for (std::size_t index = 0; index < cells; ++index) {
-        field_a[index] = config.k_react * field_ab[index];
-    }
     lbm::box_filter_3d_separable<Real>(
-        scalar_field_view(std::as_const(field_a), config),
-        scalar_field_view(field_b, config),
+        scalar_field_view(std::as_const(field_r), config),
+        scalar_field_view(filtered_r, config),
         filter_width,
         filter_tmp1,
         filter_tmp2);
@@ -2766,8 +2859,8 @@ void write_filter_statistics(
 
 #pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar, sum_a_bar_b_bar, sum_tau_ab, sum_tau_ab2, sum_r_les_naive, sum_r_sgs) reduction(max: max_abs_identity_error, max_abs_r_bar_direct, max_tau_ab, max_abs_reaction_decomposition_error, max_abs_r_exact_filtered) reduction(min: min_tau_ab) reduction(&&: reaction_finite)
     for (std::size_t index = 0; index < cells; ++index) {
-        const Real reaction = field_a[index];
-        const Real reaction_bar_direct = field_b[index];
+        const Real reaction = field_r[index];
+        const Real reaction_bar_direct = filtered_r[index];
         const Real reaction_from_filtered_ab = config.k_react * filtered_ab[index];
         const Real identity_error =
             std::abs(reaction_bar_direct - reaction_from_filtered_ab);
@@ -2864,7 +2957,7 @@ void write_filter_statistics(
             les_efficiency_identity_error,
             std::abs(les_reaction_efficiency - efficiency_from_sgs));
     }
-    const Real filter_delta = static_cast<Real>(config.filter_width);
+    const Real filter_delta = static_cast<Real>(filter_width_int);
     const Real delta_over_eta_k =
         std::isfinite(resolution.eta_k) && resolution.eta_k > Real{}
             ? filter_delta / resolution.eta_k
@@ -2876,7 +2969,7 @@ void write_filter_statistics(
 
     file << step
          << ',' << std::format("{:.17g}", static_cast<double>(step))
-         << ',' << config.filter_width
+         << ',' << filter_width_int
          << ',' << std::format("{:.17g}", static_cast<double>(filter_delta / config.delta0))
          << ',' << std::format("{:.17g}", static_cast<double>(delta_over_eta_k))
          << ',' << std::format("{:.17g}", static_cast<double>(delta_over_eta_b))
@@ -2908,6 +3001,7 @@ void write_filter_statistics(
          << ',' << std::format("{:.17g}", static_cast<double>(covariance_identity_error))
          << ',' << std::format("{:.17g}", static_cast<double>(les_efficiency_identity_error))
          << std::endl;
+    }
     file.flush();
 }
 
@@ -4143,7 +4237,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     statistics.flush();
 
     std::ofstream filter_statistics;
-    if (config.filter_width > 0) {
+    if (filtering_enabled(config)) {
         filter_statistics.open("filter_statistics_double_shear_3d.csv");
         if (!filter_statistics) {
             throw std::runtime_error(
@@ -4202,7 +4296,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     if (config.pdf_freq > 0) {
         write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
     }
-    if (config.filter_width > 0) {
+    if (filtering_enabled(config)) {
         write_filter_statistics(
             filter_statistics,
             config,
@@ -4323,7 +4417,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         if (config.pdf_freq > 0 && step % config.pdf_freq == 0) {
             write_pdf_outputs(config, pdf_dir, step, species_a, species_b);
         }
-        if (config.filter_width > 0 && step % config.filter_freq == 0) {
+        if (filtering_enabled(config) && step % config.filter_freq == 0) {
             const FlowDiagnostics filter_flow =
                 step % config.stat_freq == 0 ? flow : compute_flow_diagnostics(config, fluid);
             write_filter_statistics(
@@ -4375,7 +4469,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << "Spectrum directory: "
               << (config.spectrum_freq > 0 ? spectrum_dir.string() : "disabled") << '\n'
               << "Filter statistics: "
-              << (config.filter_width > 0
+              << (filtering_enabled(config)
                       ? "filter_statistics_double_shear_3d.csv"
                       : "disabled")
               << '\n'
