@@ -2389,6 +2389,9 @@ void write_scalar_spectrum_outputs(
     std::vector<double> velocity_plane_x(real_plane_size);
     std::vector<double> velocity_plane_y(real_plane_size);
     std::vector<double> velocity_plane_z(real_plane_size);
+    std::vector<double> reactant_plane_a(real_plane_size);
+    std::vector<double> reactant_plane_b(real_plane_size);
+    std::vector<std::array<double, 2>> reactant_a_hat(spectrum_size);
     fftw_complex* output = static_cast<fftw_complex*>(
         fftw_malloc(sizeof(fftw_complex) * spectrum_size));
     if (output == nullptr) {
@@ -2406,18 +2409,25 @@ void write_scalar_spectrum_outputs(
     std::vector<long double> weighted_spectrum_ux(spectrum_size, 0.0L);
     std::vector<long double> weighted_spectrum_uy(spectrum_size, 0.0L);
     std::vector<long double> weighted_spectrum_uz(spectrum_size, 0.0L);
+    std::vector<long double> weighted_cospectrum_ab(spectrum_size, 0.0L);
     long double sum_weights = 0.0L;
     long double weighted_scalar_variance = 0.0L;
     long double weighted_velocity_energy = 0.0L;
     long double weighted_velocity_energy_x = 0.0L;
     long double weighted_velocity_energy_y = 0.0L;
     long double weighted_velocity_energy_z = 0.0L;
+    long double weighted_cov_ab = 0.0L;
     const long double inv_plane =
         1.0L / static_cast<long double>(real_plane_size);
     const long double inv_fft_norm =
         1.0L / static_cast<long double>(real_plane_size * real_plane_size);
+    const auto hermitian_multiplicity = [nz = config.nz](std::size_t kz) {
+        const bool has_distinct_negative_kz =
+            kz != 0 && !(nz % 2 == 0 && kz == nz / 2);
+        return has_distinct_negative_kz ? 2.0L : 1.0L;
+    };
     const auto accumulate_transformed_energy =
-        [complex_z, &output, inv_fft_norm, nz = config.nz](
+        [complex_z, &output, inv_fft_norm, &hermitian_multiplicity](
             Real weight,
             std::vector<long double>& spectrum) {
             const std::size_t nx = spectrum.size() / complex_z;
@@ -2428,19 +2438,52 @@ void write_scalar_spectrum_outputs(
                     const double imag = output[index][1];
                     const long double magnitude2 =
                         static_cast<long double>(real * real + imag * imag);
-                    const bool has_distinct_negative_kz =
-                        kz != 0 && !(nz % 2 == 0 && kz == nz / 2);
-                    const long double hermitian_multiplicity =
-                        has_distinct_negative_kz ? 2.0L : 1.0L;
                     const long double energy =
-                        0.5L * hermitian_multiplicity * magnitude2 * inv_fft_norm;
+                        0.5L * hermitian_multiplicity(kz) * magnitude2 *
+                        inv_fft_norm;
                     spectrum[index] += static_cast<long double>(weight) * energy;
+                }
+            }
+        };
+    const auto store_current_transform =
+        [complex_z, &output, &reactant_a_hat]() {
+            const std::size_t nx = reactant_a_hat.size() / complex_z;
+            for (std::size_t kx = 0; kx < nx; ++kx) {
+                for (std::size_t kz = 0; kz < complex_z; ++kz) {
+                    const std::size_t index = kx * complex_z + kz;
+                    reactant_a_hat[index] = {output[index][0], output[index][1]};
+                }
+            }
+        };
+    const auto accumulate_transformed_covariance =
+        [complex_z,
+         &output,
+         inv_fft_norm,
+         &hermitian_multiplicity,
+         &reactant_a_hat](Real weight, std::vector<long double>& cospectrum) {
+            const std::size_t nx = cospectrum.size() / complex_z;
+            for (std::size_t kx = 0; kx < nx; ++kx) {
+                for (std::size_t kz = 0; kz < complex_z; ++kz) {
+                    const std::size_t index = kx * complex_z + kz;
+                    const long double ar =
+                        static_cast<long double>(reactant_a_hat[index][0]);
+                    const long double ai =
+                        static_cast<long double>(reactant_a_hat[index][1]);
+                    const long double br = static_cast<long double>(output[index][0]);
+                    const long double bi = static_cast<long double>(output[index][1]);
+                    const long double real_cross = ar * br + ai * bi;
+                    const long double covariance =
+                        hermitian_multiplicity(kz) * real_cross * inv_fft_norm;
+                    cospectrum[index] +=
+                        static_cast<long double>(weight) * covariance;
                 }
             }
         };
 
     for (std::size_t y = 0; y < config.ny; ++y) {
         long double sum_z = 0.0L;
+        long double sum_ca = 0.0L;
+        long double sum_cb = 0.0L;
         long double sum_ux = 0.0L;
         long double sum_uy = 0.0L;
         long double sum_uz = 0.0L;
@@ -2454,6 +2497,8 @@ void write_scalar_spectrum_outputs(
                 const lbm::MacroState<FluidLattice, Real> macro =
                     macro_at<FluidLattice>(fluid_view, x, y, z);
                 sum_z += static_cast<long double>(mixture_fraction);
+                sum_ca += static_cast<long double>(concentration_a);
+                sum_cb += static_cast<long double>(concentration_b);
                 sum_ux += static_cast<long double>(macro.velocity[0]);
                 sum_uy += static_cast<long double>(macro.velocity[1]);
                 sum_uz += static_cast<long double>(macro.velocity[2]);
@@ -2461,6 +2506,8 @@ void write_scalar_spectrum_outputs(
         }
 
         const Real zbar = static_cast<Real>(sum_z * inv_plane);
+        const Real abar = static_cast<Real>(sum_ca * inv_plane);
+        const Real bbar = static_cast<Real>(sum_cb * inv_plane);
         const Real uxbar = static_cast<Real>(sum_ux * inv_plane);
         const Real uybar = static_cast<Real>(sum_uy * inv_plane);
         const Real uzbar = static_cast<Real>(sum_uz * inv_plane);
@@ -2471,6 +2518,7 @@ void write_scalar_spectrum_outputs(
         long double plane_uxprime2 = 0.0L;
         long double plane_uyprime2 = 0.0L;
         long double plane_uzprime2 = 0.0L;
+        long double plane_abprime = 0.0L;
         for (std::size_t x = 0; x < config.nx; ++x) {
             for (std::size_t z = 0; z < config.nz; ++z) {
                 const std::size_t plane_index = x * config.nz + z;
@@ -2485,15 +2533,20 @@ void write_scalar_spectrum_outputs(
                 const Real uxprime = macro.velocity[0] - uxbar;
                 const Real uyprime = macro.velocity[1] - uybar;
                 const Real uzprime = macro.velocity[2] - uzbar;
+                const Real aprime = concentration_a - abar;
+                const Real bprime = concentration_b - bbar;
 
                 input[plane_index] = static_cast<double>(zprime);
                 velocity_plane_x[plane_index] = static_cast<double>(uxprime);
                 velocity_plane_y[plane_index] = static_cast<double>(uyprime);
                 velocity_plane_z[plane_index] = static_cast<double>(uzprime);
+                reactant_plane_a[plane_index] = static_cast<double>(aprime);
+                reactant_plane_b[plane_index] = static_cast<double>(bprime);
                 plane_zprime2 += static_cast<long double>(zprime * zprime);
                 plane_uxprime2 += static_cast<long double>(uxprime * uxprime);
                 plane_uyprime2 += static_cast<long double>(uyprime * uyprime);
                 plane_uzprime2 += static_cast<long double>(uzprime * uzprime);
+                plane_abprime += static_cast<long double>(aprime * bprime);
             }
         }
 
@@ -2508,6 +2561,8 @@ void write_scalar_spectrum_outputs(
         weighted_velocity_energy_z += static_cast<long double>(weight) * plane_euz;
         weighted_velocity_energy +=
             static_cast<long double>(weight) * (plane_eux + plane_euy + plane_euz);
+        weighted_cov_ab +=
+            static_cast<long double>(weight) * plane_abprime * inv_plane;
 
         fftw_execute(plan);
         accumulate_transformed_energy(weight, weighted_spectrum);
@@ -2523,6 +2578,14 @@ void write_scalar_spectrum_outputs(
         input = velocity_plane_z;
         fftw_execute(plan);
         accumulate_transformed_energy(weight, weighted_spectrum_uz);
+
+        input = reactant_plane_a;
+        fftw_execute(plan);
+        store_current_transform();
+
+        input = reactant_plane_b;
+        fftw_execute(plan);
+        accumulate_transformed_covariance(weight, weighted_cospectrum_ab);
     }
 
     if (sum_weights > 0.0L) {
@@ -2538,17 +2601,22 @@ void write_scalar_spectrum_outputs(
         for (long double& value : weighted_spectrum_uz) {
             value /= sum_weights;
         }
+        for (long double& value : weighted_cospectrum_ab) {
+            value /= sum_weights;
+        }
         weighted_scalar_variance /= sum_weights;
         weighted_velocity_energy /= sum_weights;
         weighted_velocity_energy_x /= sum_weights;
         weighted_velocity_energy_y /= sum_weights;
         weighted_velocity_energy_z /= sum_weights;
+        weighted_cov_ab /= sum_weights;
     } else {
         weighted_scalar_variance = 0.0L;
         weighted_velocity_energy = 0.0L;
         weighted_velocity_energy_x = 0.0L;
         weighted_velocity_energy_y = 0.0L;
         weighted_velocity_energy_z = 0.0L;
+        weighted_cov_ab = 0.0L;
     }
 
     long double spectral_scalar_variance = 0.0L;
@@ -2572,9 +2640,19 @@ void write_scalar_spectrum_outputs(
         spectral_velocity_energy += weighted_spectrum_u[index];
     }
 
+    long double spectral_cov_ab = 0.0L;
+    long double spectral_cov_ab_abs_sum = 0.0L;
+    for (long double value : weighted_cospectrum_ab) {
+        spectral_cov_ab += value;
+        spectral_cov_ab_abs_sum += std::abs(value);
+    }
+
     std::vector<long double> spectrum_kx(config.nx, 0.0L);
     std::vector<long double> spectrum_kz(complex_z, 0.0L);
     std::vector<long double> spectrum_kh{};
+    std::vector<long double> cospectrum_ab_kx(config.nx, 0.0L);
+    std::vector<long double> cospectrum_ab_kz(complex_z, 0.0L);
+    std::vector<long double> cospectrum_ab_kh{};
     std::vector<long double> spectrum_ux_kx(config.nx, 0.0L);
     std::vector<long double> spectrum_uy_kx(config.nx, 0.0L);
     std::vector<long double> spectrum_uz_kx(config.nx, 0.0L);
@@ -2608,11 +2686,14 @@ void write_scalar_spectrum_outputs(
             const long double energy_uy = weighted_spectrum_uy[index];
             const long double energy_uz = weighted_spectrum_uz[index];
             const long double energy_u = weighted_spectrum_u[index];
+            const long double covariance = weighted_cospectrum_ab[index];
             const std::size_t shell =
                 static_cast<std::size_t>(std::floor(kh / radial_dk + Real{0.5}));
 
             spectrum_kx[i] += energy;
             spectrum_kz[kz_index] += energy;
+            cospectrum_ab_kx[i] += covariance;
+            cospectrum_ab_kz[kz_index] += covariance;
             spectrum_ux_kx[i] += energy_ux;
             spectrum_uy_kx[i] += energy_uy;
             spectrum_uz_kx[i] += energy_uz;
@@ -2623,6 +2704,7 @@ void write_scalar_spectrum_outputs(
             spectrum_u_kz[kz_index] += energy_u;
             if (shell >= spectrum_kh.size()) {
                 spectrum_kh.resize(shell + 1, 0.0L);
+                cospectrum_ab_kh.resize(shell + 1, 0.0L);
                 spectrum_ux_kh.resize(shell + 1, 0.0L);
                 spectrum_uy_kh.resize(shell + 1, 0.0L);
                 spectrum_uz_kh.resize(shell + 1, 0.0L);
@@ -2630,6 +2712,7 @@ void write_scalar_spectrum_outputs(
                 radial_mode_count.resize(shell + 1, 0);
             }
             spectrum_kh[shell] += energy;
+            cospectrum_ab_kh[shell] += covariance;
             spectrum_ux_kh[shell] += energy_ux;
             spectrum_uy_kh[shell] += energy_uy;
             spectrum_uz_kh[shell] += energy_uz;
@@ -2648,6 +2731,9 @@ void write_scalar_spectrum_outputs(
     const long double sum_spectrum_kx = sum_long_double(spectrum_kx);
     const long double sum_spectrum_kz = sum_long_double(spectrum_kz);
     const long double sum_spectrum_kh = sum_long_double(spectrum_kh);
+    const long double sum_cospectrum_ab_kx = sum_long_double(cospectrum_ab_kx);
+    const long double sum_cospectrum_ab_kz = sum_long_double(cospectrum_ab_kz);
+    const long double sum_cospectrum_ab_kh = sum_long_double(cospectrum_ab_kh);
     const long double sum_velocity_spectrum_kx = sum_long_double(spectrum_u_kx);
     const long double sum_velocity_spectrum_kz = sum_long_double(spectrum_u_kz);
     const long double sum_velocity_spectrum_kh = sum_long_double(spectrum_u_kh);
@@ -2700,6 +2786,27 @@ void write_scalar_spectrum_outputs(
         velocity_relative_difference_from_2d_sum(sum_velocity_spectrum_kz);
     const Real velocity_kh_sum_relative_difference =
         velocity_relative_difference_from_2d_sum(sum_velocity_spectrum_kh);
+    long double covariance_error_scale = std::abs(weighted_cov_ab);
+    covariance_error_scale =
+        std::max(covariance_error_scale, spectral_cov_ab_abs_sum);
+    covariance_error_scale =
+        std::max(covariance_error_scale, static_cast<long double>(small_value));
+    const long double covariance_parseval_absolute_error =
+        std::abs(spectral_cov_ab - weighted_cov_ab);
+    const Real covariance_parseval_normalized_error =
+        static_cast<Real>(covariance_parseval_absolute_error / covariance_error_scale);
+    const Real kx_covariance_conservation_error =
+        static_cast<Real>(
+            std::abs(sum_cospectrum_ab_kx - spectral_cov_ab) /
+            covariance_error_scale);
+    const Real kz_covariance_conservation_error =
+        static_cast<Real>(
+            std::abs(sum_cospectrum_ab_kz - spectral_cov_ab) /
+            covariance_error_scale);
+    const Real kh_covariance_conservation_error =
+        static_cast<Real>(
+            std::abs(sum_cospectrum_ab_kh - spectral_cov_ab) /
+            covariance_error_scale);
     const auto multiply_if_finite = [](Real value, Real scale) {
         return std::isfinite(scale) ? value * scale
                                     : std::numeric_limits<Real>::infinity();
@@ -2958,6 +3065,121 @@ void write_scalar_spectrum_outputs(
     velocity_kh_file.flush();
     velocity_kh_file.close();
 
+    std::ofstream cospectrum_2d_file{output_dir / "cospectrum_AB_2D.csv"};
+    if (!cospectrum_2d_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "cospectrum_AB_2D.csv").string());
+    }
+    cospectrum_2d_file << "kx_index,kz_index,kx,kz,kh,C_AB\n";
+    for (std::size_t i = 0; i < config.nx; ++i) {
+        const int kx_index =
+            i <= config.nx / 2 ? static_cast<int>(i)
+                               : static_cast<int>(i) - static_cast<int>(config.nx);
+        const Real kx =
+            Real{2} * std::numbers::pi_v<Real> * static_cast<Real>(kx_index) /
+            static_cast<Real>(config.nx);
+        for (std::size_t kz_index = 0; kz_index < complex_z; ++kz_index) {
+            const Real kz =
+                Real{2} * std::numbers::pi_v<Real> *
+                static_cast<Real>(kz_index) / static_cast<Real>(config.nz);
+            const Real kh = std::sqrt(kx * kx + kz * kz);
+            const std::size_t index = i * complex_z + kz_index;
+            cospectrum_2d_file
+                << kx_index << ',' << kz_index
+                << ',' << std::format("{:.17g}", static_cast<double>(kx))
+                << ',' << std::format("{:.17g}", static_cast<double>(kz))
+                << ',' << std::format("{:.17g}", static_cast<double>(kh))
+                << ',' << std::format("{:.17g}", static_cast<double>(
+                       static_cast<Real>(weighted_cospectrum_ab[index])))
+                << '\n';
+        }
+    }
+    cospectrum_2d_file.flush();
+    cospectrum_2d_file.close();
+
+    std::ofstream cospectrum_kx_file{output_dir / "cospectrum_AB_kx.csv"};
+    if (!cospectrum_kx_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "cospectrum_AB_kx.csv").string());
+    }
+    cospectrum_kx_file << "kx_index,kx,kx_etaK,kx_etaB,C_AB\n";
+    for (std::size_t i = 0; i < config.nx; ++i) {
+        const int kx_index =
+            i <= config.nx / 2 ? static_cast<int>(i)
+                               : static_cast<int>(i) - static_cast<int>(config.nx);
+        const Real kx =
+            Real{2} * std::numbers::pi_v<Real> * static_cast<Real>(kx_index) /
+            static_cast<Real>(config.nx);
+        cospectrum_kx_file
+            << kx_index
+            << ',' << std::format("{:.17g}", static_cast<double>(kx))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kx, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kx, resolution.eta_b)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(cospectrum_ab_kx[i])))
+            << '\n';
+    }
+    cospectrum_kx_file.flush();
+    cospectrum_kx_file.close();
+
+    std::ofstream cospectrum_kz_file{output_dir / "cospectrum_AB_kz.csv"};
+    if (!cospectrum_kz_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "cospectrum_AB_kz.csv").string());
+    }
+    cospectrum_kz_file << "kz_index,kz,kz_etaK,kz_etaB,C_AB\n";
+    for (std::size_t kz_index = 0; kz_index < complex_z; ++kz_index) {
+        const Real kz =
+            Real{2} * std::numbers::pi_v<Real> *
+            static_cast<Real>(kz_index) / static_cast<Real>(config.nz);
+        cospectrum_kz_file
+            << kz_index
+            << ',' << std::format("{:.17g}", static_cast<double>(kz))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kz, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kz, resolution.eta_b)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(cospectrum_ab_kz[kz_index])))
+            << '\n';
+    }
+    cospectrum_kz_file.flush();
+    cospectrum_kz_file.close();
+
+    std::ofstream cospectrum_kh_file{output_dir / "cospectrum_AB_kh.csv"};
+    if (!cospectrum_kh_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error("failed to open " +
+                                 (output_dir / "cospectrum_AB_kh.csv").string());
+    }
+    cospectrum_kh_file
+        << "shell_index,kh_center,kh_etaK,kh_etaB,mode_count,C_AB\n";
+    for (std::size_t shell = 0; shell < cospectrum_ab_kh.size(); ++shell) {
+        const Real kh_center = static_cast<Real>(shell) * radial_dk;
+        cospectrum_kh_file
+            << shell
+            << ',' << std::format("{:.17g}", static_cast<double>(kh_center))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kh_center, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(kh_center, resolution.eta_b)))
+            << ',' << radial_mode_count[shell]
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(cospectrum_ab_kh[shell])))
+            << '\n';
+    }
+    cospectrum_kh_file.flush();
+    cospectrum_kh_file.close();
+
     const auto spectrum_stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> spectrum_elapsed =
         spectrum_stop - spectrum_start;
@@ -3044,6 +3266,26 @@ void write_scalar_spectrum_outputs(
         << json_number(velocity_kz_sum_relative_difference) << ",\n"
         << "  \"velocity_kh_sum_relative_difference\": "
         << json_number(velocity_kh_sum_relative_difference) << ",\n"
+        << "  \"weighted_cov_AB\": "
+        << json_number(static_cast<Real>(weighted_cov_ab)) << ",\n"
+        << "  \"spectral_cov_AB\": "
+        << json_number(static_cast<Real>(spectral_cov_ab)) << ",\n"
+        << "  \"covariance_parseval_absolute_error\": "
+        << json_number(static_cast<Real>(covariance_parseval_absolute_error)) << ",\n"
+        << "  \"covariance_parseval_normalized_error\": "
+        << json_number(covariance_parseval_normalized_error) << ",\n"
+        << "  \"sum_C_AB_kx\": "
+        << json_number(static_cast<Real>(sum_cospectrum_ab_kx)) << ",\n"
+        << "  \"sum_C_AB_kz\": "
+        << json_number(static_cast<Real>(sum_cospectrum_ab_kz)) << ",\n"
+        << "  \"sum_C_AB_kh\": "
+        << json_number(static_cast<Real>(sum_cospectrum_ab_kh)) << ",\n"
+        << "  \"kx_covariance_conservation_error\": "
+        << json_number(kx_covariance_conservation_error) << ",\n"
+        << "  \"kz_covariance_conservation_error\": "
+        << json_number(kz_covariance_conservation_error) << ",\n"
+        << "  \"kh_covariance_conservation_error\": "
+        << json_number(kh_covariance_conservation_error) << ",\n"
         << "  \"spectrum_wall_time_seconds\": "
         << json_number(static_cast<Real>(spectrum_elapsed.count())) << "\n"
         << "}\n";
