@@ -2098,8 +2098,143 @@ void write_pdf_metadata_json(
         << "    \"joint_pdf_Ca_Cb\": " << sum_histogram(joint_ab) << ",\n"
         << "    \"joint_pdf_Z_log_chi\": " << sum_histogram(joint_z_chi) << ",\n"
         << "    \"joint_pdf_log_R_log_chi\": " << sum_histogram(joint_r_chi) << "\n"
+        << "  },\n"
+        << "  \"conditional_statistics\": {\n"
+        << "    \"enabled\": true,\n"
+        << "    \"conditional_Z_bins\": " << config.pdf_bins << ",\n"
+        << "    \"conditional_Z_range\": [0, 1],\n"
+        << "    \"conditional_log_chi_bins\": " << config.pdf_bins << ",\n"
+        << "    \"conditional_log10_chi_star_range\": ["
+        << json_number(config.pdf_log_chi_min) << ", "
+        << json_number(config.pdf_log_chi_max) << "]\n"
         << "  }\n"
         << "}\n";
+}
+
+void write_conditional_chi_given_z_csv(
+    const std::filesystem::path& filename,
+    const std::vector<std::uint64_t>& counts,
+    const std::vector<long double>& sum_chi_z,
+    const std::vector<long double>& sum_chi_star,
+    std::uint64_t total_samples) {
+    std::ofstream file{filename};
+    if (!file) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    file << "Z_center,count,probability,mean_chi_Z_given_Z,"
+            "mean_chi_star_given_Z\n";
+    const Real width = Real{1} / static_cast<Real>(counts.size());
+    for (std::size_t bin = 0; bin < counts.size(); ++bin) {
+        const Real center = (static_cast<Real>(bin) + Real{0.5}) * width;
+        const Real probability =
+            static_cast<Real>(counts[bin]) / static_cast<Real>(total_samples);
+        const Real mean_chi_z =
+            counts[bin] > 0
+                ? static_cast<Real>(sum_chi_z[bin] / static_cast<long double>(counts[bin]))
+                : Real{};
+        const Real mean_chi_star =
+            counts[bin] > 0
+                ? static_cast<Real>(sum_chi_star[bin] / static_cast<long double>(counts[bin]))
+                : Real{};
+
+        file << std::format("{:.17g}", static_cast<double>(center))
+             << ',' << counts[bin]
+             << ',' << std::format("{:.17g}", static_cast<double>(probability))
+             << ',' << std::format("{:.17g}", static_cast<double>(mean_chi_z))
+             << ',' << std::format("{:.17g}", static_cast<double>(mean_chi_star))
+             << '\n';
+    }
+}
+
+void write_conditional_r_given_z_csv(
+    const std::filesystem::path& filename,
+    const std::vector<std::uint64_t>& counts,
+    const std::vector<long double>& sum_reaction_rate,
+    const std::vector<long double>& sum_reaction_rate_star,
+    const std::vector<long double>& sum_ca,
+    const std::vector<long double>& sum_cb,
+    const std::vector<long double>& sum_cacb,
+    std::uint64_t total_samples) {
+    std::ofstream file{filename};
+    if (!file) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    file << "Z_center,count,probability,mean_R_given_Z,mean_R_star_given_Z,"
+            "reaction_efficiency_given_Z\n";
+    const Real width = Real{1} / static_cast<Real>(counts.size());
+    for (std::size_t bin = 0; bin < counts.size(); ++bin) {
+        const Real center = (static_cast<Real>(bin) + Real{0.5}) * width;
+        const Real probability =
+            static_cast<Real>(counts[bin]) / static_cast<Real>(total_samples);
+        const long double inv_count =
+            counts[bin] > 0 ? 1.0L / static_cast<long double>(counts[bin]) : 0.0L;
+        const Real mean_r =
+            counts[bin] > 0 ? static_cast<Real>(sum_reaction_rate[bin] * inv_count) : Real{};
+        const Real mean_r_star =
+            counts[bin] > 0
+                ? static_cast<Real>(sum_reaction_rate_star[bin] * inv_count)
+                : Real{};
+        const Real mean_a =
+            counts[bin] > 0 ? static_cast<Real>(sum_ca[bin] * inv_count) : Real{};
+        const Real mean_b =
+            counts[bin] > 0 ? static_cast<Real>(sum_cb[bin] * inv_count) : Real{};
+        const Real mean_ab =
+            counts[bin] > 0 ? static_cast<Real>(sum_cacb[bin] * inv_count) : Real{};
+        const Real efficiency =
+            mean_a * mean_b > Real{} ? mean_ab / (mean_a * mean_b) : Real{};
+
+        file << std::format("{:.17g}", static_cast<double>(center))
+             << ',' << counts[bin]
+             << ',' << std::format("{:.17g}", static_cast<double>(probability))
+             << ',' << std::format("{:.17g}", static_cast<double>(mean_r))
+             << ',' << std::format("{:.17g}", static_cast<double>(mean_r_star))
+             << ',' << std::format("{:.17g}", static_cast<double>(efficiency))
+             << '\n';
+    }
+}
+
+void write_conditional_r_given_log_chi_csv(
+    const Config& config,
+    const std::filesystem::path& filename,
+    const std::vector<std::uint64_t>& counts,
+    const std::vector<long double>& sum_reaction_rate,
+    const std::vector<long double>& sum_reaction_rate_star,
+    std::uint64_t total_samples) {
+    std::ofstream file{filename};
+    if (!file) {
+        throw std::runtime_error("failed to open " + filename.string());
+    }
+
+    file << "log10_chi_center,chi_star_center,count,probability,mean_R,"
+            "mean_R_star\n";
+    const Real width =
+        (config.pdf_log_chi_max - config.pdf_log_chi_min) /
+        static_cast<Real>(counts.size());
+    for (std::size_t bin = 0; bin < counts.size(); ++bin) {
+        const Real log_center =
+            config.pdf_log_chi_min + (static_cast<Real>(bin) + Real{0.5}) * width;
+        const Real chi_star_center = std::pow(Real{10}, log_center);
+        const Real probability =
+            static_cast<Real>(counts[bin]) / static_cast<Real>(total_samples);
+        const long double inv_count =
+            counts[bin] > 0 ? 1.0L / static_cast<long double>(counts[bin]) : 0.0L;
+        const Real mean_r =
+            counts[bin] > 0 ? static_cast<Real>(sum_reaction_rate[bin] * inv_count) : Real{};
+        const Real mean_r_star =
+            counts[bin] > 0
+                ? static_cast<Real>(sum_reaction_rate_star[bin] * inv_count)
+                : Real{};
+
+        file << std::format("{:.17g}", static_cast<double>(log_center))
+             << ',' << std::format("{:.17g}", static_cast<double>(chi_star_center))
+             << ',' << counts[bin]
+             << ',' << std::format("{:.17g}", static_cast<double>(probability))
+             << ',' << std::format("{:.17g}", static_cast<double>(mean_r))
+             << ',' << std::format("{:.17g}", static_cast<double>(mean_r_star))
+             << '\n';
+    }
 }
 
 void write_pdf_outputs(
@@ -2122,6 +2257,17 @@ void write_pdf_outputs(
     std::vector<std::uint64_t> joint_ab(joint_bins * joint_bins);
     std::vector<std::uint64_t> joint_z_chi(joint_bins * joint_bins);
     std::vector<std::uint64_t> joint_r_chi(joint_bins * joint_bins);
+    std::vector<std::uint64_t> conditional_z_counts(pdf_bins);
+    std::vector<long double> conditional_z_sum_chi(pdf_bins);
+    std::vector<long double> conditional_z_sum_chi_star(pdf_bins);
+    std::vector<long double> conditional_z_sum_r(pdf_bins);
+    std::vector<long double> conditional_z_sum_r_star(pdf_bins);
+    std::vector<long double> conditional_z_sum_ca(pdf_bins);
+    std::vector<long double> conditional_z_sum_cb(pdf_bins);
+    std::vector<long double> conditional_z_sum_cacb(pdf_bins);
+    std::vector<std::uint64_t> conditional_log_chi_counts(pdf_bins);
+    std::vector<long double> conditional_log_chi_sum_r(pdf_bins);
+    std::vector<long double> conditional_log_chi_sum_r_star(pdf_bins);
     PdfCounters counters{};
 
 #pragma omp parallel
@@ -2132,6 +2278,17 @@ void write_pdf_outputs(
         std::vector<std::uint64_t> local_joint_ab(joint_bins * joint_bins);
         std::vector<std::uint64_t> local_joint_z_chi(joint_bins * joint_bins);
         std::vector<std::uint64_t> local_joint_r_chi(joint_bins * joint_bins);
+        std::vector<std::uint64_t> local_conditional_z_counts(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_chi(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_chi_star(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_r(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_r_star(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_ca(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_cb(pdf_bins);
+        std::vector<long double> local_conditional_z_sum_cacb(pdf_bins);
+        std::vector<std::uint64_t> local_conditional_log_chi_counts(pdf_bins);
+        std::vector<long double> local_conditional_log_chi_sum_r(pdf_bins);
+        std::vector<long double> local_conditional_log_chi_sum_r_star(pdf_bins);
         PdfCounters local{};
 
 #pragma omp for collapse(3) schedule(static) nowait
@@ -2165,9 +2322,10 @@ void write_pdf_outputs(
                     const Real dz_dz = Real{0.5} * (z_at(x, y, zp) - z_at(x, y, zm));
                     const Real grad_z2 =
                         dz_dx * dz_dx + dz_dy * dz_dy + dz_dz * dz_dz;
+                    const Real chi_z =
+                        Real{2} * config.scalar_diffusivity * grad_z2;
                     const Real chi_star =
-                        Real{2} * config.scalar_diffusivity * grad_z2 *
-                        config.delta0 / config.delta_u;
+                        chi_z * config.delta0 / config.delta_u;
 
                     if (mixture_fraction < Real{}) {
                         ++local.z_underflow;
@@ -2177,6 +2335,21 @@ void write_pdf_outputs(
                     const std::size_t z_pdf_bin =
                         clamped_unit_bin(mixture_fraction, config.pdf_bins);
                     ++local_pdf_z[z_pdf_bin];
+                    ++local_conditional_z_counts[z_pdf_bin];
+                    local_conditional_z_sum_chi[z_pdf_bin] +=
+                        static_cast<long double>(chi_z);
+                    local_conditional_z_sum_chi_star[z_pdf_bin] +=
+                        static_cast<long double>(chi_star);
+                    local_conditional_z_sum_r[z_pdf_bin] +=
+                        static_cast<long double>(reaction_rate);
+                    local_conditional_z_sum_r_star[z_pdf_bin] +=
+                        static_cast<long double>(reaction_rate_star);
+                    local_conditional_z_sum_ca[z_pdf_bin] +=
+                        static_cast<long double>(concentration_a);
+                    local_conditional_z_sum_cb[z_pdf_bin] +=
+                        static_cast<long double>(concentration_b);
+                    local_conditional_z_sum_cacb[z_pdf_bin] +=
+                        static_cast<long double>(concentration_a * concentration_b);
 
                     const std::size_t a_bin =
                         clamped_unit_bin(a, config.joint_pdf_bins);
@@ -2194,6 +2367,11 @@ void write_pdf_outputs(
                     if (chi_included) {
                         ++local.chi_included;
                         ++local_pdf_log_chi[chi_pdf_bin];
+                        ++local_conditional_log_chi_counts[chi_pdf_bin];
+                        local_conditional_log_chi_sum_r[chi_pdf_bin] +=
+                            static_cast<long double>(reaction_rate);
+                        local_conditional_log_chi_sum_r_star[chi_pdf_bin] +=
+                            static_cast<long double>(reaction_rate_star);
                     } else if (chi_star <= Real{} || !std::isfinite(chi_star)) {
                         ++local.chi_zero;
                     } else if (std::log10(chi_star) < config.pdf_log_chi_min) {
@@ -2262,12 +2440,36 @@ void write_pdf_outputs(
                         target[i] += source[i];
                     }
                 };
+            const auto merge_sums =
+                [](std::vector<long double>& target,
+                   const std::vector<long double>& source) {
+                    for (std::size_t i = 0; i < target.size(); ++i) {
+                        target[i] += source[i];
+                    }
+                };
             merge_histogram(pdf_z, local_pdf_z);
             merge_histogram(pdf_log_chi, local_pdf_log_chi);
             merge_histogram(pdf_log_r, local_pdf_log_r);
             merge_histogram(joint_ab, local_joint_ab);
             merge_histogram(joint_z_chi, local_joint_z_chi);
             merge_histogram(joint_r_chi, local_joint_r_chi);
+            merge_histogram(conditional_z_counts, local_conditional_z_counts);
+            merge_sums(conditional_z_sum_chi, local_conditional_z_sum_chi);
+            merge_sums(conditional_z_sum_chi_star, local_conditional_z_sum_chi_star);
+            merge_sums(conditional_z_sum_r, local_conditional_z_sum_r);
+            merge_sums(conditional_z_sum_r_star, local_conditional_z_sum_r_star);
+            merge_sums(conditional_z_sum_ca, local_conditional_z_sum_ca);
+            merge_sums(conditional_z_sum_cb, local_conditional_z_sum_cb);
+            merge_sums(conditional_z_sum_cacb, local_conditional_z_sum_cacb);
+            merge_histogram(
+                conditional_log_chi_counts,
+                local_conditional_log_chi_counts);
+            merge_sums(
+                conditional_log_chi_sum_r,
+                local_conditional_log_chi_sum_r);
+            merge_sums(
+                conditional_log_chi_sum_r_star,
+                local_conditional_log_chi_sum_r_star);
             counters.z_underflow += local.z_underflow;
             counters.z_overflow += local.z_overflow;
             counters.chi_zero += local.chi_zero;
@@ -2338,6 +2540,28 @@ void write_pdf_outputs(
         config.pdf_log_chi_max,
         config.joint_pdf_bins,
         joint_r_chi,
+        total_samples);
+    write_conditional_chi_given_z_csv(
+        output_dir / "conditional_chi_given_Z.csv",
+        conditional_z_counts,
+        conditional_z_sum_chi,
+        conditional_z_sum_chi_star,
+        total_samples);
+    write_conditional_r_given_z_csv(
+        output_dir / "conditional_R_given_Z.csv",
+        conditional_z_counts,
+        conditional_z_sum_r,
+        conditional_z_sum_r_star,
+        conditional_z_sum_ca,
+        conditional_z_sum_cb,
+        conditional_z_sum_cacb,
+        total_samples);
+    write_conditional_r_given_log_chi_csv(
+        config,
+        output_dir / "conditional_R_given_log_chi.csv",
+        conditional_log_chi_counts,
+        conditional_log_chi_sum_r,
+        conditional_log_chi_sum_r_star,
         total_samples);
     write_pdf_metadata_json(
         config,
