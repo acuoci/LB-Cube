@@ -2807,6 +2807,29 @@ void write_scalar_spectrum_outputs(
         static_cast<Real>(
             std::abs(sum_cospectrum_ab_kh - spectral_cov_ab) /
             covariance_error_scale);
+    std::vector<long double> cumulative_cospectrum_ab_resolved(
+        cospectrum_ab_kh.size(),
+        0.0L);
+    std::vector<long double> cumulative_cospectrum_ab_unresolved(
+        cospectrum_ab_kh.size(),
+        0.0L);
+    long double cumulative_covariance = 0.0L;
+    long double cumulative_covariance_max_conservation_error = 0.0L;
+    for (std::size_t shell = 0; shell < cospectrum_ab_kh.size(); ++shell) {
+        cumulative_covariance += cospectrum_ab_kh[shell];
+        cumulative_cospectrum_ab_resolved[shell] = cumulative_covariance;
+        cumulative_cospectrum_ab_unresolved[shell] =
+            sum_cospectrum_ab_kh - cumulative_covariance;
+        cumulative_covariance_max_conservation_error = std::max(
+            cumulative_covariance_max_conservation_error,
+            std::abs(
+                cumulative_cospectrum_ab_resolved[shell] +
+                cumulative_cospectrum_ab_unresolved[shell] -
+                sum_cospectrum_ab_kh));
+    }
+    const long double covariance_fraction_threshold =
+        static_cast<long double>(100.0) *
+        static_cast<long double>(std::numeric_limits<Real>::epsilon());
     const auto multiply_if_finite = [](Real value, Real scale) {
         return std::isfinite(scale) ? value * scale
                                     : std::numeric_limits<Real>::infinity();
@@ -3180,6 +3203,65 @@ void write_scalar_spectrum_outputs(
     cospectrum_kh_file.flush();
     cospectrum_kh_file.close();
 
+    std::ofstream cumulative_cospectrum_kh_file{
+        output_dir / "cumulative_cospectrum_AB_kh.csv"};
+    if (!cumulative_cospectrum_kh_file) {
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        throw std::runtime_error(
+            "failed to open " +
+            (output_dir / "cumulative_cospectrum_AB_kh.csv").string());
+    }
+    cumulative_cospectrum_kh_file
+        << "shell_index,k_c,k_c_etaK,k_c_etaB,lambda_c,lambda_c_over_delta0,"
+           "C_AB_resolved,C_AB_unresolved,resolved_covariance_fraction,"
+           "unresolved_covariance_fraction,"
+           "unresolved_covariance_magnitude_fraction\n";
+    const bool has_safe_covariance_total =
+        std::abs(sum_cospectrum_ab_kh) > covariance_fraction_threshold;
+    for (std::size_t shell = 0; shell < cospectrum_ab_kh.size(); ++shell) {
+        const Real k_c = static_cast<Real>(shell) * radial_dk;
+        const Real lambda_c =
+            k_c > Real{} ? Real{2} * std::numbers::pi_v<Real> / k_c : Real{};
+        const long double resolved = cumulative_cospectrum_ab_resolved[shell];
+        const long double unresolved = cumulative_cospectrum_ab_unresolved[shell];
+        const Real resolved_fraction =
+            has_safe_covariance_total
+                ? static_cast<Real>(resolved / sum_cospectrum_ab_kh)
+                : Real{};
+        const Real unresolved_fraction =
+            has_safe_covariance_total
+                ? static_cast<Real>(unresolved / sum_cospectrum_ab_kh)
+                : Real{};
+        const Real unresolved_magnitude_fraction =
+            has_safe_covariance_total
+                ? static_cast<Real>(
+                      std::abs(unresolved) / std::abs(sum_cospectrum_ab_kh))
+                : Real{};
+
+        cumulative_cospectrum_kh_file
+            << shell
+            << ',' << std::format("{:.17g}", static_cast<double>(k_c))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(k_c, resolution.eta_k)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   multiply_if_finite(k_c, resolution.eta_b)))
+            << ',' << std::format("{:.17g}", static_cast<double>(lambda_c))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   config.delta0 > Real{} ? lambda_c / config.delta0 : Real{}))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(resolved)))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   static_cast<Real>(unresolved)))
+            << ',' << std::format("{:.17g}", static_cast<double>(resolved_fraction))
+            << ',' << std::format("{:.17g}", static_cast<double>(unresolved_fraction))
+            << ',' << std::format("{:.17g}", static_cast<double>(
+                   unresolved_magnitude_fraction))
+            << '\n';
+    }
+    cumulative_cospectrum_kh_file.flush();
+    cumulative_cospectrum_kh_file.close();
+
     const auto spectrum_stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> spectrum_elapsed =
         spectrum_stop - spectrum_start;
@@ -3280,6 +3362,11 @@ void write_scalar_spectrum_outputs(
         << json_number(static_cast<Real>(sum_cospectrum_ab_kz)) << ",\n"
         << "  \"sum_C_AB_kh\": "
         << json_number(static_cast<Real>(sum_cospectrum_ab_kh)) << ",\n"
+        << "  \"C_AB_total\": "
+        << json_number(static_cast<Real>(sum_cospectrum_ab_kh)) << ",\n"
+        << "  \"cumulative_covariance_max_conservation_error\": "
+        << json_number(static_cast<Real>(
+               cumulative_covariance_max_conservation_error)) << ",\n"
         << "  \"kx_covariance_conservation_error\": "
         << json_number(kx_covariance_conservation_error) << ",\n"
         << "  \"kz_covariance_conservation_error\": "
