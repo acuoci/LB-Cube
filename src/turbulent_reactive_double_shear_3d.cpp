@@ -91,6 +91,9 @@ struct Config {
     int spectrum_freq{};
     std::vector<int> filter_widths{};
     int filter_freq{};
+    int filter_conditional_bins{64};
+    Real filter_log_tau_zz_min{-12};
+    Real filter_log_tau_zz_max{0};
 };
 
 struct PerturbationMode {
@@ -441,6 +444,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --filter_widths <list>   Comma-separated odd box-filter widths, e.g. 3,5,9 (default disabled)\n"
         << "  --filter_width <n>       Backward-compatible single-width alias; reject with --filter_widths\n"
         << "  --filter_freq <n>        Diagnostic scalar filtering interval; 0 disables filtering (default 0)\n"
+        << "  --filter_conditional_bins <n>  Filtered conditional bin count (default 64)\n"
+        << "  --filter_log_tauZZ_min <v>     Minimum log10(tau_ZZ) conditional edge (default -12)\n"
+        << "  --filter_log_tauZZ_max <v>     Maximum log10(tau_ZZ) conditional edge (default 0)\n"
         << "  --help                   Show this message\n";
 }
 
@@ -553,6 +559,15 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--filter_freq") {
             config.filter_freq =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_conditional_bins") {
+            config.filter_conditional_bins =
+                parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_log_tauZZ_min") {
+            config.filter_log_tau_zz_min =
+                parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_log_tauZZ_max") {
+            config.filter_log_tau_zz_max =
+                parse_real(flag, require_value(index, argc, argv));
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -614,6 +629,10 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     if (filtering_enabled(config) != (config.filter_freq > 0)) {
         throw std::runtime_error(
             "--filter_widths/--filter_width and --filter_freq must either both enable filtering or both be disabled");
+    }
+    if (config.filter_log_tau_zz_max <= config.filter_log_tau_zz_min) {
+        throw std::runtime_error(
+            "--filter_log_tauZZ_max must be greater than --filter_log_tauZZ_min");
     }
 #ifndef LB_CUBE_HAS_FFTW
     if (config.spectrum_freq > 0) {
@@ -1115,6 +1134,10 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << (filtering_enabled(config) ? "" : " (disabled)") << '\n'
         << "Filter frequency: " << config.filter_freq
         << (config.filter_freq > 0 ? "" : " (disabled)") << '\n'
+        << "Filter conditional bins: " << config.filter_conditional_bins << '\n'
+        << "log10(tau_ZZ) conditional range: ["
+        << config.filter_log_tau_zz_min << ", "
+        << config.filter_log_tau_zz_max << "]\n"
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -1217,6 +1240,9 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << (config.filter_widths.empty() ? 0 : config.filter_widths.front()) << ",\n"
         << "  \"filter_widths\": " << filter_widths_to_json(config) << ",\n"
         << "  \"filter_freq\": " << config.filter_freq << ",\n"
+        << "  \"filter_conditional_bins\": " << config.filter_conditional_bins << ",\n"
+        << "  \"filter_log_tauZZ_min\": " << json_number(config.filter_log_tau_zz_min) << ",\n"
+        << "  \"filter_log_tauZZ_max\": " << json_number(config.filter_log_tau_zz_max) << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -2740,8 +2766,220 @@ void write_filter_statistics_header(std::ofstream& file) {
         config.nx};
 }
 
+void write_filter_conditional_outputs(
+    const Config& config,
+    const std::filesystem::path& output_root,
+    int step,
+    int filter_width_int,
+    const ResolutionDiagnostics& resolution,
+    Real mean_tau_ab,
+    const std::vector<std::uint64_t>& zbar_counts,
+    const std::vector<long double>& zbar_sum_tau_ab,
+    const std::vector<long double>& zbar_sum_rho_ab_sgs,
+    const std::vector<std::uint64_t>& log_tau_zz_counts,
+    const std::vector<long double>& log_tau_zz_sum_tau_ab,
+    std::uint64_t tau_zz_zero_count,
+    std::uint64_t tau_zz_underflow_count,
+    std::uint64_t tau_zz_overflow_count,
+    long double excluded_log_tau_zz_sum_tau_ab) {
+    const std::size_t cells = cell_count(config);
+    const long double inv_cells = 1.0L / static_cast<long double>(cells);
+    const int bins = config.filter_conditional_bins;
+    const Real log_min = config.filter_log_tau_zz_min;
+    const Real log_max = config.filter_log_tau_zz_max;
+    const Real log_bin_width = (log_max - log_min) / static_cast<Real>(bins);
+    const Real filter_delta = static_cast<Real>(filter_width_int);
+    const Real delta_over_eta_k =
+        std::isfinite(resolution.eta_k) && resolution.eta_k > Real{}
+            ? filter_delta / resolution.eta_k
+            : Real{};
+    const Real delta_over_eta_b =
+        std::isfinite(resolution.eta_b) && resolution.eta_b > Real{}
+            ? filter_delta / resolution.eta_b
+            : Real{};
+
+    std::uint64_t zbar_total_count{};
+    std::uint64_t log_tau_zz_included_count{};
+    long double reconstructed_tau_ab_from_zbar{};
+    long double reconstructed_tau_ab_from_log_tau_zz_included{};
+    for (int bin = 0; bin < bins; ++bin) {
+        zbar_total_count += zbar_counts[bin];
+        log_tau_zz_included_count += log_tau_zz_counts[bin];
+        reconstructed_tau_ab_from_zbar += zbar_sum_tau_ab[bin];
+        reconstructed_tau_ab_from_log_tau_zz_included +=
+            log_tau_zz_sum_tau_ab[bin];
+    }
+    if (zbar_total_count != cells) {
+        throw std::runtime_error(
+            "filtered conditional Zbar counts do not sum to the domain size");
+    }
+    const std::uint64_t tau_zz_classified_count =
+        log_tau_zz_included_count + tau_zz_zero_count +
+        tau_zz_underflow_count + tau_zz_overflow_count;
+    if (tau_zz_classified_count != cells) {
+        throw std::runtime_error(
+            "filtered conditional tau_ZZ counts do not sum to the domain size");
+    }
+
+    reconstructed_tau_ab_from_zbar *= inv_cells;
+    reconstructed_tau_ab_from_log_tau_zz_included *= inv_cells;
+    const long double reconstructed_tau_ab_from_log_tau_zz =
+        reconstructed_tau_ab_from_log_tau_zz_included +
+        excluded_log_tau_zz_sum_tau_ab * inv_cells;
+    const Real zbar_reconstruction_abs_error = std::abs(
+        static_cast<Real>(reconstructed_tau_ab_from_zbar) - mean_tau_ab);
+    const Real log_tau_zz_reconstruction_abs_error = std::abs(
+        static_cast<Real>(reconstructed_tau_ab_from_log_tau_zz) - mean_tau_ab);
+
+    const std::filesystem::path output_dir =
+        output_root / std::format("step_{:08}", step);
+    std::filesystem::create_directories(output_dir);
+    const std::string width_label = std::format("w{:04}", filter_width_int);
+
+    {
+        std::ofstream file{
+            output_dir /
+            std::format("conditional_tauAB_given_Zbar_{}.csv", width_label)};
+        if (!file) {
+            throw std::runtime_error(
+                "failed to open filtered Zbar conditional output");
+        }
+        file << "Zbar_center,count,probability,mean_tau_AB_given_Zbar,"
+             << "mean_rho_AB_SGS_given_Zbar\n";
+        for (int bin = 0; bin < bins; ++bin) {
+            const std::uint64_t count = zbar_counts[bin];
+            const Real probability = static_cast<Real>(
+                static_cast<long double>(count) * inv_cells);
+            const Real mean_tau =
+                count > 0
+                    ? static_cast<Real>(
+                          zbar_sum_tau_ab[bin] / static_cast<long double>(count))
+                    : Real{};
+            const Real mean_rho =
+                count > 0
+                    ? static_cast<Real>(
+                          zbar_sum_rho_ab_sgs[bin] /
+                          static_cast<long double>(count))
+                    : Real{};
+            if (!std::isfinite(mean_tau) || !std::isfinite(mean_rho)) {
+                throw std::runtime_error(
+                    "non-finite value detected in filtered Zbar conditionals");
+            }
+            const Real center =
+                (static_cast<Real>(bin) + Real{0.5}) / static_cast<Real>(bins);
+            file << std::format("{:.17g}", static_cast<double>(center))
+                 << ',' << count
+                 << ',' << std::format("{:.17g}", static_cast<double>(probability))
+                 << ',' << std::format("{:.17g}", static_cast<double>(mean_tau))
+                 << ',' << std::format("{:.17g}", static_cast<double>(mean_rho))
+                 << '\n';
+        }
+        file.flush();
+    }
+
+    {
+        std::ofstream file{
+            output_dir /
+            std::format(
+                "conditional_tauAB_given_log_tauZZ_{}.csv",
+                width_label)};
+        if (!file) {
+            throw std::runtime_error(
+                "failed to open filtered tau_ZZ conditional output");
+        }
+        file << "log10_tauZZ_center,tauZZ_center,count,probability,"
+             << "mean_tau_AB_given_tauZZ\n";
+        for (int bin = 0; bin < bins; ++bin) {
+            const std::uint64_t count = log_tau_zz_counts[bin];
+            const Real probability = static_cast<Real>(
+                static_cast<long double>(count) * inv_cells);
+            const Real mean_tau =
+                count > 0
+                    ? static_cast<Real>(
+                          log_tau_zz_sum_tau_ab[bin] /
+                          static_cast<long double>(count))
+                    : Real{};
+            if (!std::isfinite(mean_tau)) {
+                throw std::runtime_error(
+                    "non-finite value detected in filtered tau_ZZ conditionals");
+            }
+            const Real log_center =
+                log_min + (static_cast<Real>(bin) + Real{0.5}) * log_bin_width;
+            const Real tau_center = std::pow(Real{10}, log_center);
+            file << std::format("{:.17g}", static_cast<double>(log_center))
+                 << ',' << std::format("{:.17g}", static_cast<double>(tau_center))
+                 << ',' << count
+                 << ',' << std::format("{:.17g}", static_cast<double>(probability))
+                 << ',' << std::format("{:.17g}", static_cast<double>(mean_tau))
+                 << '\n';
+        }
+        file.flush();
+    }
+
+    {
+        std::ofstream metadata{
+            output_dir / std::format("conditional_metadata_{}.json", width_label)};
+        if (!metadata) {
+            throw std::runtime_error(
+                "failed to open filtered conditional metadata output");
+        }
+        const Real tau_zz_zero_fraction = static_cast<Real>(
+            static_cast<long double>(tau_zz_zero_count) * inv_cells);
+        const Real tau_zz_underflow_fraction = static_cast<Real>(
+            static_cast<long double>(tau_zz_underflow_count) * inv_cells);
+        const Real tau_zz_overflow_fraction = static_cast<Real>(
+            static_cast<long double>(tau_zz_overflow_count) * inv_cells);
+        const Real tau_zz_included_fraction = static_cast<Real>(
+            static_cast<long double>(log_tau_zz_included_count) * inv_cells);
+        metadata
+            << "{\n"
+            << "  \"step\": " << step << ",\n"
+            << "  \"time\": " << json_number(static_cast<Real>(step)) << ",\n"
+            << "  \"filter_width\": " << filter_width_int << ",\n"
+            << "  \"Delta_over_delta0\": "
+            << json_number(filter_delta / config.delta0) << ",\n"
+            << "  \"Delta_over_etaK\": " << json_number(delta_over_eta_k) << ",\n"
+            << "  \"Delta_over_etaB\": " << json_number(delta_over_eta_b) << ",\n"
+            << "  \"filter_conditional_bins\": " << bins << ",\n"
+            << "  \"Zbar_range\": [0, 1],\n"
+            << "  \"log10_tauZZ_range\": ["
+            << json_number(log_min) << ", " << json_number(log_max) << "],\n"
+            << "  \"tauZZ_zero_fraction\": "
+            << json_number(tau_zz_zero_fraction) << ",\n"
+            << "  \"tauZZ_underflow_fraction\": "
+            << json_number(tau_zz_underflow_fraction) << ",\n"
+            << "  \"tauZZ_overflow_fraction\": "
+            << json_number(tau_zz_overflow_fraction) << ",\n"
+            << "  \"tauZZ_included_fraction\": "
+            << json_number(tau_zz_included_fraction) << ",\n"
+            << "  \"mean_tau_AB\": " << json_number(mean_tau_ab) << ",\n"
+            << "  \"reconstructed_mean_tau_AB_from_Zbar_conditionals\": "
+            << json_number(static_cast<Real>(reconstructed_tau_ab_from_zbar))
+            << ",\n"
+            << "  \"Zbar_reconstruction_abs_error\": "
+            << json_number(zbar_reconstruction_abs_error) << ",\n"
+            << "  \"reconstructed_mean_tau_AB_from_log_tauZZ_conditionals\": "
+            << json_number(
+                   static_cast<Real>(reconstructed_tau_ab_from_log_tau_zz))
+            << ",\n"
+            << "  \"included_mean_tau_AB_from_log_tauZZ_conditionals\": "
+            << json_number(static_cast<Real>(
+                   reconstructed_tau_ab_from_log_tau_zz_included))
+            << ",\n"
+            << "  \"excluded_mean_tau_AB_from_log_tauZZ_conditionals\": "
+            << json_number(
+                   static_cast<Real>(excluded_log_tau_zz_sum_tau_ab * inv_cells))
+            << ",\n"
+            << "  \"log_tauZZ_reconstruction_abs_error\": "
+            << json_number(log_tau_zz_reconstruction_abs_error) << "\n"
+            << "}\n";
+        metadata.flush();
+    }
+}
+
 void write_filter_statistics(
     std::ofstream& file,
+    const std::filesystem::path& conditional_output_root,
     const Config& config,
     int step,
     const ResolutionDiagnostics& resolution,
@@ -2754,16 +2992,13 @@ void write_filter_statistics(
 
     std::vector<Real> field_a(cells);
     std::vector<Real> field_b(cells);
-    std::vector<Real> field_ab(cells);
-    std::vector<Real> field_r(cells);
     std::vector<Real> field_extra(cells);
     std::vector<Real> filtered_a(cells);
     std::vector<Real> filtered_b(cells);
     std::vector<Real> filtered_ab(cells);
-    std::vector<Real> filtered_r(cells);
+    std::vector<Real> filtered_extra(cells);
     std::vector<Real> tau_aa(cells);
     std::vector<Real> tau_bb(cells);
-    std::vector<Real> tau_zz(cells);
     std::vector<Real> filter_tmp1(cells);
     std::vector<Real> filter_tmp2(cells);
 
@@ -2781,8 +3016,7 @@ void write_filter_statistics(
                 const Real concentration_ab = concentration_a * concentration_b;
                 field_a[index] = concentration_a;
                 field_b[index] = concentration_b;
-                field_ab[index] = concentration_ab;
-                field_r[index] = config.k_react * concentration_ab;
+                field_extra[index] = concentration_ab;
                 sum_a += static_cast<long double>(concentration_a);
                 sum_b += static_cast<long double>(concentration_b);
                 sum_ab += static_cast<long double>(concentration_ab);
@@ -2792,6 +3026,11 @@ void write_filter_statistics(
 
     for (const int filter_width_int : config.filter_widths) {
     const auto filter_width = static_cast<std::size_t>(filter_width_int);
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        field_extra[index] = field_a[index] * field_b[index];
+    }
+
     lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_a), config),
         scalar_field_view(filtered_a, config),
@@ -2805,7 +3044,7 @@ void write_filter_statistics(
         filter_tmp1,
         filter_tmp2);
     lbm::box_filter_3d_separable<Real>(
-        scalar_field_view(std::as_const(field_ab), config),
+        scalar_field_view(std::as_const(field_extra), config),
         scalar_field_view(filtered_ab, config),
         filter_width,
         filter_tmp1,
@@ -2834,7 +3073,7 @@ void write_filter_statistics(
                 std::abs(filtered_b[index] - field_b[index]));
             max_width_one_identity_error = std::max(
                 max_width_one_identity_error,
-                std::abs(filtered_ab[index] - field_ab[index]));
+                std::abs(filtered_ab[index] - field_extra[index]));
         }
     }
 
@@ -2845,39 +3084,32 @@ void write_filter_statistics(
         throw std::runtime_error("filter_width=1 did not reproduce scalar fields exactly");
     }
 
-    lbm::box_filter_3d_separable<Real>(
-        scalar_field_view(std::as_const(field_r), config),
-        scalar_field_view(filtered_r, config),
-        filter_width,
-        filter_tmp1,
-        filter_tmp2);
+    Real max_abs_zbar_linearity_error{};
+    Real max_abs_zbar_linearity_scale{};
 
 #pragma omp parallel for schedule(static)
     for (std::size_t index = 0; index < cells; ++index) {
-        field_extra[index] =
+        filtered_ab[index] -= filtered_a[index] * filtered_b[index];
+    }
+
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        const Real z =
             Real{0.5} * (Real{1} + (field_a[index] - field_b[index]) / config.c0);
+        field_extra[index] = z * z;
     }
     lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_extra), config),
-        scalar_field_view(tau_zz, config),
+        scalar_field_view(filtered_extra, config),
         filter_width,
         filter_tmp1,
         filter_tmp2);
-
-    Real max_abs_zbar_linearity_error{};
-    Real max_abs_zbar_linearity_scale{};
-#pragma omp parallel for schedule(static) reduction(max: max_abs_zbar_linearity_error, max_abs_zbar_linearity_scale)
+#pragma omp parallel for schedule(static)
     for (std::size_t index = 0; index < cells; ++index) {
-        const Real z_bar_reconstructed =
+        const Real z_bar =
             Real{0.5} *
             (Real{1} + (filtered_a[index] - filtered_b[index]) / config.c0);
-        const Real z_bar_direct = tau_zz[index];
-        max_abs_zbar_linearity_error = std::max(
-            max_abs_zbar_linearity_error,
-            std::abs(z_bar_direct - z_bar_reconstructed));
-        max_abs_zbar_linearity_scale = std::max(
-            max_abs_zbar_linearity_scale,
-            std::max(std::abs(z_bar_direct), std::abs(z_bar_reconstructed)));
+        filtered_extra[index] -= z_bar * z_bar;
     }
 
 #pragma omp parallel for schedule(static)
@@ -2908,26 +3140,6 @@ void write_filter_statistics(
 #pragma omp parallel for schedule(static)
     for (std::size_t index = 0; index < cells; ++index) {
         tau_bb[index] -= filtered_b[index] * filtered_b[index];
-    }
-
-#pragma omp parallel for schedule(static)
-    for (std::size_t index = 0; index < cells; ++index) {
-        const Real z =
-            Real{0.5} * (Real{1} + (field_a[index] - field_b[index]) / config.c0);
-        field_extra[index] = z * z;
-    }
-    lbm::box_filter_3d_separable<Real>(
-        scalar_field_view(std::as_const(field_extra), config),
-        scalar_field_view(tau_zz, config),
-        filter_width,
-        filter_tmp1,
-        filter_tmp2);
-#pragma omp parallel for schedule(static)
-    for (std::size_t index = 0; index < cells; ++index) {
-        const Real z_bar =
-            Real{0.5} *
-            (Real{1} + (filtered_a[index] - filtered_b[index]) / config.c0);
-        tau_zz[index] -= z_bar * z_bar;
     }
 
     long double sum_r{};
@@ -2967,16 +3179,11 @@ void write_filter_statistics(
 
 #pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar, sum_a_bar_b_bar, sum_tau_ab, sum_tau_ab2, sum_tau_aa, sum_tau_aa2, sum_tau_bb, sum_tau_bb2, sum_tau_zz, sum_tau_zz2, sum_rho_ab_sgs, sum_rho_ab_sgs2, sum_tau_zz_identity_error2, sum_r_les_naive, sum_r_sgs) reduction(max: max_abs_identity_error, max_abs_r_bar_direct, max_tau_ab, max_tau_aa, max_tau_bb, max_tau_zz, max_rho_ab_sgs, max_abs_tau_zz_identity_error, max_abs_tau_zz_identity_scale, max_abs_reaction_decomposition_error, max_abs_r_exact_filtered) reduction(min: min_tau_ab, min_tau_aa, min_tau_bb, min_tau_zz, min_rho_ab_sgs) reduction(&&: reaction_finite)
     for (std::size_t index = 0; index < cells; ++index) {
-        const Real reaction = field_r[index];
-        const Real reaction_bar_direct = filtered_r[index];
-        const Real reaction_from_filtered_ab = config.k_react * filtered_ab[index];
-        const Real identity_error =
-            std::abs(reaction_bar_direct - reaction_from_filtered_ab);
         const Real a_bar_b_bar = filtered_a[index] * filtered_b[index];
-        const Real tau_ab = filtered_ab[index] - a_bar_b_bar;
+        const Real tau_ab = filtered_ab[index];
         const Real local_tau_aa = tau_aa[index];
         const Real local_tau_bb = tau_bb[index];
-        const Real local_tau_zz = tau_zz[index];
+        const Real local_tau_zz = filtered_extra[index];
         const Real tau_zz_from_reactants =
             (local_tau_aa + local_tau_bb - Real{2} * tau_ab) /
             (Real{4} * config.c0 * config.c0);
@@ -2990,6 +3197,11 @@ void write_filter_statistics(
             local_tau_aa > variance_floor && local_tau_bb > variance_floor
                 ? tau_ab / std::sqrt(local_tau_aa * local_tau_bb)
                 : Real{};
+        const Real reaction_from_filtered_ab =
+            config.k_react * (a_bar_b_bar + tau_ab);
+        const Real reaction_bar_direct = reaction_from_filtered_ab;
+        const Real reaction = reaction_from_filtered_ab;
+        const Real identity_error{};
         const Real reaction_les_naive = config.k_react * a_bar_b_bar;
         const Real reaction_sgs = config.k_react * tau_ab;
         const Real reaction_decomposition_error =
@@ -3078,9 +3290,9 @@ void write_filter_statistics(
     const Real mean_b_bar = static_cast<Real>(sum_b_bar * inv_cells);
     const Real mean_ab = static_cast<Real>(sum_ab * inv_cells);
     const Real mean_ab_bar = static_cast<Real>(sum_ab_bar * inv_cells);
-    const Real mean_r = static_cast<Real>(sum_r * inv_cells);
-    const Real mean_r_bar_direct = static_cast<Real>(sum_r_bar_direct * inv_cells);
     const Real mean_k_ab_bar = static_cast<Real>(sum_k_ab_bar * inv_cells);
+    const Real mean_r = config.k_react * mean_ab;
+    const Real mean_r_bar_direct = mean_k_ab_bar;
     const Real mean_a_bar_b_bar = static_cast<Real>(sum_a_bar_b_bar * inv_cells);
     const Real mean_tau_ab = static_cast<Real>(sum_tau_ab * inv_cells);
     const Real rms_tau_ab =
@@ -3160,6 +3372,134 @@ void write_filter_statistics(
         std::isfinite(resolution.eta_b) && resolution.eta_b > Real{}
             ? filter_delta / resolution.eta_b
             : Real{};
+
+    const int conditional_bins = config.filter_conditional_bins;
+    std::vector<std::uint64_t> zbar_counts(conditional_bins);
+    std::vector<long double> zbar_sum_tau_ab(conditional_bins);
+    std::vector<long double> zbar_sum_rho_ab_sgs(conditional_bins);
+    std::vector<std::uint64_t> log_tau_zz_counts(conditional_bins);
+    std::vector<long double> log_tau_zz_sum_tau_ab(conditional_bins);
+    std::uint64_t tau_zz_zero_count{};
+    std::uint64_t tau_zz_underflow_count{};
+    std::uint64_t tau_zz_overflow_count{};
+    long double excluded_log_tau_zz_sum_tau_ab{};
+    bool conditional_finite = true;
+    const Real log_tau_zz_min = config.filter_log_tau_zz_min;
+    const Real log_tau_zz_max = config.filter_log_tau_zz_max;
+    const Real log_tau_zz_bin_width =
+        (log_tau_zz_max - log_tau_zz_min) /
+        static_cast<Real>(conditional_bins);
+
+#pragma omp parallel
+    {
+        std::vector<std::uint64_t> local_zbar_counts(conditional_bins);
+        std::vector<long double> local_zbar_sum_tau_ab(conditional_bins);
+        std::vector<long double> local_zbar_sum_rho_ab_sgs(conditional_bins);
+        std::vector<std::uint64_t> local_log_tau_zz_counts(conditional_bins);
+        std::vector<long double> local_log_tau_zz_sum_tau_ab(conditional_bins);
+        std::uint64_t local_tau_zz_zero_count{};
+        std::uint64_t local_tau_zz_underflow_count{};
+        std::uint64_t local_tau_zz_overflow_count{};
+        long double local_excluded_log_tau_zz_sum_tau_ab{};
+        bool local_conditional_finite = true;
+
+#pragma omp for schedule(static)
+        for (std::size_t index = 0; index < cells; ++index) {
+            const Real tau_ab = filtered_ab[index];
+            const Real local_tau_aa = tau_aa[index];
+            const Real local_tau_bb = tau_bb[index];
+            const Real local_tau_zz = filtered_extra[index];
+            const Real z_bar =
+                Real{0.5} *
+                (Real{1} + (filtered_a[index] - filtered_b[index]) / config.c0);
+            const Real variance_floor =
+                Real{64} * std::numeric_limits<Real>::epsilon() *
+                config.c0 * config.c0;
+            const Real rho_ab_sgs =
+                local_tau_aa > variance_floor && local_tau_bb > variance_floor
+                    ? tau_ab / std::sqrt(local_tau_aa * local_tau_bb)
+                    : Real{};
+
+            const Real z_clamped = std::clamp(z_bar, Real{}, Real{1});
+            int z_bin = static_cast<int>(
+                std::floor(z_clamped * static_cast<Real>(conditional_bins)));
+            z_bin = std::clamp(z_bin, 0, conditional_bins - 1);
+            ++local_zbar_counts[z_bin];
+            local_zbar_sum_tau_ab[z_bin] += static_cast<long double>(tau_ab);
+            local_zbar_sum_rho_ab_sgs[z_bin] +=
+                static_cast<long double>(rho_ab_sgs);
+
+            if (local_tau_zz <= Real{}) {
+                ++local_tau_zz_zero_count;
+                local_excluded_log_tau_zz_sum_tau_ab +=
+                    static_cast<long double>(tau_ab);
+            } else {
+                const Real log_tau_zz = std::log10(local_tau_zz);
+                if (log_tau_zz < log_tau_zz_min) {
+                    ++local_tau_zz_underflow_count;
+                    local_excluded_log_tau_zz_sum_tau_ab +=
+                        static_cast<long double>(tau_ab);
+                } else if (log_tau_zz > log_tau_zz_max) {
+                    ++local_tau_zz_overflow_count;
+                    local_excluded_log_tau_zz_sum_tau_ab +=
+                        static_cast<long double>(tau_ab);
+                } else {
+                    int log_bin = static_cast<int>(
+                        std::floor((log_tau_zz - log_tau_zz_min) /
+                                   log_tau_zz_bin_width));
+                    log_bin = std::clamp(log_bin, 0, conditional_bins - 1);
+                    ++local_log_tau_zz_counts[log_bin];
+                    local_log_tau_zz_sum_tau_ab[log_bin] +=
+                        static_cast<long double>(tau_ab);
+                }
+            }
+
+            local_conditional_finite =
+                local_conditional_finite && std::isfinite(tau_ab) &&
+                std::isfinite(local_tau_aa) && std::isfinite(local_tau_bb) &&
+                std::isfinite(local_tau_zz) && std::isfinite(z_bar) &&
+                std::isfinite(rho_ab_sgs);
+        }
+
+#pragma omp critical(filter_conditionals_merge)
+        {
+            for (int bin = 0; bin < conditional_bins; ++bin) {
+                zbar_counts[bin] += local_zbar_counts[bin];
+                zbar_sum_tau_ab[bin] += local_zbar_sum_tau_ab[bin];
+                zbar_sum_rho_ab_sgs[bin] += local_zbar_sum_rho_ab_sgs[bin];
+                log_tau_zz_counts[bin] += local_log_tau_zz_counts[bin];
+                log_tau_zz_sum_tau_ab[bin] +=
+                    local_log_tau_zz_sum_tau_ab[bin];
+            }
+            tau_zz_zero_count += local_tau_zz_zero_count;
+            tau_zz_underflow_count += local_tau_zz_underflow_count;
+            tau_zz_overflow_count += local_tau_zz_overflow_count;
+            excluded_log_tau_zz_sum_tau_ab +=
+                local_excluded_log_tau_zz_sum_tau_ab;
+            conditional_finite = conditional_finite && local_conditional_finite;
+        }
+    }
+
+    if (!conditional_finite) {
+        throw std::runtime_error(
+            "non-finite value detected in filtered conditional statistics");
+    }
+    write_filter_conditional_outputs(
+        config,
+        conditional_output_root,
+        step,
+        filter_width_int,
+        resolution,
+        mean_tau_ab,
+        zbar_counts,
+        zbar_sum_tau_ab,
+        zbar_sum_rho_ab_sgs,
+        log_tau_zz_counts,
+        log_tau_zz_sum_tau_ab,
+        tau_zz_zero_count,
+        tau_zz_underflow_count,
+        tau_zz_overflow_count,
+        excluded_log_tau_zz_sum_tau_ab);
 
     file << step
          << ',' << std::format("{:.17g}", static_cast<double>(step))
@@ -4467,6 +4807,8 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const std::filesystem::path profile_dir{"profiles_double_shear_3d"};
     const std::filesystem::path pdf_dir{"pdfs_double_shear_3d"};
     const std::filesystem::path spectrum_dir{"spectra_double_shear_3d"};
+    const std::filesystem::path filter_conditional_dir{
+        "filter_conditionals_double_shear_3d"};
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
@@ -4514,6 +4856,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     if (filtering_enabled(config)) {
         write_filter_statistics(
             filter_statistics,
+            filter_conditional_dir,
             config,
             0,
             compute_resolution_diagnostics(config, flow),
@@ -4637,6 +4980,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 step % config.stat_freq == 0 ? flow : compute_flow_diagnostics(config, fluid);
             write_filter_statistics(
                 filter_statistics,
+                filter_conditional_dir,
                 config,
                 step,
                 compute_resolution_diagnostics(config, filter_flow),
@@ -4686,6 +5030,10 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << "Filter statistics: "
               << (filtering_enabled(config)
                       ? "filter_statistics_double_shear_3d.csv"
+                      : "disabled")
+              << "\nFilter conditionals: "
+              << (filtering_enabled(config)
+                      ? filter_conditional_dir.string()
                       : "disabled")
               << '\n'
               << std::flush;
