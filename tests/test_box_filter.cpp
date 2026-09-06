@@ -1,11 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <iostream>
 #include <numbers>
 #include <numeric>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include "lattice_filter.hpp"
@@ -57,6 +60,43 @@ struct Field3D {
         max_error = std::max(max_error, std::abs(a.data[i] - b.data[i]));
     }
     return max_error;
+}
+
+[[nodiscard]] Real mean_difference(const Field3D& a, const Field3D& b) {
+    Real sum{};
+    for (std::size_t i = 0; i < a.data.size(); ++i) {
+        sum += a.data[i] - b.data[i];
+    }
+    return sum / static_cast<Real>(a.data.size());
+}
+
+[[nodiscard]] Real rms_difference(const Field3D& a, const Field3D& b) {
+    Real sum{};
+    for (std::size_t i = 0; i < a.data.size(); ++i) {
+        const Real difference = a.data[i] - b.data[i];
+        sum += difference * difference;
+    }
+    return std::sqrt(sum / static_cast<Real>(a.data.size()));
+}
+
+void fill_nonuniform_periodic_field(Field3D& field) {
+    for (std::size_t z = 0; z < field.nz; ++z) {
+        for (std::size_t y = 0; y < field.ny; ++y) {
+            for (std::size_t x = 0; x < field.nx; ++x) {
+                const Real xi = static_cast<Real>(x) / static_cast<Real>(field.nx);
+                const Real eta = static_cast<Real>(y) / static_cast<Real>(field.ny);
+                const Real zeta = static_cast<Real>(z) / static_cast<Real>(field.nz);
+                field(z, y, x) =
+                    std::sin(Real{2} * std::numbers::pi_v<Real> * xi) +
+                    Real{0.37} *
+                        std::cos(Real{6} * std::numbers::pi_v<Real> * eta) +
+                    Real{0.19} *
+                        std::sin(Real{4} * std::numbers::pi_v<Real> * zeta +
+                                 Real{0.3} * std::cos(Real{2} * std::numbers::pi_v<Real> * xi)) +
+                    Real{0.01} * static_cast<Real>((x + 2 * y + 3 * z) % 11);
+            }
+        }
+    }
 }
 
 [[nodiscard]] Real discrete_box_transfer_function(
@@ -120,6 +160,16 @@ TEST(BoxFilter3D, RejectsInvalidWidths) {
     EXPECT_THROW(
         lbm::box_filter_3d<Real>(input.view(), output.view(), 8),
         std::invalid_argument);
+
+    EXPECT_THROW(
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), 0),
+        std::invalid_argument);
+    EXPECT_THROW(
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), 2),
+        std::invalid_argument);
+    EXPECT_THROW(
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), 8),
+        std::invalid_argument);
 }
 
 TEST(BoxFilter3D, ConstantFieldIsPreservedPointwise) {
@@ -129,6 +179,20 @@ TEST(BoxFilter3D, ConstantFieldIsPreservedPointwise) {
 
     for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{5}, std::size_t{9}}) {
         lbm::box_filter_3d<Real>(input.view(), output.view(), width);
+        for (const Real value : output.data) {
+            EXPECT_DOUBLE_EQ(value, 3.25) << "width=" << width;
+        }
+    }
+}
+
+TEST(BoxFilter3D, SeparableConstantFieldIsPreservedPointwise) {
+    Field3D input{8, 7, 6};
+    Field3D output{8, 7, 6};
+    std::ranges::fill(input.data, 3.25);
+
+    for (const std::size_t width :
+         {std::size_t{1}, std::size_t{3}, std::size_t{5}, std::size_t{9}}) {
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), width);
         for (const Real value : output.data) {
             EXPECT_DOUBLE_EQ(value, 3.25) << "width=" << width;
         }
@@ -145,6 +209,22 @@ TEST(BoxFilter3D, IdentityWidthOneCopiesInputExactly) {
     }
 
     lbm::box_filter_3d<Real>(input.view(), output.view(), 1);
+
+    for (std::size_t i = 0; i < input.data.size(); ++i) {
+        EXPECT_DOUBLE_EQ(output.data[i], input.data[i]);
+    }
+}
+
+TEST(BoxFilter3D, SeparableIdentityWidthOneCopiesInputExactly) {
+    Field3D input{9, 8, 7};
+    Field3D output{9, 8, 7};
+    for (std::size_t i = 0; i < input.data.size(); ++i) {
+        input.data[i] =
+            std::sin(static_cast<Real>(i) * Real{0.17}) +
+            Real{0.01} * static_cast<Real>(i % 11);
+    }
+
+    lbm::box_filter_3d_separable<Real>(input.view(), output.view(), 1);
 
     for (std::size_t i = 0; i < input.data.size(); ++i) {
         EXPECT_DOUBLE_EQ(output.data[i], input.data[i]);
@@ -182,6 +262,26 @@ TEST(BoxFilter3D, PreservesGlobalMeanForNonuniformPeriodicField) {
     }
 }
 
+TEST(BoxFilter3D, SeparablePreservesGlobalMeanForNonuniformPeriodicField) {
+    Field3D input{13, 11, 9};
+    Field3D output{13, 11, 9};
+    fill_nonuniform_periodic_field(input);
+
+    for (const std::size_t width :
+         {std::size_t{3}, std::size_t{5}, std::size_t{9}}) {
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), width);
+        const Real input_mean = mean(input);
+        const Real filtered_mean = mean(output);
+        const Real abs_error = std::abs(filtered_mean - input_mean);
+        const Real rel_error =
+            abs_error / std::max(std::abs(input_mean), Real{1.0e-30});
+
+        EXPECT_NEAR(filtered_mean, input_mean, 1.0e-15) << "width=" << width;
+        EXPECT_LT(abs_error, 1.0e-15) << "width=" << width;
+        EXPECT_LT(rel_error, 1.0e-14) << "width=" << width;
+    }
+}
+
 TEST(BoxFilter3D, WrapsAcrossAllPeriodicBoundaries) {
     Field3D input{4, 5, 6};
     Field3D output{4, 5, 6};
@@ -191,6 +291,22 @@ TEST(BoxFilter3D, WrapsAcrossAllPeriodicBoundaries) {
     input(input.nz - 1, input.ny - 1, input.nx - 1) = 11.0;
 
     lbm::box_filter_3d<Real>(input.view(), output.view(), 3);
+
+    EXPECT_DOUBLE_EQ(output(0, 0, 0), (3.0 + 5.0 + 7.0 + 11.0) / 27.0);
+    EXPECT_DOUBLE_EQ(
+        output(input.nz - 1, input.ny - 1, input.nx - 1),
+        (3.0 + 5.0 + 7.0 + 11.0) / 27.0);
+}
+
+TEST(BoxFilter3D, SeparableWrapsAcrossAllPeriodicBoundaries) {
+    Field3D input{4, 5, 6};
+    Field3D output{4, 5, 6};
+    input(0, 0, input.nx - 1) = 3.0;
+    input(0, input.ny - 1, 0) = 5.0;
+    input(input.nz - 1, 0, 0) = 7.0;
+    input(input.nz - 1, input.ny - 1, input.nx - 1) = 11.0;
+
+    lbm::box_filter_3d_separable<Real>(input.view(), output.view(), 3);
 
     EXPECT_DOUBLE_EQ(output(0, 0, 0), (3.0 + 5.0 + 7.0 + 11.0) / 27.0);
     EXPECT_DOUBLE_EQ(
@@ -235,4 +351,136 @@ TEST(BoxFilter3D, FourierModeMatchesDiscreteTransferFunction) {
         EXPECT_LT(ratio_rel_error, 1.0e-13) << "width=" << width;
         EXPECT_LT(max_pointwise_error, 2.0e-15) << "width=" << width;
     }
+}
+
+TEST(BoxFilter3D, SeparableFourierModeMatchesDiscreteTransferFunction) {
+    constexpr std::size_t nx = 32;
+    constexpr std::size_t ny = 30;
+    constexpr std::size_t nz = 28;
+    constexpr int kx = 3;
+    constexpr int ky = 2;
+    constexpr int kz = 4;
+
+    const Field3D input = make_fourier_mode(nx, ny, nz, kx, ky, kz);
+    Field3D output{nx, ny, nz};
+    Field3D expected{nx, ny, nz};
+
+    for (const std::size_t width :
+         {std::size_t{1}, std::size_t{3}, std::size_t{5}, std::size_t{9}}) {
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), width);
+        const Real expected_ratio =
+            discrete_box_transfer_function(kx, nx, width) *
+            discrete_box_transfer_function(ky, ny, width) *
+            discrete_box_transfer_function(kz, nz, width);
+
+        Real numerator{};
+        Real denominator{};
+        for (std::size_t i = 0; i < input.data.size(); ++i) {
+            expected.data[i] = expected_ratio * input.data[i];
+            numerator += output.data[i] * input.data[i];
+            denominator += input.data[i] * input.data[i];
+        }
+        const Real measured_ratio = numerator / denominator;
+        const Real ratio_rel_error =
+            std::abs(measured_ratio - expected_ratio) /
+            std::max(std::abs(expected_ratio), Real{1.0e-30});
+        const Real max_pointwise_error = max_abs_difference(output, expected);
+
+        EXPECT_NEAR(measured_ratio, expected_ratio, 1.0e-14)
+            << "width=" << width;
+        EXPECT_LT(ratio_rel_error, 1.0e-13) << "width=" << width;
+        EXPECT_LT(max_pointwise_error, 2.0e-15) << "width=" << width;
+    }
+}
+
+TEST(BoxFilter3D, SeparableMatchesNaiveForNonuniformFields) {
+    const std::vector<std::tuple<std::size_t, std::size_t, std::size_t>> sizes{
+        {7, 5, 6},
+        {13, 11, 9},
+        {16, 10, 12}};
+    const std::vector<std::size_t> widths{1, 3, 5, 9, 17};
+
+    for (const auto& [nx, ny, nz] : sizes) {
+        Field3D input{nx, ny, nz};
+        Field3D naive{nx, ny, nz};
+        Field3D separable{nx, ny, nz};
+        fill_nonuniform_periodic_field(input);
+
+        for (const std::size_t width : widths) {
+            lbm::box_filter_3d<Real>(input.view(), naive.view(), width);
+            lbm::box_filter_3d_separable<Real>(
+                input.view(),
+                separable.view(),
+                width);
+
+            const Real max_error = max_abs_difference(naive, separable);
+            const Real rms_error = rms_difference(naive, separable);
+            const Real mean_error = mean_difference(naive, separable);
+            std::cout << "Separable equivalence nx=" << nx << " ny=" << ny
+                      << " nz=" << nz << " width=" << width
+                      << " max_abs=" << max_error << " rms=" << rms_error
+                      << " mean=" << mean_error << '\n';
+
+            EXPECT_LT(max_error, 8.0e-15) << "width=" << width;
+            EXPECT_LT(rms_error, 2.0e-15) << "width=" << width;
+            EXPECT_LT(std::abs(mean_error), 1.0e-15) << "width=" << width;
+        }
+    }
+}
+
+TEST(BoxFilter3D, SeparableMatchesNaiveWhenWidthExceedsExtent) {
+    Field3D input{4, 3, 5};
+    Field3D naive{4, 3, 5};
+    Field3D separable{4, 3, 5};
+    fill_nonuniform_periodic_field(input);
+
+    for (const std::size_t width : {std::size_t{7}, std::size_t{9}, std::size_t{17}}) {
+        lbm::box_filter_3d<Real>(input.view(), naive.view(), width);
+        lbm::box_filter_3d_separable<Real>(input.view(), separable.view(), width);
+
+        const Real max_error = max_abs_difference(naive, separable);
+        const Real rms_error = rms_difference(naive, separable);
+        const Real mean_error = mean_difference(naive, separable);
+        std::cout << "Oversized width equivalence width=" << width
+                  << " max_abs=" << max_error << " rms=" << rms_error
+                  << " mean=" << mean_error << '\n';
+
+        EXPECT_LT(max_error, 2.0e-14) << "width=" << width;
+        EXPECT_LT(rms_error, 1.0e-14) << "width=" << width;
+        EXPECT_LT(std::abs(mean_error), 1.0e-14) << "width=" << width;
+    }
+}
+
+TEST(BoxFilter3D, DISABLED_PerformanceBenchmark128Cube) {
+    constexpr std::size_t n = 128;
+    Field3D input{n, n, n};
+    Field3D output{n, n, n};
+    fill_nonuniform_periodic_field(input);
+
+    for (const std::size_t width :
+         {std::size_t{3}, std::size_t{5}, std::size_t{9}, std::size_t{17}}) {
+        const auto naive_start = std::chrono::steady_clock::now();
+        lbm::box_filter_3d<Real>(input.view(), output.view(), width);
+        const auto naive_stop = std::chrono::steady_clock::now();
+
+        const auto separable_start = std::chrono::steady_clock::now();
+        lbm::box_filter_3d_separable<Real>(input.view(), output.view(), width);
+        const auto separable_stop = std::chrono::steady_clock::now();
+
+        const double naive_seconds =
+            std::chrono::duration<double>(naive_stop - naive_start).count();
+        const double separable_seconds =
+            std::chrono::duration<double>(separable_stop - separable_start).count();
+        std::cout << "Box filter benchmark 128^3 width=" << width
+                  << " naive_s=" << naive_seconds
+                  << " separable_s=" << separable_seconds
+                  << " speedup=" << naive_seconds / separable_seconds << '\n';
+    }
+
+    const auto separable_start = std::chrono::steady_clock::now();
+    lbm::box_filter_3d_separable<Real>(input.view(), output.view(), 33);
+    const auto separable_stop = std::chrono::steady_clock::now();
+    std::cout << "Box filter benchmark 128^3 width=33 optimized_only_s="
+              << std::chrono::duration<double>(separable_stop - separable_start).count()
+              << '\n';
 }

@@ -168,4 +168,229 @@ inline void box_filter_3d(
     }
 }
 
+/**
+ * @brief Wrap a signed index into the periodic range `[0, extent)`.
+ *
+ * @param index Signed lattice index, possibly outside the physical range.
+ * @param extent Positive periodic extent.
+ * @return Wrapped unsigned index.
+ */
+[[nodiscard]] inline std::size_t wrap_periodic_index(
+    std::ptrdiff_t index,
+    std::size_t extent) {
+    const auto period = static_cast<std::ptrdiff_t>(extent);
+    const auto wrapped = (index % period + period) % period;
+    return static_cast<std::size_t>(wrapped);
+}
+
+/**
+ * @brief Apply a separable periodic 3D box filter using sliding 1D windows.
+ *
+ * This optimized implementation is mathematically equivalent to
+ * `box_filter_3d`, but factors the 3D box into three normalized one-dimensional
+ * filters:
+ *
+ * \f[
+ * \bar{\phi} = B_z(B_y(B_x(\phi))).
+ * \f]
+ *
+ * Each 1D pass uses a periodic running sum along independent lines. The
+ * centered stencil convention is identical to the reference implementation:
+ * offsets `[-h, ..., h]` with `h = (n_filter - 1) / 2`. If `n_filter` is larger
+ * than an extent, wrapped cells are counted repeatedly, exactly as in the
+ * direct periodic summation. Two full-domain temporaries are used, and the
+ * operation remains strictly out-of-place.
+ *
+ * @tparam Real Floating-point scalar precision.
+ * @param input Read-only scalar field with extents `[Nz, Ny, Nx]`.
+ * @param output Mutable scalar field with extents `[Nz, Ny, Nx]`.
+ * @param n_filter Positive odd number of stencil points per direction.
+ *
+ * @throws std::invalid_argument if the filter width or view extents are invalid.
+ */
+template <std::floating_point Real>
+inline void box_filter_3d_separable(
+    ConstScalarField3DView<Real> input,
+    ScalarField3DView<Real> output,
+    std::size_t n_filter,
+    std::vector<Real>& tmp1,
+    std::vector<Real>& tmp2) {
+    validate_box_filter_width(n_filter);
+
+    const std::size_t nz = input.extent(0);
+    const std::size_t ny = input.extent(1);
+    const std::size_t nx = input.extent(2);
+    if (nx == 0 || ny == 0 || nz == 0) {
+        throw std::invalid_argument(
+            "box_filter_3d_separable requires strictly positive grid extents");
+    }
+    if (output.extent(0) != nz || output.extent(1) != ny ||
+        output.extent(2) != nx) {
+        throw std::invalid_argument(
+            "box_filter_3d_separable input and output extents must match");
+    }
+    if (input.data_handle() == static_cast<const Real*>(output.data_handle())) {
+        throw std::invalid_argument(
+            "box_filter_3d_separable is an out-of-place filter; input and output storage must differ");
+    }
+
+    if (n_filter == 1) {
+#pragma omp parallel for collapse(3) schedule(static)
+        for (std::size_t z = 0; z < nz; ++z) {
+            for (std::size_t y = 0; y < ny; ++y) {
+                for (std::size_t x = 0; x < nx; ++x) {
+                    output[z, y, x] = input[z, y, x];
+                }
+            }
+        }
+        return;
+    }
+
+    const std::size_t cells = nx * ny * nz;
+    if (tmp1.size() != cells) {
+        tmp1.resize(cells);
+    }
+    if (tmp2.size() != cells) {
+        tmp2.resize(cells);
+    }
+    ScalarField3DView<Real> tmp1_view{tmp1.data(), nz, ny, nx};
+    ScalarField3DView<Real> tmp2_view{tmp2.data(), nz, ny, nx};
+    ConstScalarField3DView<Real> tmp1_const{tmp1.data(), nz, ny, nx};
+    ConstScalarField3DView<Real> tmp2_const{tmp2.data(), nz, ny, nx};
+
+    const auto half_width = static_cast<std::ptrdiff_t>((n_filter - 1) / 2);
+    const Real inverse_width = Real{1} / static_cast<Real>(n_filter);
+
+#pragma omp parallel for collapse(2) schedule(static)
+    for (std::size_t z = 0; z < nz; ++z) {
+        for (std::size_t y = 0; y < ny; ++y) {
+            Real line_total{};
+            for (std::size_t x = 0; x < nx; ++x) {
+                line_total += input[z, y, x];
+            }
+
+            const std::size_t full_periods = n_filter / nx;
+            const std::size_t remainder = n_filter % nx;
+            Real window_sum =
+                static_cast<Real>(full_periods) * line_total;
+            const auto first =
+                static_cast<std::ptrdiff_t>(0) - half_width;
+            for (std::size_t offset = 0; offset < remainder; ++offset) {
+                const auto xx = wrap_periodic_index(
+                    first + static_cast<std::ptrdiff_t>(offset),
+                    nx);
+                window_sum += input[z, y, xx];
+            }
+
+            tmp1_view[z, y, 0] = window_sum * inverse_width;
+            for (std::size_t x = 1; x < nx; ++x) {
+                const auto leaving = wrap_periodic_index(
+                    static_cast<std::ptrdiff_t>(x - 1) - half_width,
+                    nx);
+                const auto entering = wrap_periodic_index(
+                    static_cast<std::ptrdiff_t>(x) + half_width,
+                    nx);
+                window_sum += input[z, y, entering] - input[z, y, leaving];
+                tmp1_view[z, y, x] = window_sum * inverse_width;
+            }
+        }
+    }
+
+#pragma omp parallel for collapse(2) schedule(static)
+    for (std::size_t z = 0; z < nz; ++z) {
+        for (std::size_t x = 0; x < nx; ++x) {
+            Real line_total{};
+            for (std::size_t y = 0; y < ny; ++y) {
+                line_total += tmp1_const[z, y, x];
+            }
+
+            const std::size_t full_periods = n_filter / ny;
+            const std::size_t remainder = n_filter % ny;
+            Real window_sum =
+                static_cast<Real>(full_periods) * line_total;
+            const auto first =
+                static_cast<std::ptrdiff_t>(0) - half_width;
+            for (std::size_t offset = 0; offset < remainder; ++offset) {
+                const auto yy = wrap_periodic_index(
+                    first + static_cast<std::ptrdiff_t>(offset),
+                    ny);
+                window_sum += tmp1_const[z, yy, x];
+            }
+
+            tmp2_view[z, 0, x] = window_sum * inverse_width;
+            for (std::size_t y = 1; y < ny; ++y) {
+                const auto leaving = wrap_periodic_index(
+                    static_cast<std::ptrdiff_t>(y - 1) - half_width,
+                    ny);
+                const auto entering = wrap_periodic_index(
+                    static_cast<std::ptrdiff_t>(y) + half_width,
+                    ny);
+                window_sum +=
+                    tmp1_const[z, entering, x] - tmp1_const[z, leaving, x];
+                tmp2_view[z, y, x] = window_sum * inverse_width;
+            }
+        }
+    }
+
+#pragma omp parallel for collapse(2) schedule(static)
+    for (std::size_t y = 0; y < ny; ++y) {
+        for (std::size_t x = 0; x < nx; ++x) {
+            Real line_total{};
+            for (std::size_t z = 0; z < nz; ++z) {
+                line_total += tmp2_const[z, y, x];
+            }
+
+            const std::size_t full_periods = n_filter / nz;
+            const std::size_t remainder = n_filter % nz;
+            Real window_sum =
+                static_cast<Real>(full_periods) * line_total;
+            const auto first =
+                static_cast<std::ptrdiff_t>(0) - half_width;
+            for (std::size_t offset = 0; offset < remainder; ++offset) {
+                const auto zz = wrap_periodic_index(
+                    first + static_cast<std::ptrdiff_t>(offset),
+                    nz);
+                window_sum += tmp2_const[zz, y, x];
+            }
+
+            output[0, y, x] = window_sum * inverse_width;
+            for (std::size_t z = 1; z < nz; ++z) {
+                const auto leaving = wrap_periodic_index(
+                    static_cast<std::ptrdiff_t>(z - 1) - half_width,
+                    nz);
+                const auto entering = wrap_periodic_index(
+                    static_cast<std::ptrdiff_t>(z) + half_width,
+                    nz);
+                window_sum +=
+                    tmp2_const[entering, y, x] - tmp2_const[leaving, y, x];
+                output[z, y, x] = window_sum * inverse_width;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Apply the separable box filter with internally managed scratch arrays.
+ *
+ * Prefer the overload accepting `tmp1` and `tmp2` when several fields are
+ * filtered back-to-back, so callers can reuse the two full-domain temporaries
+ * and avoid repeated allocation.
+ *
+ * @tparam Real Floating-point scalar precision.
+ * @param input Read-only scalar field with extents `[Nz, Ny, Nx]`.
+ * @param output Mutable scalar field with extents `[Nz, Ny, Nx]`.
+ * @param n_filter Positive odd number of stencil points per direction.
+ */
+template <std::floating_point Real>
+inline void box_filter_3d_separable(
+    ConstScalarField3DView<Real> input,
+    ScalarField3DView<Real> output,
+    std::size_t n_filter) {
+    const std::size_t cells =
+        input.extent(0) * input.extent(1) * input.extent(2);
+    std::vector<Real> tmp1(cells);
+    std::vector<Real> tmp2(cells);
+    box_filter_3d_separable(input, output, n_filter, tmp1, tmp2);
+}
+
 } // namespace lbm

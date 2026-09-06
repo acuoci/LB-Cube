@@ -2655,6 +2655,8 @@ void write_filter_statistics(
     std::vector<Real> filtered_a(cells);
     std::vector<Real> filtered_b(cells);
     std::vector<Real> filtered_ab(cells);
+    std::vector<Real> filter_tmp1(cells);
+    std::vector<Real> filter_tmp2(cells);
 
     long double sum_a{};
     long double sum_b{};
@@ -2679,18 +2681,24 @@ void write_filter_statistics(
     }
 
     const auto filter_width = static_cast<std::size_t>(config.filter_width);
-    lbm::box_filter_3d<Real>(
+    lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_a), config),
         scalar_field_view(filtered_a, config),
-        filter_width);
-    lbm::box_filter_3d<Real>(
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
+    lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_b), config),
         scalar_field_view(filtered_b, config),
-        filter_width);
-    lbm::box_filter_3d<Real>(
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
+    lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_ab), config),
         scalar_field_view(filtered_ab, config),
-        filter_width);
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
 
     long double sum_a_bar{};
     long double sum_b_bar{};
@@ -2733,10 +2741,12 @@ void write_filter_statistics(
     for (std::size_t index = 0; index < cells; ++index) {
         field_a[index] = config.k_react * field_ab[index];
     }
-    lbm::box_filter_3d<Real>(
+    lbm::box_filter_3d_separable<Real>(
         scalar_field_view(std::as_const(field_a), config),
         scalar_field_view(field_b, config),
-        filter_width);
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
 
     long double sum_r{};
     long double sum_r_bar_direct{};
