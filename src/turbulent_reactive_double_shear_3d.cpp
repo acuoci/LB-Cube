@@ -2703,6 +2703,13 @@ void write_filter_statistics_header(std::ofstream& file) {
          << "mean_ABbar,mean_R,mean_Rbar_direct,mean_kABbar,"
          << "max_abs_Rbar_identity_error,relative_Rbar_identity_error,"
          << "mean_AbarBbar,mean_tau_AB,rms_tau_AB,min_tau_AB,max_tau_AB,"
+         << "mean_tau_AA,rms_tau_AA,min_tau_AA,max_tau_AA,"
+         << "mean_tau_BB,rms_tau_BB,min_tau_BB,max_tau_BB,"
+         << "mean_tau_ZZ,rms_tau_ZZ,min_tau_ZZ,max_tau_ZZ,"
+         << "mean_rho_AB_SGS,rms_rho_AB_SGS,min_rho_AB_SGS,max_rho_AB_SGS,"
+         << "max_abs_tauZZ_identity_error,rms_tauZZ_identity_error,"
+         << "relative_tauZZ_identity_error,max_abs_Zbar_linearity_error,"
+         << "relative_Zbar_linearity_error,"
          << "mean_R_exact_filtered,mean_R_LES_naive,mean_R_SGS,"
          << "LES_reaction_efficiency,LES_reaction_overprediction_factor,"
          << "SGS_reaction_fraction,SGS_reaction_magnitude_fraction,"
@@ -2749,10 +2756,14 @@ void write_filter_statistics(
     std::vector<Real> field_b(cells);
     std::vector<Real> field_ab(cells);
     std::vector<Real> field_r(cells);
+    std::vector<Real> field_extra(cells);
     std::vector<Real> filtered_a(cells);
     std::vector<Real> filtered_b(cells);
     std::vector<Real> filtered_ab(cells);
     std::vector<Real> filtered_r(cells);
+    std::vector<Real> tau_aa(cells);
+    std::vector<Real> tau_bb(cells);
+    std::vector<Real> tau_zz(cells);
     std::vector<Real> filter_tmp1(cells);
     std::vector<Real> filter_tmp2(cells);
 
@@ -2841,23 +2852,120 @@ void write_filter_statistics(
         filter_tmp1,
         filter_tmp2);
 
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        field_extra[index] =
+            Real{0.5} * (Real{1} + (field_a[index] - field_b[index]) / config.c0);
+    }
+    lbm::box_filter_3d_separable<Real>(
+        scalar_field_view(std::as_const(field_extra), config),
+        scalar_field_view(tau_zz, config),
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
+
+    Real max_abs_zbar_linearity_error{};
+    Real max_abs_zbar_linearity_scale{};
+#pragma omp parallel for schedule(static) reduction(max: max_abs_zbar_linearity_error, max_abs_zbar_linearity_scale)
+    for (std::size_t index = 0; index < cells; ++index) {
+        const Real z_bar_reconstructed =
+            Real{0.5} *
+            (Real{1} + (filtered_a[index] - filtered_b[index]) / config.c0);
+        const Real z_bar_direct = tau_zz[index];
+        max_abs_zbar_linearity_error = std::max(
+            max_abs_zbar_linearity_error,
+            std::abs(z_bar_direct - z_bar_reconstructed));
+        max_abs_zbar_linearity_scale = std::max(
+            max_abs_zbar_linearity_scale,
+            std::max(std::abs(z_bar_direct), std::abs(z_bar_reconstructed)));
+    }
+
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        field_extra[index] = field_a[index] * field_a[index];
+    }
+    lbm::box_filter_3d_separable<Real>(
+        scalar_field_view(std::as_const(field_extra), config),
+        scalar_field_view(tau_aa, config),
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        tau_aa[index] -= filtered_a[index] * filtered_a[index];
+    }
+
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        field_extra[index] = field_b[index] * field_b[index];
+    }
+    lbm::box_filter_3d_separable<Real>(
+        scalar_field_view(std::as_const(field_extra), config),
+        scalar_field_view(tau_bb, config),
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        tau_bb[index] -= filtered_b[index] * filtered_b[index];
+    }
+
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        const Real z =
+            Real{0.5} * (Real{1} + (field_a[index] - field_b[index]) / config.c0);
+        field_extra[index] = z * z;
+    }
+    lbm::box_filter_3d_separable<Real>(
+        scalar_field_view(std::as_const(field_extra), config),
+        scalar_field_view(tau_zz, config),
+        filter_width,
+        filter_tmp1,
+        filter_tmp2);
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        const Real z_bar =
+            Real{0.5} *
+            (Real{1} + (filtered_a[index] - filtered_b[index]) / config.c0);
+        tau_zz[index] -= z_bar * z_bar;
+    }
+
     long double sum_r{};
     long double sum_r_bar_direct{};
     long double sum_k_ab_bar{};
     long double sum_a_bar_b_bar{};
     long double sum_tau_ab{};
     long double sum_tau_ab2{};
+    long double sum_tau_aa{};
+    long double sum_tau_aa2{};
+    long double sum_tau_bb{};
+    long double sum_tau_bb2{};
+    long double sum_tau_zz{};
+    long double sum_tau_zz2{};
+    long double sum_rho_ab_sgs{};
+    long double sum_rho_ab_sgs2{};
     long double sum_r_les_naive{};
     long double sum_r_sgs{};
     Real max_abs_identity_error{};
     Real max_abs_r_bar_direct{};
     Real min_tau_ab{std::numeric_limits<Real>::max()};
     Real max_tau_ab{std::numeric_limits<Real>::lowest()};
+    Real min_tau_aa{std::numeric_limits<Real>::max()};
+    Real max_tau_aa{std::numeric_limits<Real>::lowest()};
+    Real min_tau_bb{std::numeric_limits<Real>::max()};
+    Real max_tau_bb{std::numeric_limits<Real>::lowest()};
+    Real min_tau_zz{std::numeric_limits<Real>::max()};
+    Real max_tau_zz{std::numeric_limits<Real>::lowest()};
+    Real min_rho_ab_sgs{std::numeric_limits<Real>::max()};
+    Real max_rho_ab_sgs{std::numeric_limits<Real>::lowest()};
+    Real max_abs_tau_zz_identity_error{};
+    Real max_abs_tau_zz_identity_scale{};
+    long double sum_tau_zz_identity_error2{};
     Real max_abs_reaction_decomposition_error{};
     Real max_abs_r_exact_filtered{};
     bool reaction_finite = true;
 
-#pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar, sum_a_bar_b_bar, sum_tau_ab, sum_tau_ab2, sum_r_les_naive, sum_r_sgs) reduction(max: max_abs_identity_error, max_abs_r_bar_direct, max_tau_ab, max_abs_reaction_decomposition_error, max_abs_r_exact_filtered) reduction(min: min_tau_ab) reduction(&&: reaction_finite)
+#pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar, sum_a_bar_b_bar, sum_tau_ab, sum_tau_ab2, sum_tau_aa, sum_tau_aa2, sum_tau_bb, sum_tau_bb2, sum_tau_zz, sum_tau_zz2, sum_rho_ab_sgs, sum_rho_ab_sgs2, sum_tau_zz_identity_error2, sum_r_les_naive, sum_r_sgs) reduction(max: max_abs_identity_error, max_abs_r_bar_direct, max_tau_ab, max_tau_aa, max_tau_bb, max_tau_zz, max_rho_ab_sgs, max_abs_tau_zz_identity_error, max_abs_tau_zz_identity_scale, max_abs_reaction_decomposition_error, max_abs_r_exact_filtered) reduction(min: min_tau_ab, min_tau_aa, min_tau_bb, min_tau_zz, min_rho_ab_sgs) reduction(&&: reaction_finite)
     for (std::size_t index = 0; index < cells; ++index) {
         const Real reaction = field_r[index];
         const Real reaction_bar_direct = filtered_r[index];
@@ -2866,6 +2974,22 @@ void write_filter_statistics(
             std::abs(reaction_bar_direct - reaction_from_filtered_ab);
         const Real a_bar_b_bar = filtered_a[index] * filtered_b[index];
         const Real tau_ab = filtered_ab[index] - a_bar_b_bar;
+        const Real local_tau_aa = tau_aa[index];
+        const Real local_tau_bb = tau_bb[index];
+        const Real local_tau_zz = tau_zz[index];
+        const Real tau_zz_from_reactants =
+            (local_tau_aa + local_tau_bb - Real{2} * tau_ab) /
+            (Real{4} * config.c0 * config.c0);
+        const Real tau_zz_identity_error =
+            std::abs(local_tau_zz - tau_zz_from_reactants);
+        const Real tau_zz_identity_scale =
+            std::max(std::abs(local_tau_zz), std::abs(tau_zz_from_reactants));
+        const Real variance_floor =
+            Real{64} * std::numeric_limits<Real>::epsilon() * config.c0 * config.c0;
+        const Real rho_ab_sgs =
+            local_tau_aa > variance_floor && local_tau_bb > variance_floor
+                ? tau_ab / std::sqrt(local_tau_aa * local_tau_bb)
+                : Real{};
         const Real reaction_les_naive = config.k_react * a_bar_b_bar;
         const Real reaction_sgs = config.k_react * tau_ab;
         const Real reaction_decomposition_error =
@@ -2876,6 +3000,17 @@ void write_filter_statistics(
         sum_a_bar_b_bar += static_cast<long double>(a_bar_b_bar);
         sum_tau_ab += static_cast<long double>(tau_ab);
         sum_tau_ab2 += static_cast<long double>(tau_ab * tau_ab);
+        sum_tau_aa += static_cast<long double>(local_tau_aa);
+        sum_tau_aa2 += static_cast<long double>(local_tau_aa * local_tau_aa);
+        sum_tau_bb += static_cast<long double>(local_tau_bb);
+        sum_tau_bb2 += static_cast<long double>(local_tau_bb * local_tau_bb);
+        sum_tau_zz += static_cast<long double>(local_tau_zz);
+        sum_tau_zz2 += static_cast<long double>(local_tau_zz * local_tau_zz);
+        sum_rho_ab_sgs += static_cast<long double>(rho_ab_sgs);
+        sum_rho_ab_sgs2 += static_cast<long double>(rho_ab_sgs * rho_ab_sgs);
+        sum_tau_zz_identity_error2 +=
+            static_cast<long double>(tau_zz_identity_error) *
+            static_cast<long double>(tau_zz_identity_error);
         sum_r_les_naive += static_cast<long double>(reaction_les_naive);
         sum_r_sgs += static_cast<long double>(reaction_sgs);
         max_abs_identity_error = std::max(max_abs_identity_error, identity_error);
@@ -2883,6 +3018,20 @@ void write_filter_statistics(
             std::max(max_abs_r_bar_direct, std::abs(reaction_bar_direct));
         min_tau_ab = std::min(min_tau_ab, tau_ab);
         max_tau_ab = std::max(max_tau_ab, tau_ab);
+        min_tau_aa = std::min(min_tau_aa, local_tau_aa);
+        max_tau_aa = std::max(max_tau_aa, local_tau_aa);
+        min_tau_bb = std::min(min_tau_bb, local_tau_bb);
+        max_tau_bb = std::max(max_tau_bb, local_tau_bb);
+        min_tau_zz = std::min(min_tau_zz, local_tau_zz);
+        max_tau_zz = std::max(max_tau_zz, local_tau_zz);
+        min_rho_ab_sgs = std::min(min_rho_ab_sgs, rho_ab_sgs);
+        max_rho_ab_sgs = std::max(max_rho_ab_sgs, rho_ab_sgs);
+        max_abs_tau_zz_identity_error = std::max(
+            max_abs_tau_zz_identity_error,
+            tau_zz_identity_error);
+        max_abs_tau_zz_identity_scale = std::max(
+            max_abs_tau_zz_identity_scale,
+            tau_zz_identity_scale);
         max_abs_reaction_decomposition_error = std::max(
             max_abs_reaction_decomposition_error,
             reaction_decomposition_error);
@@ -2894,12 +3043,33 @@ void write_filter_statistics(
                           std::isfinite(reaction_from_filtered_ab) &&
                           std::isfinite(a_bar_b_bar) &&
                           std::isfinite(tau_ab) &&
+                          std::isfinite(local_tau_aa) &&
+                          std::isfinite(local_tau_bb) &&
+                          std::isfinite(local_tau_zz) &&
+                          std::isfinite(rho_ab_sgs) &&
                           std::isfinite(reaction_les_naive) &&
                           std::isfinite(reaction_sgs);
     }
 
     if (!reaction_finite) {
         throw std::runtime_error("non-finite value detected in filtered reaction fields");
+    }
+    if (filter_width_int == 1) {
+        const Real max_width_one_sgs_error = std::max(
+            {std::abs(min_tau_ab),
+             std::abs(max_tau_ab),
+             std::abs(min_tau_aa),
+             std::abs(max_tau_aa),
+             std::abs(min_tau_bb),
+             std::abs(max_tau_bb),
+             std::abs(min_tau_zz),
+             std::abs(max_tau_zz)});
+        const Real width_one_tolerance =
+            Real{64} * std::numeric_limits<Real>::epsilon() * config.c0 * config.c0;
+        if (max_width_one_sgs_error > width_one_tolerance) {
+            throw std::runtime_error(
+                "filter_width=1 produced nonzero SGS scalar moments");
+        }
     }
 
     const Real mean_a = static_cast<Real>(sum_a * inv_cells);
@@ -2915,6 +3085,30 @@ void write_filter_statistics(
     const Real mean_tau_ab = static_cast<Real>(sum_tau_ab * inv_cells);
     const Real rms_tau_ab =
         std::sqrt(std::max(Real{}, static_cast<Real>(sum_tau_ab2 * inv_cells)));
+    const Real mean_tau_aa = static_cast<Real>(sum_tau_aa * inv_cells);
+    const Real rms_tau_aa =
+        std::sqrt(std::max(Real{}, static_cast<Real>(sum_tau_aa2 * inv_cells)));
+    const Real mean_tau_bb = static_cast<Real>(sum_tau_bb * inv_cells);
+    const Real rms_tau_bb =
+        std::sqrt(std::max(Real{}, static_cast<Real>(sum_tau_bb2 * inv_cells)));
+    const Real mean_tau_zz = static_cast<Real>(sum_tau_zz * inv_cells);
+    const Real rms_tau_zz =
+        std::sqrt(std::max(Real{}, static_cast<Real>(sum_tau_zz2 * inv_cells)));
+    const Real mean_rho_ab_sgs = static_cast<Real>(sum_rho_ab_sgs * inv_cells);
+    const Real rms_rho_ab_sgs = std::sqrt(
+        std::max(Real{}, static_cast<Real>(sum_rho_ab_sgs2 * inv_cells)));
+    const Real rms_tau_zz_identity_error = std::sqrt(std::max(
+        Real{},
+        static_cast<Real>(sum_tau_zz_identity_error2 * inv_cells)));
+    const Real relative_tau_zz_identity_error =
+        max_abs_tau_zz_identity_error /
+        std::max(
+            {max_abs_tau_zz_identity_scale,
+             config.c0 * config.c0,
+             std::numeric_limits<Real>::min()});
+    const Real relative_zbar_linearity_error =
+        max_abs_zbar_linearity_error /
+        std::max(max_abs_zbar_linearity_scale, std::numeric_limits<Real>::min());
     const Real mean_r_exact_filtered = mean_k_ab_bar;
     const Real mean_r_les_naive = static_cast<Real>(sum_r_les_naive * inv_cells);
     const Real mean_r_sgs = static_cast<Real>(sum_r_sgs * inv_cells);
@@ -2989,6 +3183,27 @@ void write_filter_statistics(
          << ',' << std::format("{:.17g}", static_cast<double>(rms_tau_ab))
          << ',' << std::format("{:.17g}", static_cast<double>(min_tau_ab))
          << ',' << std::format("{:.17g}", static_cast<double>(max_tau_ab))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_tau_aa))
+         << ',' << std::format("{:.17g}", static_cast<double>(rms_tau_aa))
+         << ',' << std::format("{:.17g}", static_cast<double>(min_tau_aa))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_tau_aa))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_tau_bb))
+         << ',' << std::format("{:.17g}", static_cast<double>(rms_tau_bb))
+         << ',' << std::format("{:.17g}", static_cast<double>(min_tau_bb))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_tau_bb))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_tau_zz))
+         << ',' << std::format("{:.17g}", static_cast<double>(rms_tau_zz))
+         << ',' << std::format("{:.17g}", static_cast<double>(min_tau_zz))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_tau_zz))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_rho_ab_sgs))
+         << ',' << std::format("{:.17g}", static_cast<double>(rms_rho_ab_sgs))
+         << ',' << std::format("{:.17g}", static_cast<double>(min_rho_ab_sgs))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_rho_ab_sgs))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_abs_tau_zz_identity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(rms_tau_zz_identity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(relative_tau_zz_identity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_abs_zbar_linearity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(relative_zbar_linearity_error))
          << ',' << std::format("{:.17g}", static_cast<double>(mean_r_exact_filtered))
          << ',' << std::format("{:.17g}", static_cast<double>(mean_r_les_naive))
          << ',' << std::format("{:.17g}", static_cast<double>(mean_r_sgs))
