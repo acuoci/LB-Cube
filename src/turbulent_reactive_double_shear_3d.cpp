@@ -28,10 +28,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "double_shear_parameters.hpp"
 #include "lattice_core.hpp"
+#include "lattice_filter.hpp"
 #include "lattice_io.hpp"
 #include "lattice_memory.hpp"
 #include "lattice_physics.hpp"
@@ -87,6 +89,8 @@ struct Config {
     Real pdf_log_r_min{-12};
     Real pdf_log_r_max{2};
     int spectrum_freq{};
+    int filter_width{};
+    int filter_freq{};
 };
 
 struct PerturbationMode {
@@ -362,6 +366,8 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --pdf_log_R_min <v>      Minimum log10(R*) bin edge (default -12)\n"
         << "  --pdf_log_R_max <v>      Maximum log10(R*) bin edge (default 2)\n"
         << "  --spectrum_freq <n>      2D x-z scalar-spectrum interval; 0 disables output (default 0)\n"
+        << "  --filter_width <n>       Diagnostic scalar box-filter width; 0 disables filtering (default 0)\n"
+        << "  --filter_freq <n>        Diagnostic scalar filtering interval; 0 disables filtering (default 0)\n"
         << "  --help                   Show this message\n";
 }
 
@@ -448,6 +454,12 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--spectrum_freq") {
             config.spectrum_freq =
                 parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_width") {
+            config.filter_width =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--filter_freq") {
+            config.filter_freq =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -501,6 +513,13 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     }
     if (config.pdf_log_r_max <= config.pdf_log_r_min) {
         throw std::runtime_error("--pdf_log_R_max must be greater than --pdf_log_R_min");
+    }
+    if ((config.filter_width > 0) != (config.filter_freq > 0)) {
+        throw std::runtime_error(
+            "--filter_width and --filter_freq must either both be positive or both be zero");
+    }
+    if (config.filter_width > 0 && config.filter_width % 2 == 0) {
+        throw std::runtime_error("--filter_width must be 0 or a positive odd integer");
     }
 #ifndef LB_CUBE_HAS_FFTW
     if (config.spectrum_freq > 0) {
@@ -998,6 +1017,10 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << ", " << config.pdf_log_r_max << "]\n"
         << "Spectrum frequency: " << config.spectrum_freq
         << (config.spectrum_freq > 0 ? "" : " (disabled)") << '\n'
+        << "Filter width: " << config.filter_width
+        << (config.filter_width > 0 ? "" : " (disabled)") << '\n'
+        << "Filter frequency: " << config.filter_freq
+        << (config.filter_freq > 0 ? "" : " (disabled)") << '\n'
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -1096,6 +1119,8 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"pdf_log_R_min\": " << json_number(config.pdf_log_r_min) << ",\n"
         << "  \"pdf_log_R_max\": " << json_number(config.pdf_log_r_max) << ",\n"
         << "  \"spectrum_freq\": " << config.spectrum_freq << ",\n"
+        << "  \"filter_width\": " << config.filter_width << ",\n"
+        << "  \"filter_freq\": " << config.filter_freq << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -2576,6 +2601,208 @@ void write_pdf_outputs(
         joint_r_chi);
 }
 
+void write_filter_statistics_header(std::ofstream& file) {
+    file << "step,time,filter_width,Delta_over_delta0,Delta_over_etaK,"
+         << "Delta_over_etaB,mean_A,mean_Abar,mean_B,mean_Bbar,mean_AB,"
+         << "mean_ABbar,mean_R,mean_Rbar_direct,mean_kABbar,"
+         << "max_abs_Rbar_identity_error,relative_Rbar_identity_error"
+         << std::endl;
+    file.flush();
+}
+
+[[nodiscard]] lbm::ScalarField3DView<Real> scalar_field_view(
+    std::vector<Real>& field,
+    const Config& config) {
+    return lbm::ScalarField3DView<Real>{
+        field.data(),
+        config.nz,
+        config.ny,
+        config.nx};
+}
+
+[[nodiscard]] lbm::ConstScalarField3DView<Real> scalar_field_view(
+    const std::vector<Real>& field,
+    const Config& config) {
+    return lbm::ConstScalarField3DView<Real>{
+        field.data(),
+        config.nz,
+        config.ny,
+        config.nx};
+}
+
+void write_filter_statistics(
+    std::ofstream& file,
+    const Config& config,
+    int step,
+    const ResolutionDiagnostics& resolution,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    const auto a_view = species_a.get_current_view();
+    const auto b_view = species_b.get_current_view();
+    const std::size_t cells = cell_count(config);
+    const long double inv_cells = 1.0L / static_cast<long double>(cells);
+
+    std::vector<Real> field_a(cells);
+    std::vector<Real> field_b(cells);
+    std::vector<Real> field_ab(cells);
+    std::vector<Real> filtered_a(cells);
+    std::vector<Real> filtered_b(cells);
+    std::vector<Real> filtered_ab(cells);
+
+    long double sum_a{};
+    long double sum_b{};
+    long double sum_ab{};
+
+#pragma omp parallel for collapse(3) schedule(static) reduction(+: sum_a, sum_b, sum_ab)
+    for (std::size_t z = 0; z < config.nz; ++z) {
+        for (std::size_t y = 0; y < config.ny; ++y) {
+            for (std::size_t x = 0; x < config.nx; ++x) {
+                const std::size_t index = (z * config.ny + y) * config.nx + x;
+                const Real concentration_a = concentration_at(a_view, x, y, z);
+                const Real concentration_b = concentration_at(b_view, x, y, z);
+                const Real concentration_ab = concentration_a * concentration_b;
+                field_a[index] = concentration_a;
+                field_b[index] = concentration_b;
+                field_ab[index] = concentration_ab;
+                sum_a += static_cast<long double>(concentration_a);
+                sum_b += static_cast<long double>(concentration_b);
+                sum_ab += static_cast<long double>(concentration_ab);
+            }
+        }
+    }
+
+    const auto filter_width = static_cast<std::size_t>(config.filter_width);
+    lbm::box_filter_3d<Real>(
+        scalar_field_view(std::as_const(field_a), config),
+        scalar_field_view(filtered_a, config),
+        filter_width);
+    lbm::box_filter_3d<Real>(
+        scalar_field_view(std::as_const(field_b), config),
+        scalar_field_view(filtered_b, config),
+        filter_width);
+    lbm::box_filter_3d<Real>(
+        scalar_field_view(std::as_const(field_ab), config),
+        scalar_field_view(filtered_ab, config),
+        filter_width);
+
+    long double sum_a_bar{};
+    long double sum_b_bar{};
+    long double sum_ab_bar{};
+    Real max_width_one_identity_error{};
+    bool all_finite = true;
+
+#pragma omp parallel for schedule(static) reduction(+: sum_a_bar, sum_b_bar, sum_ab_bar) reduction(max: max_width_one_identity_error) reduction(&&: all_finite)
+    for (std::size_t index = 0; index < cells; ++index) {
+        sum_a_bar += static_cast<long double>(filtered_a[index]);
+        sum_b_bar += static_cast<long double>(filtered_b[index]);
+        sum_ab_bar += static_cast<long double>(filtered_ab[index]);
+        all_finite = all_finite && std::isfinite(filtered_a[index]) &&
+                     std::isfinite(filtered_b[index]) &&
+                     std::isfinite(filtered_ab[index]);
+        if (config.filter_width == 1) {
+            max_width_one_identity_error = std::max(
+                max_width_one_identity_error,
+                std::abs(filtered_a[index] - field_a[index]));
+            max_width_one_identity_error = std::max(
+                max_width_one_identity_error,
+                std::abs(filtered_b[index] - field_b[index]));
+            max_width_one_identity_error = std::max(
+                max_width_one_identity_error,
+                std::abs(filtered_ab[index] - field_ab[index]));
+        }
+    }
+
+    if (!all_finite) {
+        throw std::runtime_error("non-finite value detected in filtered scalar fields");
+    }
+    if (config.filter_width == 1 && max_width_one_identity_error != Real{}) {
+        throw std::runtime_error("filter_width=1 did not reproduce scalar fields exactly");
+    }
+
+    // Reuse `field_a` as the unfiltered reaction field and `field_b` as
+    // Rbar_direct. This avoids two extra full-domain temporaries while keeping
+    // the diagnostic out-of-place for each individual filter application.
+#pragma omp parallel for schedule(static)
+    for (std::size_t index = 0; index < cells; ++index) {
+        field_a[index] = config.k_react * field_ab[index];
+    }
+    lbm::box_filter_3d<Real>(
+        scalar_field_view(std::as_const(field_a), config),
+        scalar_field_view(field_b, config),
+        filter_width);
+
+    long double sum_r{};
+    long double sum_r_bar_direct{};
+    long double sum_k_ab_bar{};
+    Real max_abs_identity_error{};
+    Real max_abs_r_bar_direct{};
+    bool reaction_finite = true;
+
+#pragma omp parallel for schedule(static) reduction(+: sum_r, sum_r_bar_direct, sum_k_ab_bar) reduction(max: max_abs_identity_error, max_abs_r_bar_direct) reduction(&&: reaction_finite)
+    for (std::size_t index = 0; index < cells; ++index) {
+        const Real reaction = field_a[index];
+        const Real reaction_bar_direct = field_b[index];
+        const Real reaction_from_filtered_ab = config.k_react * filtered_ab[index];
+        const Real identity_error =
+            std::abs(reaction_bar_direct - reaction_from_filtered_ab);
+        sum_r += static_cast<long double>(reaction);
+        sum_r_bar_direct += static_cast<long double>(reaction_bar_direct);
+        sum_k_ab_bar += static_cast<long double>(reaction_from_filtered_ab);
+        max_abs_identity_error = std::max(max_abs_identity_error, identity_error);
+        max_abs_r_bar_direct =
+            std::max(max_abs_r_bar_direct, std::abs(reaction_bar_direct));
+        reaction_finite = reaction_finite && std::isfinite(reaction) &&
+                          std::isfinite(reaction_bar_direct) &&
+                          std::isfinite(reaction_from_filtered_ab);
+    }
+
+    if (!reaction_finite) {
+        throw std::runtime_error("non-finite value detected in filtered reaction fields");
+    }
+
+    const Real mean_a = static_cast<Real>(sum_a * inv_cells);
+    const Real mean_a_bar = static_cast<Real>(sum_a_bar * inv_cells);
+    const Real mean_b = static_cast<Real>(sum_b * inv_cells);
+    const Real mean_b_bar = static_cast<Real>(sum_b_bar * inv_cells);
+    const Real mean_ab = static_cast<Real>(sum_ab * inv_cells);
+    const Real mean_ab_bar = static_cast<Real>(sum_ab_bar * inv_cells);
+    const Real mean_r = static_cast<Real>(sum_r * inv_cells);
+    const Real mean_r_bar_direct = static_cast<Real>(sum_r_bar_direct * inv_cells);
+    const Real mean_k_ab_bar = static_cast<Real>(sum_k_ab_bar * inv_cells);
+    const Real relative_identity_error =
+        max_abs_identity_error /
+        std::max(max_abs_r_bar_direct, std::numeric_limits<Real>::min());
+    const Real filter_delta = static_cast<Real>(config.filter_width);
+    const Real delta_over_eta_k =
+        std::isfinite(resolution.eta_k) && resolution.eta_k > Real{}
+            ? filter_delta / resolution.eta_k
+            : Real{};
+    const Real delta_over_eta_b =
+        std::isfinite(resolution.eta_b) && resolution.eta_b > Real{}
+            ? filter_delta / resolution.eta_b
+            : Real{};
+
+    file << step
+         << ',' << std::format("{:.17g}", static_cast<double>(step))
+         << ',' << config.filter_width
+         << ',' << std::format("{:.17g}", static_cast<double>(filter_delta / config.delta0))
+         << ',' << std::format("{:.17g}", static_cast<double>(delta_over_eta_k))
+         << ',' << std::format("{:.17g}", static_cast<double>(delta_over_eta_b))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_a))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_a_bar))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_b))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_b_bar))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_ab))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_ab_bar))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_r))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_r_bar_direct))
+         << ',' << std::format("{:.17g}", static_cast<double>(mean_k_ab_bar))
+         << ',' << std::format("{:.17g}", static_cast<double>(max_abs_identity_error))
+         << ',' << std::format("{:.17g}", static_cast<double>(relative_identity_error))
+         << std::endl;
+    file.flush();
+}
+
 void write_scalar_spectrum_outputs(
     const Config& config,
     const std::filesystem::path& output_root,
@@ -3807,6 +4034,16 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         << std::endl;
     statistics.flush();
 
+    std::ofstream filter_statistics;
+    if (config.filter_width > 0) {
+        filter_statistics.open("filter_statistics_double_shear_3d.csv");
+        if (!filter_statistics) {
+            throw std::runtime_error(
+                "failed to open filter_statistics_double_shear_3d.csv");
+        }
+        write_filter_statistics_header(filter_statistics);
+    }
+
     const Real omega_f = Real{1} / config.tau_f;
     const Real omega_s = Real{1} / config.tau_s;
     const std::filesystem::path vtk_dir{"vtk_double_shear_3d"};
@@ -3856,6 +4093,15 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     }
     if (config.pdf_freq > 0) {
         write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
+    }
+    if (config.filter_width > 0) {
+        write_filter_statistics(
+            filter_statistics,
+            config,
+            0,
+            compute_resolution_diagnostics(config, flow),
+            species_a,
+            species_b);
     }
     if (config.spectrum_freq > 0) {
         write_scalar_spectrum_outputs(
@@ -3969,6 +4215,17 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
         if (config.pdf_freq > 0 && step % config.pdf_freq == 0) {
             write_pdf_outputs(config, pdf_dir, step, species_a, species_b);
         }
+        if (config.filter_width > 0 && step % config.filter_freq == 0) {
+            const FlowDiagnostics filter_flow =
+                step % config.stat_freq == 0 ? flow : compute_flow_diagnostics(config, fluid);
+            write_filter_statistics(
+                filter_statistics,
+                config,
+                step,
+                compute_resolution_diagnostics(config, filter_flow),
+                species_a,
+                species_b);
+        }
         if (config.spectrum_freq > 0 && step % config.spectrum_freq == 0) {
             const FlowDiagnostics spectrum_flow =
                 step % config.stat_freq == 0 ? flow : compute_flow_diagnostics(config, fluid);
@@ -3993,6 +4250,10 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const auto stop = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double> elapsed = stop - start;
     statistics.flush();
+    if (filter_statistics.is_open()) {
+        filter_statistics.flush();
+        filter_statistics.close();
+    }
     statistics.close();
 
     std::cout << "Simulation complete in " << elapsed.count()
@@ -4005,6 +4266,11 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
               << (config.pdf_freq > 0 ? pdf_dir.string() : "disabled") << '\n'
               << "Spectrum directory: "
               << (config.spectrum_freq > 0 ? spectrum_dir.string() : "disabled") << '\n'
+              << "Filter statistics: "
+              << (config.filter_width > 0
+                      ? "filter_statistics_double_shear_3d.csv"
+                      : "disabled")
+              << '\n'
               << std::flush;
 }
 
