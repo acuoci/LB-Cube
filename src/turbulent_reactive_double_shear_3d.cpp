@@ -103,6 +103,8 @@ struct Config {
     int checkpoint_freq{};
     Real checkpoint_walltime_hours{};
     int checkpoint_keep{2};
+    Real max_walltime_hours{};
+    Real walltime_safety_margin_hours{0.25};
     std::string restart_from{};
 };
 
@@ -253,6 +255,11 @@ struct RestartState {
     Real initial_mean_z{};
     Real initial_mean_rho{};
     std::filesystem::path source_path{};
+};
+
+struct CheckpointWriteResult {
+    std::filesystem::path path{};
+    double elapsed_seconds{};
 };
 
 struct CheckpointHeader {
@@ -546,6 +553,8 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --checkpoint_freq <n>          Checkpoint interval in completed steps; 0 disables (default 0)\n"
         << "  --checkpoint_walltime <hours>  Checkpoint interval in elapsed wall-clock hours; 0 disables (default 0)\n"
         << "  --checkpoint_keep <n>          Number of completed checkpoints to retain (default 2)\n"
+        << "  --max_walltime <hours>         Gracefully checkpoint and exit before this elapsed walltime; 0 disables (default 0)\n"
+        << "  --walltime_safety_margin <h>   Safety margin reserved before max walltime (default 0.25)\n"
         << "  --restart_from <file>          Restart from a binary checkpoint; --steps is the absolute final step\n"
         << "  --help                   Show this message\n";
 }
@@ -685,6 +694,12 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--checkpoint_keep") {
             config.checkpoint_keep =
                 parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--max_walltime") {
+            config.max_walltime_hours =
+                parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--walltime_safety_margin") {
+            config.walltime_safety_margin_hours =
+                parse_real(flag, require_value(index, argc, argv));
         } else if (flag == "--restart_from") {
             config.restart_from = require_value(index, argc, argv);
         } else {
@@ -759,6 +774,12 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     }
     if (config.checkpoint_walltime_hours < Real{}) {
         throw std::runtime_error("--checkpoint_walltime must be non-negative");
+    }
+    if (config.max_walltime_hours < Real{}) {
+        throw std::runtime_error("--max_walltime must be non-negative");
+    }
+    if (config.walltime_safety_margin_hours < Real{}) {
+        throw std::runtime_error("--walltime_safety_margin must be non-negative");
     }
 #ifndef LB_CUBE_HAS_FFTW
     if (config.spectrum_freq > 0) {
@@ -1272,6 +1293,10 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << "Checkpoint walltime: " << config.checkpoint_walltime_hours
         << " h" << (config.checkpoint_walltime_hours > Real{} ? "" : " (disabled)") << '\n'
         << "Checkpoint keep: " << config.checkpoint_keep << '\n'
+        << "Maximum walltime: " << config.max_walltime_hours
+        << " h" << (config.max_walltime_hours > Real{} ? "" : " (disabled)") << '\n'
+        << "Walltime safety margin: " << config.walltime_safety_margin_hours
+        << " h\n"
         << "Restart from: "
         << (config.restart_from.empty() ? "none" : config.restart_from) << '\n'
         << "Initial perturbation:\n"
@@ -1419,6 +1444,9 @@ void write_metadata_json(
         << "  \"checkpoint_freq\": " << config.checkpoint_freq << ",\n"
         << "  \"checkpoint_walltime\": " << json_number(config.checkpoint_walltime_hours) << ",\n"
         << "  \"checkpoint_keep\": " << config.checkpoint_keep << ",\n"
+        << "  \"max_walltime\": " << json_number(config.max_walltime_hours) << ",\n"
+        << "  \"walltime_safety_margin\": "
+        << json_number(config.walltime_safety_margin_hours) << ",\n"
         << "  \"restart_from\": "
         << (restart_state.enabled ? json_string(restart_state.source_path.string()) : "null")
         << ",\n"
@@ -1764,7 +1792,7 @@ void validate_checkpoint_header(const Config& config, const CheckpointHeader& he
     check_close("D", header.scalar_diffusivity, config.scalar_diffusivity);
 }
 
-void write_checkpoint(
+[[nodiscard]] CheckpointWriteResult write_checkpoint(
     const Config& config,
     const PerturbationDefinition& perturbation,
     int step,
@@ -1847,6 +1875,7 @@ void write_checkpoint(
               << " (" << std::filesystem::file_size(final_path)
               << " bytes, " << checkpoint_elapsed.count() << " s)\n"
               << std::flush;
+    return {.path = final_path, .elapsed_seconds = checkpoint_elapsed.count()};
 }
 
 [[nodiscard]] RestartState read_checkpoint(
@@ -5938,6 +5967,9 @@ void run_simulation(const Config& config) {
     auto next_walltime_checkpoint = start +
         std::chrono::duration<double>(config.checkpoint_walltime_hours * 3600.0);
     int last_checkpoint_step = restart_state.enabled ? restart_state.step : -1;
+    constexpr double checkpoint_write_estimate_floor_seconds = 1.0;
+    double checkpoint_write_estimate_seconds = checkpoint_write_estimate_floor_seconds;
+    bool graceful_walltime_exit = false;
 
     for (int step = first_step; step <= config.steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, lbm::CollisionType::RLBM>(fluid, omega_f);
@@ -6053,6 +6085,28 @@ void run_simulation(const Config& config) {
                 species_b);
         }
 
+        const auto write_checkpoint_for_step = [&](int checkpoint_step) {
+            const CheckpointWriteResult result = write_checkpoint(
+                config,
+                perturbation,
+                checkpoint_step,
+                kinetic_energy_previous,
+                previous_kinetic_energy_step,
+                latest_kinetic_energy_decay_rate,
+                previous_var_z,
+                previous_statistics_step,
+                initial_mean_z,
+                initial_mean_rho,
+                fluid,
+                species_a,
+                species_b);
+            checkpoint_write_estimate_seconds = std::max(
+                checkpoint_write_estimate_seconds,
+                std::max(result.elapsed_seconds, checkpoint_write_estimate_floor_seconds));
+            last_checkpoint_step = checkpoint_step;
+            return result;
+        };
+
         bool checkpoint_due = false;
         if (config.checkpoint_freq > 0 && step % config.checkpoint_freq == 0) {
             checkpoint_due = true;
@@ -6069,21 +6123,39 @@ void run_simulation(const Config& config) {
             }
         }
         if (checkpoint_due && step != last_checkpoint_step) {
-            write_checkpoint(
-                config,
-                perturbation,
-                step,
-                kinetic_energy_previous,
-                previous_kinetic_energy_step,
-                latest_kinetic_energy_decay_rate,
-                previous_var_z,
-                previous_statistics_step,
-                initial_mean_z,
-                initial_mean_rho,
-                fluid,
-                species_a,
-                species_b);
-            last_checkpoint_step = step;
+            write_checkpoint_for_step(step);
+        }
+
+        if (config.max_walltime_hours > Real{} && step < config.steps) {
+            const auto now = std::chrono::high_resolution_clock::now();
+            const std::chrono::duration<double> elapsed = now - start;
+            const double max_walltime_seconds =
+                static_cast<double>(config.max_walltime_hours) * 3600.0;
+            const double safety_margin_seconds =
+                static_cast<double>(config.walltime_safety_margin_hours) * 3600.0;
+            if (elapsed.count() + checkpoint_write_estimate_seconds +
+                    safety_margin_seconds >=
+                max_walltime_seconds) {
+                CheckpointWriteResult walltime_checkpoint{
+                    .path = checkpoint_path_for_step(step),
+                    .elapsed_seconds = 0.0};
+                if (step != last_checkpoint_step) {
+                    walltime_checkpoint = write_checkpoint_for_step(step);
+                }
+                const auto exit_now = std::chrono::high_resolution_clock::now();
+                const std::chrono::duration<double> exit_elapsed = exit_now - start;
+                std::cout << "Graceful walltime exit after completed step "
+                          << step
+                          << ": elapsed=" << exit_elapsed.count()
+                          << " s, estimated_checkpoint_time="
+                          << checkpoint_write_estimate_seconds
+                          << " s, checkpoint="
+                          << walltime_checkpoint.path.string()
+                          << '\n'
+                          << std::flush;
+                graceful_walltime_exit = true;
+                break;
+            }
         }
 
         if (!std::isfinite(flow.u_max) || !std::isfinite(flow.mean_kinetic_energy)) {
@@ -6103,7 +6175,9 @@ void run_simulation(const Config& config) {
     }
     statistics.close();
 
-    std::cout << "Simulation complete in " << elapsed.count()
+    std::cout << (graceful_walltime_exit ? "Simulation stopped gracefully in "
+                                         : "Simulation complete in ")
+              << elapsed.count()
               << " s.\nStatistics: statistics_double_shear_3d.csv"
               << "\nMetadata: metadata_double_shear_3d.json"
               << "\nVTK directory: "

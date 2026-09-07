@@ -419,6 +419,8 @@ Use `--help` to print the executable's command-line reference.
 | `--checkpoint_freq` | `0` | Checkpoint interval in completed steps; `0` disables step-based checkpointing |
 | `--checkpoint_walltime` | `0` | Approximate wall-clock checkpoint interval in hours; `0` disables wall-clock checkpointing |
 | `--checkpoint_keep` | `2` | Number of completed checkpoint files retained |
+| `--max_walltime` | `0` | Gracefully checkpoint and exit before this elapsed wall time; `0` disables |
+| `--walltime_safety_margin` | `0.25` | Reserved time, in hours, before `--max_walltime` for final checkpoint writing |
 | `--restart_from` | none | Binary checkpoint file to restart from |
 
 ### Perturbation Options
@@ -641,6 +643,14 @@ checkpoint_XXXXXXXX.bin.tmp -> checkpoint_XXXXXXXX.bin
 The executable writes the temporary file, flushes/closes it, renames it to the final path, and only then applies retention. Retention keeps the most recent `--checkpoint_keep` completed `.bin` files and ignores temporary files.
 
 On restart, the executable validates grid dimensions, precision, lattice identifiers, `tau_f`, `tau_s`, `k_react`, `U0`, `C0`, `delta_ratio`, `Re_delta`, `Sc`, `Da_delta`, `delta0`, `DeltaU`, `nu`, and `D`. Output frequencies may be changed after restart. Main and filter CSV histories are appended, and step-0 output is not regenerated.
+
+For HPC batch queues, `--max_walltime` enables a portable graceful exit that does not rely on scheduler signals. At safe points between completed steps the executable checks:
+
+```text
+elapsed_walltime + estimated_checkpoint_write_time + walltime_safety_margin >= max_walltime
+```
+
+When the condition is met before the requested final step, the code writes a normal atomic checkpoint for the completed step, applies the usual `--checkpoint_keep` retention policy, reports the checkpoint filename, and exits with return code `0`. This forced checkpoint is independent of `--checkpoint_freq` and `--checkpoint_walltime`; normal completion at `--steps` does not force an extra checkpoint.
 
 ### VTK
 
