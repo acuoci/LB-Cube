@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -48,6 +49,9 @@ namespace {
 using FluidLattice = lbm::D3Q27;
 using ScalarLattice = lbm::D3Q7;
 using Real = double;
+
+constexpr std::uint32_t checkpoint_current_format_version = 2;
+constexpr std::uint32_t checkpoint_legacy_full_ping_pong_format_version = 1;
 
 struct Config {
     lbm::double_shear::ParameterizationMode mode{lbm::double_shear::ParameterizationMode::DirectLbm};
@@ -96,6 +100,10 @@ struct Config {
     int filter_joint_pdf_bins{128};
     Real filter_tau_ab_min{-0.5};
     Real filter_tau_ab_max{0.5};
+    int checkpoint_freq{};
+    Real checkpoint_walltime_hours{};
+    int checkpoint_keep{2};
+    std::string restart_from{};
 };
 
 struct PerturbationMode {
@@ -232,6 +240,90 @@ struct ScalarBudgetDiagnostics {
     Real numerical_dissipation_fraction{};
     Real tau_eff{};
     Real tau_eff_star{};
+};
+
+struct RestartState {
+    bool enabled{};
+    int step{};
+    Real kinetic_energy_previous{};
+    int previous_kinetic_energy_step{};
+    Real latest_kinetic_energy_decay_rate{};
+    Real previous_var_z{};
+    int previous_statistics_step{};
+    Real initial_mean_z{};
+    Real initial_mean_rho{};
+    std::filesystem::path source_path{};
+};
+
+struct CheckpointHeader {
+    char magic[16]{};
+    std::uint32_t version{};
+    std::uint32_t header_size{};
+    std::uint64_t step{};
+    std::uint64_t nx{};
+    std::uint64_t ny{};
+    std::uint64_t nz{};
+    std::uint32_t real_size{};
+    std::uint32_t fluid_q{};
+    std::uint32_t scalar_q{};
+    std::uint32_t fluid_d{};
+    std::uint32_t scalar_d{};
+    std::uint32_t fluid_current_buffer{};
+    std::uint32_t species_a_current_buffer{};
+    std::uint32_t species_b_current_buffer{};
+    std::uint32_t reserved{};
+    std::uint64_t fluid_buffer_size{};
+    std::uint64_t scalar_buffer_size{};
+    Real tau_f{};
+    Real tau_s{};
+    Real k_react{};
+    Real u0{};
+    Real c0{};
+    Real delta_ratio{};
+    Real re_delta{};
+    Real sc{};
+    Real da_delta{};
+    Real delta0{};
+    Real delta_u{};
+    Real viscosity{};
+    Real scalar_diffusivity{};
+    Real kinetic_energy_previous{};
+    std::int64_t previous_kinetic_energy_step{};
+    Real latest_kinetic_energy_decay_rate{};
+    Real previous_var_z{};
+    std::int64_t previous_statistics_step{};
+    Real initial_mean_z{};
+    Real initial_mean_rho{};
+    std::uint64_t perturb_number_of_modes{};
+    std::uint32_t perturb_enabled{};
+    Real perturb_target_rms{};
+    Real perturb_achieved_rms{};
+    Real perturb_mean_ux{};
+    Real perturb_mean_uy{};
+    Real perturb_mean_uz{};
+    Real perturb_rms_ux{};
+    Real perturb_rms_uy{};
+    Real perturb_rms_uz{};
+    Real perturb_max_plane_mean_abs_ux{};
+    Real perturb_max_plane_mean_abs_uy{};
+    Real perturb_max_plane_mean_abs_uz{};
+    Real perturb_max_plane_rms{};
+    std::uint64_t perturb_max_plane_rms_y{};
+    Real perturb_y1_plane_rms{};
+    Real perturb_y2_plane_rms{};
+    Real perturb_y1_plane_rms_ux{};
+    Real perturb_y1_plane_rms_uy{};
+    Real perturb_y1_plane_rms_uz{};
+    Real perturb_y2_plane_rms_ux{};
+    Real perturb_y2_plane_rms_uy{};
+    Real perturb_y2_plane_rms_uz{};
+    Real perturb_divergence_rms{};
+    Real perturb_normalized_divergence{};
+    Real perturb_localization_energy_max{};
+    std::uint64_t perturb_localization_peak_y1{};
+    std::uint64_t perturb_localization_peak_y2{};
+    Real perturb_localization_layer_to_bulk_ratio{};
+    std::uint64_t payload_checksum{};
 };
 
 struct ProfilePlaneSums {
@@ -451,6 +543,10 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --filter_joint_pdf_bins <n>    SGS joint PDF bin count per dimension (default 128)\n"
         << "  --filter_tauAB_min <v>         Minimum tau_AB PDF bin edge (default -0.5)\n"
         << "  --filter_tauAB_max <v>         Maximum tau_AB PDF bin edge (default 0.5)\n"
+        << "  --checkpoint_freq <n>          Checkpoint interval in completed steps; 0 disables (default 0)\n"
+        << "  --checkpoint_walltime <hours>  Checkpoint interval in elapsed wall-clock hours; 0 disables (default 0)\n"
+        << "  --checkpoint_keep <n>          Number of completed checkpoints to retain (default 2)\n"
+        << "  --restart_from <file>          Restart from a binary checkpoint; --steps is the absolute final step\n"
         << "  --help                   Show this message\n";
 }
 
@@ -580,6 +676,17 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--filter_tauAB_max") {
             config.filter_tau_ab_max =
                 parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--checkpoint_freq") {
+            config.checkpoint_freq =
+                parse_nonnegative_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--checkpoint_walltime") {
+            config.checkpoint_walltime_hours =
+                parse_real(flag, require_value(index, argc, argv));
+        } else if (flag == "--checkpoint_keep") {
+            config.checkpoint_keep =
+                parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--restart_from") {
+            config.restart_from = require_value(index, argc, argv);
         } else {
             throw std::runtime_error(std::format("unknown option: {}", flag));
         }
@@ -649,6 +756,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     if (config.filter_tau_ab_max <= config.filter_tau_ab_min) {
         throw std::runtime_error(
             "--filter_tauAB_max must be greater than --filter_tauAB_min");
+    }
+    if (config.checkpoint_walltime_hours < Real{}) {
+        throw std::runtime_error("--checkpoint_walltime must be non-negative");
     }
 #ifndef LB_CUBE_HAS_FFTW
     if (config.spectrum_freq > 0) {
@@ -1157,6 +1267,13 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << ", joint filter PDF bins: " << config.filter_joint_pdf_bins << '\n'
         << "tau_AB PDF range: [" << config.filter_tau_ab_min
         << ", " << config.filter_tau_ab_max << "]\n"
+        << "Checkpoint frequency: " << config.checkpoint_freq
+        << (config.checkpoint_freq > 0 ? "" : " (disabled)") << '\n'
+        << "Checkpoint walltime: " << config.checkpoint_walltime_hours
+        << " h" << (config.checkpoint_walltime_hours > Real{} ? "" : " (disabled)") << '\n'
+        << "Checkpoint keep: " << config.checkpoint_keep << '\n'
+        << "Restart from: "
+        << (config.restart_from.empty() ? "none" : config.restart_from) << '\n'
         << "Initial perturbation:\n"
         << "  enabled:                  " << (pert.enabled ? "yes" : "no") << '\n'
         << "  type:                     curl(periodic Gaussian localized vector potential)\n"
@@ -1218,7 +1335,40 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
     return std::format("{:.17g}", static_cast<double>(value));
 }
 
-void write_metadata_json(const Config& config, const PerturbationDefinition& perturbation) {
+[[nodiscard]] std::string json_string(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (const char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            escaped.push_back(ch);
+            break;
+        }
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+void write_metadata_json(
+    const Config& config,
+    const PerturbationDefinition& perturbation,
+    const RestartState& restart_state) {
     std::ofstream metadata{"metadata_double_shear_3d.json"};
     if (!metadata) {
         throw std::runtime_error("failed to open metadata_double_shear_3d.json");
@@ -1266,6 +1416,16 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "  \"filter_joint_pdf_bins\": " << config.filter_joint_pdf_bins << ",\n"
         << "  \"filter_tauAB_min\": " << json_number(config.filter_tau_ab_min) << ",\n"
         << "  \"filter_tauAB_max\": " << json_number(config.filter_tau_ab_max) << ",\n"
+        << "  \"checkpoint_freq\": " << config.checkpoint_freq << ",\n"
+        << "  \"checkpoint_walltime\": " << json_number(config.checkpoint_walltime_hours) << ",\n"
+        << "  \"checkpoint_keep\": " << config.checkpoint_keep << ",\n"
+        << "  \"restart_from\": "
+        << (restart_state.enabled ? json_string(restart_state.source_path.string()) : "null")
+        << ",\n"
+        << "  \"restart_step\": "
+        << (restart_state.enabled ? std::to_string(restart_state.step) : "null")
+        << ",\n"
+        << "  \"checkpoint_format_version\": " << checkpoint_current_format_version << ",\n"
         << "  \"perturbation_type\": \"" << (pert.enabled ? "curl_localized_vector_potential" : "none") << "\",\n"
         << "  \"perturb_amplitude\": " << json_number(config.perturb_amplitude) << ",\n"
         << "  \"perturb_seed\": " << config.perturb_seed << ",\n"
@@ -1304,6 +1464,464 @@ void write_metadata_json(const Config& config, const PerturbationDefinition& per
         << "}\n";
     metadata.flush();
     metadata.close();
+}
+
+[[nodiscard]] constexpr std::array<char, 16> checkpoint_magic() {
+    return {'L', 'B', 'C', 'U', 'B', 'E', '_', 'D',
+            'S', '3', 'D', '_', 'C', 'K', 'P', 'T'};
+}
+
+[[nodiscard]] constexpr std::uint32_t checkpoint_format_version() {
+    return checkpoint_current_format_version;
+}
+
+[[nodiscard]] std::filesystem::path checkpoint_directory() {
+    return "checkpoints_double_shear_3d";
+}
+
+[[nodiscard]] std::filesystem::path checkpoint_path_for_step(int step) {
+    return checkpoint_directory() / std::format("checkpoint_{:08}.bin", step);
+}
+
+void checksum_update(std::uint64_t& checksum, const void* data, std::size_t size) {
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        checksum ^= static_cast<std::uint64_t>(bytes[i]);
+        checksum *= prime;
+    }
+}
+
+template <typename T>
+void checksum_value(std::uint64_t& checksum, const T& value) {
+    checksum_update(checksum, &value, sizeof(T));
+}
+
+template <typename T>
+void checksum_vector(std::uint64_t& checksum, const std::vector<T>& values) {
+    if (!values.empty()) {
+        checksum_update(checksum, values.data(), values.size() * sizeof(T));
+    }
+}
+
+[[nodiscard]] std::uint64_t checkpoint_payload_checksum_common(
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
+    const RestartState& state) {
+    std::uint64_t checksum = 1469598103934665603ULL;
+    checksum_value(checksum, state.step);
+    checksum_value(checksum, state.kinetic_energy_previous);
+    checksum_value(checksum, state.previous_kinetic_energy_step);
+    checksum_value(checksum, state.latest_kinetic_energy_decay_rate);
+    checksum_value(checksum, state.previous_var_z);
+    checksum_value(checksum, state.previous_statistics_step);
+    checksum_value(checksum, state.initial_mean_z);
+    checksum_value(checksum, state.initial_mean_rho);
+    checksum_value(checksum, fluid.current_buffer_index());
+    checksum_value(checksum, species_a.current_buffer_index());
+    checksum_value(checksum, species_b.current_buffer_index());
+    return checksum;
+}
+
+[[nodiscard]] std::uint64_t checkpoint_payload_checksum_compact(
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
+    const RestartState& state) {
+    std::uint64_t checksum =
+        checkpoint_payload_checksum_common(fluid, species_a, species_b, state);
+    checksum_vector(checksum, fluid.raw_buffer(fluid.current_buffer_index()));
+    checksum_vector(checksum, species_a.raw_buffer(species_a.current_buffer_index()));
+    checksum_vector(checksum, species_b.raw_buffer(species_b.current_buffer_index()));
+    return checksum;
+}
+
+[[nodiscard]] std::uint64_t checkpoint_payload_checksum_full_ping_pong(
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
+    const RestartState& state) {
+    std::uint64_t checksum =
+        checkpoint_payload_checksum_common(fluid, species_a, species_b, state);
+    checksum_vector(checksum, fluid.raw_buffer(0));
+    checksum_vector(checksum, fluid.raw_buffer(1));
+    checksum_vector(checksum, species_a.raw_buffer(0));
+    checksum_vector(checksum, species_a.raw_buffer(1));
+    checksum_vector(checksum, species_b.raw_buffer(0));
+    checksum_vector(checksum, species_b.raw_buffer(1));
+    return checksum;
+}
+
+void write_bytes(std::ofstream& stream, const void* data, std::size_t size) {
+    stream.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    if (!stream) {
+        throw std::runtime_error("failed while writing checkpoint data");
+    }
+}
+
+void read_bytes(std::ifstream& stream, void* data, std::size_t size) {
+    stream.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+    if (!stream) {
+        throw std::runtime_error("checkpoint is truncated or unreadable");
+    }
+}
+
+template <typename T>
+void write_vector(std::ofstream& stream, const std::vector<T>& values) {
+    if (!values.empty()) {
+        write_bytes(stream, values.data(), values.size() * sizeof(T));
+    }
+}
+
+template <typename T>
+void read_vector(std::ifstream& stream, std::vector<T>& values) {
+    if (!values.empty()) {
+        read_bytes(stream, values.data(), values.size() * sizeof(T));
+    }
+}
+
+[[nodiscard]] CheckpointHeader make_checkpoint_header(
+    const Config& config,
+    const PerturbationDefinition& perturbation,
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b,
+    const RestartState& state) {
+    CheckpointHeader header{};
+    std::memset(&header, 0, sizeof(header));
+    const auto magic = checkpoint_magic();
+    std::copy(magic.begin(), magic.end(), std::begin(header.magic));
+    header.version = checkpoint_format_version();
+    header.header_size = sizeof(CheckpointHeader);
+    header.step = static_cast<std::uint64_t>(state.step);
+    header.nx = config.nx;
+    header.ny = config.ny;
+    header.nz = config.nz;
+    header.real_size = sizeof(Real);
+    header.fluid_q = FluidLattice::Q;
+    header.scalar_q = ScalarLattice::Q;
+    header.fluid_d = FluidLattice::D;
+    header.scalar_d = ScalarLattice::D;
+    header.fluid_current_buffer =
+        static_cast<std::uint32_t>(fluid.current_buffer_index());
+    header.species_a_current_buffer =
+        static_cast<std::uint32_t>(species_a.current_buffer_index());
+    header.species_b_current_buffer =
+        static_cast<std::uint32_t>(species_b.current_buffer_index());
+    header.fluid_buffer_size = fluid.raw_buffer(0).size();
+    header.scalar_buffer_size = species_a.raw_buffer(0).size();
+    header.tau_f = config.tau_f;
+    header.tau_s = config.tau_s;
+    header.k_react = config.k_react;
+    header.u0 = config.u0;
+    header.c0 = config.c0;
+    header.delta_ratio = config.delta_ratio;
+    header.re_delta = config.re_delta;
+    header.sc = config.sc;
+    header.da_delta = config.da_delta;
+    header.delta0 = config.delta0;
+    header.delta_u = config.delta_u;
+    header.viscosity = config.viscosity;
+    header.scalar_diffusivity = config.scalar_diffusivity;
+    header.kinetic_energy_previous = state.kinetic_energy_previous;
+    header.previous_kinetic_energy_step = state.previous_kinetic_energy_step;
+    header.latest_kinetic_energy_decay_rate = state.latest_kinetic_energy_decay_rate;
+    header.previous_var_z = state.previous_var_z;
+    header.previous_statistics_step = state.previous_statistics_step;
+    header.initial_mean_z = state.initial_mean_z;
+    header.initial_mean_rho = state.initial_mean_rho;
+    const PerturbationDiagnostics& pert = perturbation.diagnostics;
+    header.perturb_number_of_modes = pert.number_of_modes;
+    header.perturb_enabled = pert.enabled ? 1U : 0U;
+    header.perturb_target_rms = pert.target_rms;
+    header.perturb_achieved_rms = pert.achieved_rms;
+    header.perturb_mean_ux = pert.mean_ux;
+    header.perturb_mean_uy = pert.mean_uy;
+    header.perturb_mean_uz = pert.mean_uz;
+    header.perturb_rms_ux = pert.rms_ux;
+    header.perturb_rms_uy = pert.rms_uy;
+    header.perturb_rms_uz = pert.rms_uz;
+    header.perturb_max_plane_mean_abs_ux = pert.max_plane_mean_abs_ux;
+    header.perturb_max_plane_mean_abs_uy = pert.max_plane_mean_abs_uy;
+    header.perturb_max_plane_mean_abs_uz = pert.max_plane_mean_abs_uz;
+    header.perturb_max_plane_rms = pert.max_plane_rms;
+    header.perturb_max_plane_rms_y = pert.max_plane_rms_y;
+    header.perturb_y1_plane_rms = pert.y1_plane_rms;
+    header.perturb_y2_plane_rms = pert.y2_plane_rms;
+    header.perturb_y1_plane_rms_ux = pert.y1_plane_rms_ux;
+    header.perturb_y1_plane_rms_uy = pert.y1_plane_rms_uy;
+    header.perturb_y1_plane_rms_uz = pert.y1_plane_rms_uz;
+    header.perturb_y2_plane_rms_ux = pert.y2_plane_rms_ux;
+    header.perturb_y2_plane_rms_uy = pert.y2_plane_rms_uy;
+    header.perturb_y2_plane_rms_uz = pert.y2_plane_rms_uz;
+    header.perturb_divergence_rms = pert.divergence_rms;
+    header.perturb_normalized_divergence = pert.normalized_divergence;
+    header.perturb_localization_energy_max = pert.localization_energy_max;
+    header.perturb_localization_peak_y1 = pert.localization_peak_y1;
+    header.perturb_localization_peak_y2 = pert.localization_peak_y2;
+    header.perturb_localization_layer_to_bulk_ratio =
+        pert.localization_layer_to_bulk_ratio;
+    header.payload_checksum =
+        checkpoint_payload_checksum_compact(fluid, species_a, species_b, state);
+    return header;
+}
+
+void restore_perturbation_diagnostics(
+    PerturbationDefinition& perturbation,
+    const CheckpointHeader& header) {
+    PerturbationDiagnostics& pert = perturbation.diagnostics;
+    pert.enabled = header.perturb_enabled != 0U;
+    pert.number_of_modes = header.perturb_number_of_modes;
+    pert.target_rms = header.perturb_target_rms;
+    pert.achieved_rms = header.perturb_achieved_rms;
+    pert.mean_ux = header.perturb_mean_ux;
+    pert.mean_uy = header.perturb_mean_uy;
+    pert.mean_uz = header.perturb_mean_uz;
+    pert.rms_ux = header.perturb_rms_ux;
+    pert.rms_uy = header.perturb_rms_uy;
+    pert.rms_uz = header.perturb_rms_uz;
+    pert.max_plane_mean_abs_ux = header.perturb_max_plane_mean_abs_ux;
+    pert.max_plane_mean_abs_uy = header.perturb_max_plane_mean_abs_uy;
+    pert.max_plane_mean_abs_uz = header.perturb_max_plane_mean_abs_uz;
+    pert.max_plane_rms = header.perturb_max_plane_rms;
+    pert.max_plane_rms_y = header.perturb_max_plane_rms_y;
+    pert.y1_plane_rms = header.perturb_y1_plane_rms;
+    pert.y2_plane_rms = header.perturb_y2_plane_rms;
+    pert.y1_plane_rms_ux = header.perturb_y1_plane_rms_ux;
+    pert.y1_plane_rms_uy = header.perturb_y1_plane_rms_uy;
+    pert.y1_plane_rms_uz = header.perturb_y1_plane_rms_uz;
+    pert.y2_plane_rms_ux = header.perturb_y2_plane_rms_ux;
+    pert.y2_plane_rms_uy = header.perturb_y2_plane_rms_uy;
+    pert.y2_plane_rms_uz = header.perturb_y2_plane_rms_uz;
+    pert.divergence_rms = header.perturb_divergence_rms;
+    pert.normalized_divergence = header.perturb_normalized_divergence;
+    pert.localization_energy_max = header.perturb_localization_energy_max;
+    pert.localization_peak_y1 = header.perturb_localization_peak_y1;
+    pert.localization_peak_y2 = header.perturb_localization_peak_y2;
+    pert.localization_layer_to_bulk_ratio =
+        header.perturb_localization_layer_to_bulk_ratio;
+}
+
+void validate_checkpoint_header(const Config& config, const CheckpointHeader& header) {
+    const auto magic = checkpoint_magic();
+    if (!std::equal(magic.begin(), magic.end(), std::begin(header.magic))) {
+        throw std::runtime_error("checkpoint magic identifier does not match LB-Cube double-shear checkpoints");
+    }
+    if (header.version != checkpoint_current_format_version &&
+        header.version != checkpoint_legacy_full_ping_pong_format_version) {
+        throw std::runtime_error(
+            std::format("unsupported checkpoint format version {}", header.version));
+    }
+    if (header.header_size != sizeof(CheckpointHeader)) {
+        throw std::runtime_error("checkpoint header size is incompatible with this executable");
+    }
+    if (header.real_size != sizeof(Real)) {
+        throw std::runtime_error("checkpoint precision does not match this executable");
+    }
+    if (header.fluid_q != FluidLattice::Q || header.fluid_d != FluidLattice::D ||
+        header.scalar_q != ScalarLattice::Q || header.scalar_d != ScalarLattice::D) {
+        throw std::runtime_error("checkpoint lattice/model identifiers are incompatible");
+    }
+    if (header.nx != config.nx || header.ny != config.ny || header.nz != config.nz) {
+        throw std::runtime_error("checkpoint grid dimensions do not match --Nx/--Ny/--Nz");
+    }
+    if (header.fluid_buffer_size !=
+            static_cast<std::uint64_t>(FluidLattice::Q) * config.nx * config.ny * config.nz ||
+        header.scalar_buffer_size !=
+            static_cast<std::uint64_t>(ScalarLattice::Q) * config.nx * config.ny * config.nz) {
+        throw std::runtime_error("checkpoint stored array sizes do not match the requested grid/lattices");
+    }
+    if (header.fluid_current_buffer > 1 || header.species_a_current_buffer > 1 ||
+        header.species_b_current_buffer > 1) {
+        throw std::runtime_error("checkpoint contains an invalid active buffer index");
+    }
+
+    const auto check_close = [](std::string_view name, Real actual, Real expected) {
+        const Real scale = std::max<Real>({Real{1}, std::abs(actual), std::abs(expected)});
+        if (std::abs(actual - expected) > Real{1.0e-11} * scale) {
+            throw std::runtime_error(
+                std::format(
+                    "checkpoint parameter {} is incompatible: checkpoint={}, command-line={}",
+                    name,
+                    actual,
+                    expected));
+        }
+    };
+
+    check_close("tau_f", header.tau_f, config.tau_f);
+    check_close("tau_s", header.tau_s, config.tau_s);
+    check_close("k_react", header.k_react, config.k_react);
+    check_close("U0", header.u0, config.u0);
+    check_close("C0", header.c0, config.c0);
+    check_close("delta_ratio", header.delta_ratio, config.delta_ratio);
+    check_close("Re_delta", header.re_delta, config.re_delta);
+    check_close("Sc", header.sc, config.sc);
+    check_close("Da_delta", header.da_delta, config.da_delta);
+    check_close("delta0", header.delta0, config.delta0);
+    check_close("DeltaU", header.delta_u, config.delta_u);
+    check_close("nu", header.viscosity, config.viscosity);
+    check_close("D", header.scalar_diffusivity, config.scalar_diffusivity);
+}
+
+void write_checkpoint(
+    const Config& config,
+    const PerturbationDefinition& perturbation,
+    int step,
+    Real kinetic_energy_previous,
+    int previous_kinetic_energy_step,
+    Real latest_kinetic_energy_decay_rate,
+    Real previous_var_z,
+    int previous_statistics_step,
+    Real initial_mean_z,
+    Real initial_mean_rho,
+    const lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    std::filesystem::create_directories(checkpoint_directory());
+    const std::filesystem::path final_path = checkpoint_path_for_step(step);
+    const std::filesystem::path tmp_path = final_path.string() + ".tmp";
+    const auto checkpoint_start = std::chrono::high_resolution_clock::now();
+
+    RestartState state{};
+    state.step = step;
+    state.kinetic_energy_previous = kinetic_energy_previous;
+    state.previous_kinetic_energy_step = previous_kinetic_energy_step;
+    state.latest_kinetic_energy_decay_rate = latest_kinetic_energy_decay_rate;
+    state.previous_var_z = previous_var_z;
+    state.previous_statistics_step = previous_statistics_step;
+    state.initial_mean_z = initial_mean_z;
+    state.initial_mean_rho = initial_mean_rho;
+    const CheckpointHeader header =
+        make_checkpoint_header(config, perturbation, fluid, species_a, species_b, state);
+
+    {
+        std::ofstream checkpoint{tmp_path, std::ios::binary | std::ios::trunc};
+        if (!checkpoint) {
+            throw std::runtime_error(
+                std::format("failed to open temporary checkpoint {}", tmp_path.string()));
+        }
+        write_bytes(checkpoint, &header, sizeof(header));
+        write_vector(checkpoint, fluid.raw_buffer(fluid.current_buffer_index()));
+        write_vector(checkpoint, species_a.raw_buffer(species_a.current_buffer_index()));
+        write_vector(checkpoint, species_b.raw_buffer(species_b.current_buffer_index()));
+        checkpoint.flush();
+        if (!checkpoint) {
+            throw std::runtime_error("failed to flush checkpoint file");
+        }
+    }
+
+    std::filesystem::rename(tmp_path, final_path);
+    const auto checkpoint_stop = std::chrono::high_resolution_clock::now();
+    const std::chrono::duration<double> checkpoint_elapsed =
+        checkpoint_stop - checkpoint_start;
+
+    std::vector<std::pair<int, std::filesystem::path>> checkpoints;
+    if (std::filesystem::exists(checkpoint_directory())) {
+        for (const auto& entry : std::filesystem::directory_iterator(checkpoint_directory())) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::string filename = entry.path().filename().string();
+            constexpr std::string_view prefix{"checkpoint_"};
+            constexpr std::string_view suffix{".bin"};
+            if (!filename.starts_with(prefix) || !filename.ends_with(suffix)) {
+                continue;
+            }
+            const std::string step_text = filename.substr(
+                prefix.size(),
+                filename.size() - prefix.size() - suffix.size());
+            try {
+                checkpoints.emplace_back(std::stoi(step_text), entry.path());
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    std::ranges::sort(checkpoints, {}, &std::pair<int, std::filesystem::path>::first);
+    while (checkpoints.size() > static_cast<std::size_t>(config.checkpoint_keep)) {
+        std::filesystem::remove(checkpoints.front().second);
+        checkpoints.erase(checkpoints.begin());
+    }
+
+    std::cout << "Checkpoint written: " << final_path.string()
+              << " (" << std::filesystem::file_size(final_path)
+              << " bytes, " << checkpoint_elapsed.count() << " s)\n"
+              << std::flush;
+}
+
+[[nodiscard]] RestartState read_checkpoint(
+    const Config& config,
+    PerturbationDefinition& perturbation,
+    lbm::LatticeMemory<FluidLattice, Real>& fluid,
+    lbm::LatticeMemory<ScalarLattice, Real>& species_a,
+    lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
+    if (std::filesystem::path{config.restart_from}.extension() == ".tmp") {
+        throw std::runtime_error("refusing to restart from a temporary checkpoint file");
+    }
+    const auto checkpoint_start = std::chrono::high_resolution_clock::now();
+    std::ifstream checkpoint{config.restart_from, std::ios::binary};
+    if (!checkpoint) {
+        throw std::runtime_error(
+            std::format("failed to open restart checkpoint {}", config.restart_from));
+    }
+
+    CheckpointHeader header{};
+    read_bytes(checkpoint, &header, sizeof(header));
+    validate_checkpoint_header(config, header);
+    restore_perturbation_diagnostics(perturbation, header);
+
+    fluid.set_current_buffer_index(static_cast<int>(header.fluid_current_buffer));
+    species_a.set_current_buffer_index(static_cast<int>(header.species_a_current_buffer));
+    species_b.set_current_buffer_index(static_cast<int>(header.species_b_current_buffer));
+
+    if (header.version == checkpoint_legacy_full_ping_pong_format_version) {
+        read_vector(checkpoint, fluid.raw_buffer(0));
+        read_vector(checkpoint, fluid.raw_buffer(1));
+        read_vector(checkpoint, species_a.raw_buffer(0));
+        read_vector(checkpoint, species_a.raw_buffer(1));
+        read_vector(checkpoint, species_b.raw_buffer(0));
+        read_vector(checkpoint, species_b.raw_buffer(1));
+    } else {
+        read_vector(checkpoint, fluid.raw_buffer(fluid.current_buffer_index()));
+        read_vector(checkpoint, species_a.raw_buffer(species_a.current_buffer_index()));
+        read_vector(checkpoint, species_b.raw_buffer(species_b.current_buffer_index()));
+    }
+
+    char trailing_byte{};
+    checkpoint.read(&trailing_byte, 1);
+    if (checkpoint.gcount() != 0) {
+        throw std::runtime_error("checkpoint contains unexpected trailing bytes");
+    }
+
+    RestartState state{};
+    state.enabled = true;
+    state.step = static_cast<int>(header.step);
+    state.kinetic_energy_previous = header.kinetic_energy_previous;
+    state.previous_kinetic_energy_step =
+        static_cast<int>(header.previous_kinetic_energy_step);
+    state.latest_kinetic_energy_decay_rate = header.latest_kinetic_energy_decay_rate;
+    state.previous_var_z = header.previous_var_z;
+    state.previous_statistics_step =
+        static_cast<int>(header.previous_statistics_step);
+    state.initial_mean_z = header.initial_mean_z;
+    state.initial_mean_rho = header.initial_mean_rho;
+    state.source_path = config.restart_from;
+
+    const std::uint64_t checksum =
+        header.version == checkpoint_legacy_full_ping_pong_format_version
+            ? checkpoint_payload_checksum_full_ping_pong(fluid, species_a, species_b, state)
+            : checkpoint_payload_checksum_compact(fluid, species_a, species_b, state);
+    if (checksum != header.payload_checksum) {
+        throw std::runtime_error("checkpoint payload checksum mismatch");
+    }
+    const auto checkpoint_stop = std::chrono::high_resolution_clock::now();
+    const std::chrono::duration<double> checkpoint_elapsed =
+        checkpoint_stop - checkpoint_start;
+    std::cout << "Checkpoint read: " << config.restart_from
+              << " (" << std::filesystem::file_size(config.restart_from)
+              << " bytes, " << checkpoint_elapsed.count() << " s)\n"
+              << std::flush;
+    return state;
 }
 
 [[nodiscard]] lbm::MacroState<FluidLattice, Real> initial_fluid_macro(
@@ -5144,52 +5762,84 @@ void append_statistics(
     statistics.flush();
 }
 
-void run_simulation(const Config& config, const PerturbationDefinition& perturbation) {
-    write_metadata_json(config, perturbation);
-
+void run_simulation(const Config& config) {
     lbm::LatticeMemory<FluidLattice, Real> fluid{config.nx, config.ny, config.nz};
     lbm::LatticeMemory<ScalarLattice, Real> species_a{config.nx, config.ny, config.nz};
     lbm::LatticeMemory<ScalarLattice, Real> species_b{config.nx, config.ny, config.nz};
 
-    initialize_fields(config, perturbation, fluid, species_a, species_b);
+    PerturbationDefinition perturbation{};
+    RestartState restart_state{};
+    if (config.restart_from.empty()) {
+        perturbation = prepare_perturbation(config);
+        initialize_fields(config, perturbation, fluid, species_a, species_b);
+    } else {
+        restart_state = read_checkpoint(
+            config,
+            perturbation,
+            fluid,
+            species_a,
+            species_b);
+        if (config.steps <= restart_state.step) {
+            std::cout << "Restart checkpoint is already at step "
+                      << restart_state.step
+                      << "; requested final --steps is " << config.steps
+                      << ". Nothing to do.\n"
+                      << std::flush;
+            return;
+        }
+    }
+    print_recap(config, perturbation);
+    write_metadata_json(config, perturbation, restart_state);
 
-    std::ofstream statistics{"statistics_double_shear_3d.csv"};
+    std::ofstream statistics{
+        "statistics_double_shear_3d.csv",
+        restart_state.enabled ? std::ios::app : std::ios::trunc};
     if (!statistics) {
         throw std::runtime_error("failed to open statistics_double_shear_3d.csv");
     }
-    statistics
-        << "step,time,u_max,E_k,kinetic_energy_decay_rate,"
-        << "E_perp,E_fluc,uy_rms,uz_rms,uperp_rms,enstrophy,epsilon,"
-        << "mean_Ca,var_Ca,min_Ca,max_Ca,"
-        << "mean_Cb,var_Cb,min_Cb,max_Cb,"
-        << "mean_Cc,var_Cc,rate_true,rate_mixed,reaction_efficiency,"
-        << "mean_Z,var_Z,scalar_variance_decay_rate,scalar_budget_ratio,"
-        << "min_Z,max_Z,"
-        << "mean_chi_Z,rms_chi_Z,max_chi_Z,var_chi_Z,"
-        << "tau_mix,tau_mix_star,scalar_numerical_dissipation_fraction,"
-        << "tau_eff,tau_eff_star,Da_mix,"
-        << "cov_AB,I_seg,rho_AB,"
-        << "eta_K,eta_B,dx_over_etaK,dx_over_etaB,"
-        << "mean_gradZ2,mean_gradZ4,F_gradZ,"
-        << "theta_1,theta_2,theta_avg,Re_theta,"
-        << "delta_omega_1,delta_omega_2,delta_omega_avg,"
-        << "delta_Z_1,delta_Z_2,delta_Z_avg,"
-        << "rms_reaction_rate,max_reaction_rate,"
-        << "reaction_effective_volume_fraction,corr_R_chiZ,"
-        << "tau_eta,tau_eta_star,Da_eta,"
-        << "mean_rho,min_rho,max_rho,rho_rms_fluct,Mach_max,"
-        << "mean_Z_drift,relative_mass_drift"
-        << std::endl;
-    statistics.flush();
+    if (!restart_state.enabled ||
+        !std::filesystem::exists("statistics_double_shear_3d.csv") ||
+        std::filesystem::file_size("statistics_double_shear_3d.csv") == 0) {
+        statistics
+            << "step,time,u_max,E_k,kinetic_energy_decay_rate,"
+            << "E_perp,E_fluc,uy_rms,uz_rms,uperp_rms,enstrophy,epsilon,"
+            << "mean_Ca,var_Ca,min_Ca,max_Ca,"
+            << "mean_Cb,var_Cb,min_Cb,max_Cb,"
+            << "mean_Cc,var_Cc,rate_true,rate_mixed,reaction_efficiency,"
+            << "mean_Z,var_Z,scalar_variance_decay_rate,scalar_budget_ratio,"
+            << "min_Z,max_Z,"
+            << "mean_chi_Z,rms_chi_Z,max_chi_Z,var_chi_Z,"
+            << "tau_mix,tau_mix_star,scalar_numerical_dissipation_fraction,"
+            << "tau_eff,tau_eff_star,Da_mix,"
+            << "cov_AB,I_seg,rho_AB,"
+            << "eta_K,eta_B,dx_over_etaK,dx_over_etaB,"
+            << "mean_gradZ2,mean_gradZ4,F_gradZ,"
+            << "theta_1,theta_2,theta_avg,Re_theta,"
+            << "delta_omega_1,delta_omega_2,delta_omega_avg,"
+            << "delta_Z_1,delta_Z_2,delta_Z_avg,"
+            << "rms_reaction_rate,max_reaction_rate,"
+            << "reaction_effective_volume_fraction,corr_R_chiZ,"
+            << "tau_eta,tau_eta_star,Da_eta,"
+            << "mean_rho,min_rho,max_rho,rho_rms_fluct,Mach_max,"
+            << "mean_Z_drift,relative_mass_drift"
+            << std::endl;
+        statistics.flush();
+    }
 
     std::ofstream filter_statistics;
     if (filtering_enabled(config)) {
-        filter_statistics.open("filter_statistics_double_shear_3d.csv");
+        filter_statistics.open(
+            "filter_statistics_double_shear_3d.csv",
+            restart_state.enabled ? std::ios::app : std::ios::trunc);
         if (!filter_statistics) {
             throw std::runtime_error(
                 "failed to open filter_statistics_double_shear_3d.csv");
         }
-        write_filter_statistics_header(filter_statistics);
+        if (!restart_state.enabled ||
+            !std::filesystem::exists("filter_statistics_double_shear_3d.csv") ||
+            std::filesystem::file_size("filter_statistics_double_shear_3d.csv") == 0) {
+            write_filter_statistics_header(filter_statistics);
+        }
     }
 
     const Real omega_f = Real{1} / config.tau_f;
@@ -5204,69 +5854,92 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
     const auto start = std::chrono::high_resolution_clock::now();
 
     FlowDiagnostics flow = compute_flow_diagnostics(config, fluid);
-    Real kinetic_energy_previous = flow.mean_kinetic_energy;
-    Real latest_kinetic_energy_decay_rate{};
+    Real kinetic_energy_previous =
+        restart_state.enabled ? restart_state.kinetic_energy_previous
+                              : flow.mean_kinetic_energy;
+    int previous_kinetic_energy_step =
+        restart_state.enabled ? restart_state.previous_kinetic_energy_step : 0;
+    Real latest_kinetic_energy_decay_rate =
+        restart_state.enabled ? restart_state.latest_kinetic_energy_decay_rate : Real{};
     ScalarBudgetDiagnostics scalar_budget{};
 
     ScalarDiagnostics scalar =
         compute_scalar_diagnostics(config, species_a, species_b);
-    Real previous_var_z = scalar.var_z;
-    int previous_statistics_step = 0;
-    const Real initial_mean_z = scalar.mean_z;
-    const Real initial_mean_rho = flow.mean_rho;
-    std::cout << "Initial profile check: "
-              << "ux(y=0)=" << config.u0 * shear_profile(config, 0)
-              << ", ux(y=Ny/2)=" << config.u0 * shear_profile(config, config.ny / 2)
-              << ", min_Ca=" << scalar.min_ca
-              << ", max_Ca=" << scalar.max_ca
-              << ", min_Cb=" << scalar.min_cb
-              << ", max_Cb=" << scalar.max_cb
-              << ", mean_Ca=" << scalar.mean_ca
-              << ", mean_Cb=" << scalar.mean_cb << '\n'
-              << std::flush;
-    append_statistics(
-        statistics,
-        config,
-        0,
-        Real{},
-        flow,
-        latest_kinetic_energy_decay_rate,
-        scalar,
-        scalar_budget,
-        initial_mean_z,
-        initial_mean_rho);
-    if (config.vtk_freq > 0) {
-        write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
-    }
-    if (config.profile_freq > 0) {
-        write_y_profile_csv(config, profile_dir, 0, fluid, species_a, species_b);
-    }
-    if (config.pdf_freq > 0) {
-        write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
-    }
-    if (filtering_enabled(config)) {
-        write_filter_statistics(
-            filter_statistics,
-            filter_conditional_dir,
-            filter_pdf_dir,
+    Real previous_var_z =
+        restart_state.enabled ? restart_state.previous_var_z : scalar.var_z;
+    int previous_statistics_step =
+        restart_state.enabled ? restart_state.previous_statistics_step : 0;
+    const Real initial_mean_z =
+        restart_state.enabled ? restart_state.initial_mean_z : scalar.mean_z;
+    const Real initial_mean_rho =
+        restart_state.enabled ? restart_state.initial_mean_rho : flow.mean_rho;
+
+    if (restart_state.enabled) {
+        std::cout << "Restarted from " << restart_state.source_path.string()
+                  << " at completed step " << restart_state.step
+                  << "; continuing to absolute final step " << config.steps
+                  << ".\n"
+                  << std::flush;
+    } else {
+        std::cout << "Initial profile check: "
+                  << "ux(y=0)=" << config.u0 * shear_profile(config, 0)
+                  << ", ux(y=Ny/2)=" << config.u0 * shear_profile(config, config.ny / 2)
+                  << ", min_Ca=" << scalar.min_ca
+                  << ", max_Ca=" << scalar.max_ca
+                  << ", min_Cb=" << scalar.min_cb
+                  << ", max_Cb=" << scalar.max_cb
+                  << ", mean_Ca=" << scalar.mean_ca
+                  << ", mean_Cb=" << scalar.mean_cb << '\n'
+                  << std::flush;
+        append_statistics(
+            statistics,
             config,
             0,
-            compute_resolution_diagnostics(config, flow),
-            species_a,
-            species_b);
-    }
-    if (config.spectrum_freq > 0) {
-        write_scalar_spectrum_outputs(
-            config,
-            spectrum_dir,
-            0,
-            compute_resolution_diagnostics(config, flow),
-            fluid,
-            species_a,
-            species_b);
+            Real{},
+            flow,
+            latest_kinetic_energy_decay_rate,
+            scalar,
+            scalar_budget,
+            initial_mean_z,
+            initial_mean_rho);
+        if (config.vtk_freq > 0) {
+            write_binary_vtk(config, vtk_dir, 0, fluid, species_a, species_b);
+        }
+        if (config.profile_freq > 0) {
+            write_y_profile_csv(config, profile_dir, 0, fluid, species_a, species_b);
+        }
+        if (config.pdf_freq > 0) {
+            write_pdf_outputs(config, pdf_dir, 0, species_a, species_b);
+        }
+        if (filtering_enabled(config)) {
+            write_filter_statistics(
+                filter_statistics,
+                filter_conditional_dir,
+                filter_pdf_dir,
+                config,
+                0,
+                compute_resolution_diagnostics(config, flow),
+                species_a,
+                species_b);
+        }
+        if (config.spectrum_freq > 0) {
+            write_scalar_spectrum_outputs(
+                config,
+                spectrum_dir,
+                0,
+                compute_resolution_diagnostics(config, flow),
+                fluid,
+                species_a,
+                species_b);
+        }
     }
 
-    for (int step = 1; step <= config.steps; ++step) {
+    const int first_step = restart_state.enabled ? restart_state.step + 1 : 1;
+    auto next_walltime_checkpoint = start +
+        std::chrono::duration<double>(config.checkpoint_walltime_hours * 3600.0);
+    int last_checkpoint_step = restart_state.enabled ? restart_state.step : -1;
+
+    for (int step = first_step; step <= config.steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, lbm::CollisionType::RLBM>(fluid, omega_f);
         lbm::step_reaction_AB<FluidLattice, ScalarLattice, Real>(
             fluid,
@@ -5278,10 +5951,14 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
 
         if (step % config.stat_freq == 0) {
             flow = compute_flow_diagnostics(config, fluid);
+            const int kinetic_delta_steps = step - previous_kinetic_energy_step;
             latest_kinetic_energy_decay_rate =
-                (kinetic_energy_previous - flow.mean_kinetic_energy) /
-                static_cast<Real>(config.stat_freq);
+                kinetic_delta_steps > 0
+                    ? (kinetic_energy_previous - flow.mean_kinetic_energy) /
+                          static_cast<Real>(kinetic_delta_steps)
+                    : Real{};
             kinetic_energy_previous = flow.mean_kinetic_energy;
+            previous_kinetic_energy_step = step;
 
             scalar = compute_scalar_diagnostics(config, species_a, species_b);
             scalar_budget = compute_scalar_budget_diagnostics(
@@ -5376,6 +6053,39 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
                 species_b);
         }
 
+        bool checkpoint_due = false;
+        if (config.checkpoint_freq > 0 && step % config.checkpoint_freq == 0) {
+            checkpoint_due = true;
+        }
+        if (config.checkpoint_walltime_hours > Real{}) {
+            const auto now = std::chrono::high_resolution_clock::now();
+            if (now >= next_walltime_checkpoint) {
+                checkpoint_due = true;
+                do {
+                    next_walltime_checkpoint +=
+                        std::chrono::duration<double>(
+                            config.checkpoint_walltime_hours * 3600.0);
+                } while (now >= next_walltime_checkpoint);
+            }
+        }
+        if (checkpoint_due && step != last_checkpoint_step) {
+            write_checkpoint(
+                config,
+                perturbation,
+                step,
+                kinetic_energy_previous,
+                previous_kinetic_energy_step,
+                latest_kinetic_energy_decay_rate,
+                previous_var_z,
+                previous_statistics_step,
+                initial_mean_z,
+                initial_mean_rho,
+                fluid,
+                species_a,
+                species_b);
+            last_checkpoint_step = step;
+        }
+
         if (!std::isfinite(flow.u_max) || !std::isfinite(flow.mean_kinetic_energy)) {
             std::cout << "[D3Q27_RLBM] Solver produced non-finite diagnostics at step "
                       << step << '\n'
@@ -5425,9 +6135,7 @@ void run_simulation(const Config& config, const PerturbationDefinition& perturba
 int main(int argc, char** argv) {
     try {
         const Config config = parse_arguments(argc, argv);
-        const PerturbationDefinition perturbation = prepare_perturbation(config);
-        print_recap(config, perturbation);
-        run_simulation(config, perturbation);
+        run_simulation(config);
     } catch (const std::exception& error) {
         std::cerr << "Fatal error: " << error.what() << '\n';
         print_usage(

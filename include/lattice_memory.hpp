@@ -13,6 +13,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -197,6 +198,41 @@ public:
      */
     void swap_buffers() noexcept {
         current_buffer_index_ = 1 - current_buffer_index_;
+    }
+
+    /**
+     * @brief Expose one raw ping-pong buffer for checkpoint serialization.
+     *
+     * Buffer index 0 refers to the first owned population vector and index 1 to
+     * the second. The active time level is still determined by
+     * `current_buffer_index()`.
+     */
+    [[nodiscard]] std::vector<Real>& raw_buffer(int buffer_index) {
+        return buffer_index == 0 ? pop_0 : pop_1;
+    }
+
+    /**
+     * @brief Read-only raw buffer access for checkpoint serialization.
+     */
+    [[nodiscard]] const std::vector<Real>& raw_buffer(int buffer_index) const {
+        return buffer_index == 0 ? pop_0 : pop_1;
+    }
+
+    /**
+     * @brief Index of the currently active ping-pong buffer.
+     */
+    [[nodiscard]] int current_buffer_index() const noexcept {
+        return current_buffer_index_;
+    }
+
+    /**
+     * @brief Restore the active ping-pong buffer index from a checkpoint.
+     */
+    void set_current_buffer_index(int buffer_index) {
+        if (buffer_index != 0 && buffer_index != 1) {
+            throw std::invalid_argument("buffer_index must be 0 or 1");
+        }
+        current_buffer_index_ = buffer_index;
     }
 
 private:

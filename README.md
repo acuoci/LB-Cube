@@ -416,6 +416,10 @@ Use `--help` to print the executable's command-line reference.
 | `--pdf_freq` | `0` | PDF and conditional-statistics interval; `0` disables PDFs |
 | `--spectrum_freq` | `0` | Spectral-output interval; `0` disables spectra |
 | `--filter_freq` | `0` | A-priori filter interval; `0` disables filtering |
+| `--checkpoint_freq` | `0` | Checkpoint interval in completed steps; `0` disables step-based checkpointing |
+| `--checkpoint_walltime` | `0` | Approximate wall-clock checkpoint interval in hours; `0` disables wall-clock checkpointing |
+| `--checkpoint_keep` | `2` | Number of completed checkpoint files retained |
+| `--restart_from` | none | Binary checkpoint file to restart from |
 
 ### Perturbation Options
 
@@ -477,6 +481,8 @@ The naive filter remains in the codebase as a reference implementation for tests
 ### Running the Solver
 
 The executable writes outputs in the current working directory. For production runs, launch from a dedicated run directory so CSV, metadata, VTK, profile, PDF, spectrum, and filtering outputs remain grouped with the job.
+
+Checkpointing is optional. `--steps` always means the absolute final simulation step, including after restart. For example, restarting from `checkpoint_00012000.bin` with `--steps 28800` continues from completed step 12000 through step 28800.
 
 #### Direct Mode Example
 
@@ -601,6 +607,40 @@ metadata_double_shear_3d.json
 ```
 
 The metadata records the parameterization mode, numerical parameters, physical nondimensional groups, perturbation definition, output frequencies, PDF/filter/spectrum settings, and perturbation diagnostics.
+
+For restarted runs it also records `restart_from`, `restart_step`, and the checkpoint format version.
+
+### Checkpoints
+
+Directory:
+
+```text
+checkpoints_double_shear_3d/
+```
+
+Checkpoint files use names such as:
+
+```text
+checkpoint_00006400.bin
+```
+
+Each checkpoint is written after a fully completed time step. Current checkpoints use format version 2 and store only the active population buffer for:
+
+- `D3Q27` fluid populations
+- `D3Q7` species `A` populations
+- `D3Q7` species `B` populations
+
+The inactive ping-pong buffers are scratch storage and are completely overwritten by the next out-of-place LBM step. They are therefore reconstructed as ordinary allocated write buffers on restart rather than serialized. The checkpoint also stores the active ping-pong buffer indices, current completed step, initial diagnostic reference means, previous statistics state, previous kinetic-energy state, and compatibility metadata. Product `C` is not stored because it is reconstructed diagnostically from `A` and `B`. Legacy format-version-1 checkpoints that stored both ping-pong buffers can still be read for restart compatibility; new checkpoints are always written in the compact version-2 format.
+
+Checkpoint writes are atomic-style:
+
+```text
+checkpoint_XXXXXXXX.bin.tmp -> checkpoint_XXXXXXXX.bin
+```
+
+The executable writes the temporary file, flushes/closes it, renames it to the final path, and only then applies retention. Retention keeps the most recent `--checkpoint_keep` completed `.bin` files and ignores temporary files.
+
+On restart, the executable validates grid dimensions, precision, lattice identifiers, `tau_f`, `tau_s`, `k_react`, `U0`, `C0`, `delta_ratio`, `Re_delta`, `Sc`, `Da_delta`, `delta0`, `DeltaU`, `nu`, and `D`. Output frequencies may be changed after restart. Main and filter CSV histories are appended, and step-0 output is not regenerated.
 
 ### VTK
 
