@@ -419,6 +419,7 @@ Use `--help` to print the executable's command-line reference.
 | `--checkpoint_freq` | `0` | Checkpoint interval in completed steps; `0` disables step-based checkpointing |
 | `--checkpoint_walltime` | `0` | Approximate wall-clock checkpoint interval in hours; `0` disables wall-clock checkpointing |
 | `--checkpoint_keep` | `2` | Number of completed checkpoint files retained |
+| `--checkpoint_assumed_bandwidth` | `250` | Initial checkpoint write-bandwidth estimate in MiB/s for graceful walltime planning |
 | `--max_walltime` | `0` | Gracefully checkpoint and exit before this elapsed wall time; `0` disables |
 | `--walltime_safety_margin` | `0.25` | Reserved time, in hours, before `--max_walltime` for final checkpoint writing |
 | `--restart_from` | none | Binary checkpoint file to restart from |
@@ -650,7 +651,7 @@ For HPC batch queues, `--max_walltime` enables a portable graceful exit that doe
 elapsed_walltime + estimated_checkpoint_write_time + walltime_safety_margin >= max_walltime
 ```
 
-When the condition is met before the requested final step, the code writes a normal atomic checkpoint for the completed step, applies the usual `--checkpoint_keep` retention policy, reports the checkpoint filename, and exits with return code `0`. This forced checkpoint is independent of `--checkpoint_freq` and `--checkpoint_walltime`; normal completion at `--steps` does not force an extra checkpoint.
+Before the first checkpoint, `estimated_checkpoint_write_time` is initialized from the compact version-2 checkpoint size and `--checkpoint_assumed_bandwidth`, with a minimum floor of 1 second. After successful checkpoint writes, the estimate is refined conservatively as the larger of the initial estimate and `1.25 * max_measured_checkpoint_write_time`. When the condition is met before the requested final step, the code writes a normal atomic checkpoint for the completed step, applies the usual `--checkpoint_keep` retention policy, reports the checkpoint filename, and exits with return code `0`. This forced checkpoint is independent of `--checkpoint_freq` and `--checkpoint_walltime`; normal completion at `--steps` does not force an extra checkpoint.
 
 ### VTK
 

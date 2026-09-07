@@ -52,6 +52,9 @@ using Real = double;
 
 constexpr std::uint32_t checkpoint_current_format_version = 2;
 constexpr std::uint32_t checkpoint_legacy_full_ping_pong_format_version = 1;
+constexpr double checkpoint_write_estimate_floor_seconds = 1.0;
+constexpr double checkpoint_write_estimate_safety_factor = 1.25;
+constexpr double bytes_per_mebibyte = 1024.0 * 1024.0;
 
 struct Config {
     lbm::double_shear::ParameterizationMode mode{lbm::double_shear::ParameterizationMode::DirectLbm};
@@ -103,6 +106,7 @@ struct Config {
     int checkpoint_freq{};
     Real checkpoint_walltime_hours{};
     int checkpoint_keep{2};
+    Real checkpoint_assumed_bandwidth_mb_per_s{250};
     Real max_walltime_hours{};
     Real walltime_safety_margin_hours{0.25};
     std::string restart_from{};
@@ -370,6 +374,25 @@ struct PdfCounters {
     return config.nx * config.ny * config.nz;
 }
 
+[[nodiscard]] std::uint64_t compact_checkpoint_size_bytes(const Config& config) {
+    const std::uint64_t cells = static_cast<std::uint64_t>(cell_count(config));
+    constexpr std::uint64_t population_values_per_cell =
+        static_cast<std::uint64_t>(FluidLattice::Q) +
+        2ULL * static_cast<std::uint64_t>(ScalarLattice::Q);
+    return static_cast<std::uint64_t>(sizeof(CheckpointHeader)) +
+        cells * population_values_per_cell * static_cast<std::uint64_t>(sizeof(Real));
+}
+
+[[nodiscard]] double initial_checkpoint_write_estimate_seconds(const Config& config) {
+    const double bandwidth_bytes_per_second =
+        static_cast<double>(config.checkpoint_assumed_bandwidth_mb_per_s) *
+        bytes_per_mebibyte;
+    const double bandwidth_estimate =
+        static_cast<double>(compact_checkpoint_size_bytes(config)) /
+        bandwidth_bytes_per_second;
+    return std::max(checkpoint_write_estimate_floor_seconds, bandwidth_estimate);
+}
+
 [[nodiscard]] std::string require_value(int& index, int argc, char** argv) {
     if (index + 1 >= argc) {
         throw std::runtime_error(std::format("missing value for {}", argv[index]));
@@ -553,6 +576,7 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         << "  --checkpoint_freq <n>          Checkpoint interval in completed steps; 0 disables (default 0)\n"
         << "  --checkpoint_walltime <hours>  Checkpoint interval in elapsed wall-clock hours; 0 disables (default 0)\n"
         << "  --checkpoint_keep <n>          Number of completed checkpoints to retain (default 2)\n"
+        << "  --checkpoint_assumed_bandwidth <MB/s>  Initial checkpoint write bandwidth estimate (default 250)\n"
         << "  --max_walltime <hours>         Gracefully checkpoint and exit before this elapsed walltime; 0 disables (default 0)\n"
         << "  --walltime_safety_margin <h>   Safety margin reserved before max walltime (default 0.25)\n"
         << "  --restart_from <file>          Restart from a binary checkpoint; --steps is the absolute final step\n"
@@ -694,6 +718,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
         } else if (flag == "--checkpoint_keep") {
             config.checkpoint_keep =
                 parse_int(flag, require_value(index, argc, argv));
+        } else if (flag == "--checkpoint_assumed_bandwidth") {
+            config.checkpoint_assumed_bandwidth_mb_per_s =
+                parse_real(flag, require_value(index, argc, argv));
         } else if (flag == "--max_walltime") {
             config.max_walltime_hours =
                 parse_real(flag, require_value(index, argc, argv));
@@ -774,6 +801,9 @@ void print_usage(std::ostream& stream, std::string_view executable) {
     }
     if (config.checkpoint_walltime_hours < Real{}) {
         throw std::runtime_error("--checkpoint_walltime must be non-negative");
+    }
+    if (config.checkpoint_assumed_bandwidth_mb_per_s <= Real{}) {
+        throw std::runtime_error("--checkpoint_assumed_bandwidth must be positive");
     }
     if (config.max_walltime_hours < Real{}) {
         throw std::runtime_error("--max_walltime must be non-negative");
@@ -1293,10 +1323,20 @@ void print_recap(const Config& config, const PerturbationDefinition& perturbatio
         << "Checkpoint walltime: " << config.checkpoint_walltime_hours
         << " h" << (config.checkpoint_walltime_hours > Real{} ? "" : " (disabled)") << '\n'
         << "Checkpoint keep: " << config.checkpoint_keep << '\n'
+        << "Checkpoint assumed bandwidth: "
+        << config.checkpoint_assumed_bandwidth_mb_per_s << " MiB/s\n"
         << "Maximum walltime: " << config.max_walltime_hours
         << " h" << (config.max_walltime_hours > Real{} ? "" : " (disabled)") << '\n'
         << "Walltime safety margin: " << config.walltime_safety_margin_hours
-        << " h\n"
+        << " h\n";
+    if (config.max_walltime_hours > Real{}) {
+        std::cout << "Initial checkpoint write estimate: "
+                  << initial_checkpoint_write_estimate_seconds(config)
+                  << " s (compact size "
+                  << compact_checkpoint_size_bytes(config)
+                  << " bytes)\n";
+    }
+    std::cout
         << "Restart from: "
         << (config.restart_from.empty() ? "none" : config.restart_from) << '\n'
         << "Initial perturbation:\n"
@@ -1444,6 +1484,8 @@ void write_metadata_json(
         << "  \"checkpoint_freq\": " << config.checkpoint_freq << ",\n"
         << "  \"checkpoint_walltime\": " << json_number(config.checkpoint_walltime_hours) << ",\n"
         << "  \"checkpoint_keep\": " << config.checkpoint_keep << ",\n"
+        << "  \"checkpoint_assumed_bandwidth\": "
+        << json_number(config.checkpoint_assumed_bandwidth_mb_per_s) << ",\n"
         << "  \"max_walltime\": " << json_number(config.max_walltime_hours) << ",\n"
         << "  \"walltime_safety_margin\": "
         << json_number(config.walltime_safety_margin_hours) << ",\n"
@@ -5967,8 +6009,10 @@ void run_simulation(const Config& config) {
     auto next_walltime_checkpoint = start +
         std::chrono::duration<double>(config.checkpoint_walltime_hours * 3600.0);
     int last_checkpoint_step = restart_state.enabled ? restart_state.step : -1;
-    constexpr double checkpoint_write_estimate_floor_seconds = 1.0;
-    double checkpoint_write_estimate_seconds = checkpoint_write_estimate_floor_seconds;
+    const double initial_checkpoint_write_estimate =
+        initial_checkpoint_write_estimate_seconds(config);
+    double max_measured_checkpoint_write_seconds = 0.0;
+    double checkpoint_write_estimate_seconds = initial_checkpoint_write_estimate;
     bool graceful_walltime_exit = false;
 
     for (int step = first_step; step <= config.steps; ++step) {
@@ -6100,9 +6144,12 @@ void run_simulation(const Config& config) {
                 fluid,
                 species_a,
                 species_b);
+            max_measured_checkpoint_write_seconds =
+                std::max(max_measured_checkpoint_write_seconds, result.elapsed_seconds);
             checkpoint_write_estimate_seconds = std::max(
-                checkpoint_write_estimate_seconds,
-                std::max(result.elapsed_seconds, checkpoint_write_estimate_floor_seconds));
+                initial_checkpoint_write_estimate,
+                checkpoint_write_estimate_safety_factor *
+                    max_measured_checkpoint_write_seconds);
             last_checkpoint_step = checkpoint_step;
             return result;
         };
