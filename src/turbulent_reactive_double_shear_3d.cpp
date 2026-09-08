@@ -50,7 +50,8 @@ using FluidLattice = lbm::D3Q27;
 using ScalarLattice = lbm::D3Q7;
 using Real = double;
 
-constexpr std::uint32_t checkpoint_current_format_version = 2;
+constexpr std::uint32_t checkpoint_current_format_version = 3;
+constexpr std::uint32_t checkpoint_legacy_compact_no_limiter_format_version = 2;
 constexpr std::uint32_t checkpoint_legacy_full_ping_pong_format_version = 1;
 constexpr double checkpoint_write_estimate_floor_seconds = 1.0;
 constexpr double checkpoint_write_estimate_safety_factor = 1.25;
@@ -258,6 +259,8 @@ struct RestartState {
     int previous_statistics_step{};
     Real initial_mean_z{};
     Real initial_mean_rho{};
+    lbm::ScalarLimiterDiagnostics<Real> limiter_interval{};
+    lbm::ScalarLimiterDiagnostics<Real> limiter_cumulative{};
     std::filesystem::path source_path{};
 };
 
@@ -305,6 +308,40 @@ struct CheckpointHeader {
     std::int64_t previous_statistics_step{};
     Real initial_mean_z{};
     Real initial_mean_rho{};
+    std::uint64_t limiter_interval_activations_a{};
+    std::uint64_t limiter_interval_activations_b{};
+    std::uint64_t limiter_interval_activations_either{};
+    std::uint64_t limiter_interval_activations_both{};
+    Real limiter_interval_delta_mass_a{};
+    Real limiter_interval_delta_mass_b{};
+    Real limiter_interval_delta_mass_diff{};
+    Real limiter_interval_sum_abs_delta_a{};
+    Real limiter_interval_sum_abs_delta_b{};
+    Real limiter_interval_sum_square_delta_a{};
+    Real limiter_interval_sum_square_delta_b{};
+    Real limiter_interval_max_abs_delta_a{};
+    Real limiter_interval_max_abs_delta_b{};
+    Real limiter_interval_positive_correction_a{};
+    Real limiter_interval_negative_correction_a{};
+    Real limiter_interval_positive_correction_b{};
+    Real limiter_interval_negative_correction_b{};
+    std::uint64_t limiter_cumulative_activations_a{};
+    std::uint64_t limiter_cumulative_activations_b{};
+    std::uint64_t limiter_cumulative_activations_either{};
+    std::uint64_t limiter_cumulative_activations_both{};
+    Real limiter_cumulative_delta_mass_a{};
+    Real limiter_cumulative_delta_mass_b{};
+    Real limiter_cumulative_delta_mass_diff{};
+    Real limiter_cumulative_sum_abs_delta_a{};
+    Real limiter_cumulative_sum_abs_delta_b{};
+    Real limiter_cumulative_sum_square_delta_a{};
+    Real limiter_cumulative_sum_square_delta_b{};
+    Real limiter_cumulative_max_abs_delta_a{};
+    Real limiter_cumulative_max_abs_delta_b{};
+    Real limiter_cumulative_positive_correction_a{};
+    Real limiter_cumulative_negative_correction_a{};
+    Real limiter_cumulative_positive_correction_b{};
+    Real limiter_cumulative_negative_correction_b{};
     std::uint64_t perturb_number_of_modes{};
     std::uint32_t perturb_enabled{};
     Real perturb_target_rms{};
@@ -391,6 +428,81 @@ struct PdfCounters {
         static_cast<double>(compact_checkpoint_size_bytes(config)) /
         bandwidth_bytes_per_second;
     return std::max(checkpoint_write_estimate_floor_seconds, bandwidth_estimate);
+}
+
+void add_limiter_diagnostics(
+    lbm::ScalarLimiterDiagnostics<Real>& total,
+    const lbm::ScalarLimiterDiagnostics<Real>& increment) {
+    total.activations_a += increment.activations_a;
+    total.activations_b += increment.activations_b;
+    total.activations_either += increment.activations_either;
+    total.activations_both += increment.activations_both;
+    total.delta_mass_a += increment.delta_mass_a;
+    total.delta_mass_b += increment.delta_mass_b;
+    total.delta_mass_diff += increment.delta_mass_diff;
+    total.sum_abs_delta_a += increment.sum_abs_delta_a;
+    total.sum_abs_delta_b += increment.sum_abs_delta_b;
+    total.sum_square_delta_a += increment.sum_square_delta_a;
+    total.sum_square_delta_b += increment.sum_square_delta_b;
+    total.max_abs_delta_a =
+        std::max(total.max_abs_delta_a, increment.max_abs_delta_a);
+    total.max_abs_delta_b =
+        std::max(total.max_abs_delta_b, increment.max_abs_delta_b);
+    total.positive_correction_a += increment.positive_correction_a;
+    total.negative_correction_a += increment.negative_correction_a;
+    total.positive_correction_b += increment.positive_correction_b;
+    total.negative_correction_b += increment.negative_correction_b;
+}
+
+[[nodiscard]] Real limiter_fraction(
+    std::uint64_t activations,
+    std::size_t cells,
+    int interval_steps) {
+    if (interval_steps <= 0 || cells == 0) {
+        return Real{};
+    }
+    const long double denominator =
+        static_cast<long double>(cells) *
+        static_cast<long double>(interval_steps);
+    return static_cast<Real>(
+        static_cast<long double>(activations) / denominator);
+}
+
+[[nodiscard]] Real limiter_mean_abs_delta(
+    const lbm::ScalarLimiterDiagnostics<Real>& diagnostics,
+    bool species_a) {
+    const std::uint64_t activations =
+        species_a ? diagnostics.activations_a : diagnostics.activations_b;
+    if (activations == 0) {
+        return Real{};
+    }
+    const Real sum_abs =
+        species_a ? diagnostics.sum_abs_delta_a : diagnostics.sum_abs_delta_b;
+    return sum_abs / static_cast<Real>(activations);
+}
+
+[[nodiscard]] Real limiter_rms_delta(
+    const lbm::ScalarLimiterDiagnostics<Real>& diagnostics,
+    bool species_a) {
+    const std::uint64_t activations =
+        species_a ? diagnostics.activations_a : diagnostics.activations_b;
+    if (activations == 0) {
+        return Real{};
+    }
+    const Real sum_square =
+        species_a ? diagnostics.sum_square_delta_a : diagnostics.sum_square_delta_b;
+    return std::sqrt(std::max(Real{}, sum_square / static_cast<Real>(activations)));
+}
+
+[[nodiscard]] Real limiter_delta_mean_z(
+    const Config& config,
+    const lbm::ScalarLimiterDiagnostics<Real>& diagnostics) {
+    const std::size_t cells = cell_count(config);
+    if (cells == 0 || config.c0 == Real{}) {
+        return Real{};
+    }
+    return Real{0.5} * diagnostics.delta_mass_diff /
+        (config.c0 * static_cast<Real>(cells));
 }
 
 [[nodiscard]] std::string require_value(int& index, int argc, char** argv) {
@@ -1574,6 +1686,110 @@ void checksum_vector(std::uint64_t& checksum, const std::vector<T>& values) {
     }
 }
 
+void checksum_limiter_diagnostics(
+    std::uint64_t& checksum,
+    const lbm::ScalarLimiterDiagnostics<Real>& diagnostics) {
+    checksum_value(checksum, diagnostics.activations_a);
+    checksum_value(checksum, diagnostics.activations_b);
+    checksum_value(checksum, diagnostics.activations_either);
+    checksum_value(checksum, diagnostics.activations_both);
+    checksum_value(checksum, diagnostics.delta_mass_a);
+    checksum_value(checksum, diagnostics.delta_mass_b);
+    checksum_value(checksum, diagnostics.delta_mass_diff);
+    checksum_value(checksum, diagnostics.sum_abs_delta_a);
+    checksum_value(checksum, diagnostics.sum_abs_delta_b);
+    checksum_value(checksum, diagnostics.sum_square_delta_a);
+    checksum_value(checksum, diagnostics.sum_square_delta_b);
+    checksum_value(checksum, diagnostics.max_abs_delta_a);
+    checksum_value(checksum, diagnostics.max_abs_delta_b);
+    checksum_value(checksum, diagnostics.positive_correction_a);
+    checksum_value(checksum, diagnostics.negative_correction_a);
+    checksum_value(checksum, diagnostics.positive_correction_b);
+    checksum_value(checksum, diagnostics.negative_correction_b);
+}
+
+void store_limiter_diagnostics(
+    CheckpointHeader& header,
+    const lbm::ScalarLimiterDiagnostics<Real>& interval,
+    const lbm::ScalarLimiterDiagnostics<Real>& cumulative) {
+    header.limiter_interval_activations_a = interval.activations_a;
+    header.limiter_interval_activations_b = interval.activations_b;
+    header.limiter_interval_activations_either = interval.activations_either;
+    header.limiter_interval_activations_both = interval.activations_both;
+    header.limiter_interval_delta_mass_a = interval.delta_mass_a;
+    header.limiter_interval_delta_mass_b = interval.delta_mass_b;
+    header.limiter_interval_delta_mass_diff = interval.delta_mass_diff;
+    header.limiter_interval_sum_abs_delta_a = interval.sum_abs_delta_a;
+    header.limiter_interval_sum_abs_delta_b = interval.sum_abs_delta_b;
+    header.limiter_interval_sum_square_delta_a = interval.sum_square_delta_a;
+    header.limiter_interval_sum_square_delta_b = interval.sum_square_delta_b;
+    header.limiter_interval_max_abs_delta_a = interval.max_abs_delta_a;
+    header.limiter_interval_max_abs_delta_b = interval.max_abs_delta_b;
+    header.limiter_interval_positive_correction_a = interval.positive_correction_a;
+    header.limiter_interval_negative_correction_a = interval.negative_correction_a;
+    header.limiter_interval_positive_correction_b = interval.positive_correction_b;
+    header.limiter_interval_negative_correction_b = interval.negative_correction_b;
+
+    header.limiter_cumulative_activations_a = cumulative.activations_a;
+    header.limiter_cumulative_activations_b = cumulative.activations_b;
+    header.limiter_cumulative_activations_either = cumulative.activations_either;
+    header.limiter_cumulative_activations_both = cumulative.activations_both;
+    header.limiter_cumulative_delta_mass_a = cumulative.delta_mass_a;
+    header.limiter_cumulative_delta_mass_b = cumulative.delta_mass_b;
+    header.limiter_cumulative_delta_mass_diff = cumulative.delta_mass_diff;
+    header.limiter_cumulative_sum_abs_delta_a = cumulative.sum_abs_delta_a;
+    header.limiter_cumulative_sum_abs_delta_b = cumulative.sum_abs_delta_b;
+    header.limiter_cumulative_sum_square_delta_a = cumulative.sum_square_delta_a;
+    header.limiter_cumulative_sum_square_delta_b = cumulative.sum_square_delta_b;
+    header.limiter_cumulative_max_abs_delta_a = cumulative.max_abs_delta_a;
+    header.limiter_cumulative_max_abs_delta_b = cumulative.max_abs_delta_b;
+    header.limiter_cumulative_positive_correction_a = cumulative.positive_correction_a;
+    header.limiter_cumulative_negative_correction_a = cumulative.negative_correction_a;
+    header.limiter_cumulative_positive_correction_b = cumulative.positive_correction_b;
+    header.limiter_cumulative_negative_correction_b = cumulative.negative_correction_b;
+}
+
+void restore_limiter_diagnostics(
+    const CheckpointHeader& header,
+    lbm::ScalarLimiterDiagnostics<Real>& interval,
+    lbm::ScalarLimiterDiagnostics<Real>& cumulative) {
+    interval.activations_a = header.limiter_interval_activations_a;
+    interval.activations_b = header.limiter_interval_activations_b;
+    interval.activations_either = header.limiter_interval_activations_either;
+    interval.activations_both = header.limiter_interval_activations_both;
+    interval.delta_mass_a = header.limiter_interval_delta_mass_a;
+    interval.delta_mass_b = header.limiter_interval_delta_mass_b;
+    interval.delta_mass_diff = header.limiter_interval_delta_mass_diff;
+    interval.sum_abs_delta_a = header.limiter_interval_sum_abs_delta_a;
+    interval.sum_abs_delta_b = header.limiter_interval_sum_abs_delta_b;
+    interval.sum_square_delta_a = header.limiter_interval_sum_square_delta_a;
+    interval.sum_square_delta_b = header.limiter_interval_sum_square_delta_b;
+    interval.max_abs_delta_a = header.limiter_interval_max_abs_delta_a;
+    interval.max_abs_delta_b = header.limiter_interval_max_abs_delta_b;
+    interval.positive_correction_a = header.limiter_interval_positive_correction_a;
+    interval.negative_correction_a = header.limiter_interval_negative_correction_a;
+    interval.positive_correction_b = header.limiter_interval_positive_correction_b;
+    interval.negative_correction_b = header.limiter_interval_negative_correction_b;
+
+    cumulative.activations_a = header.limiter_cumulative_activations_a;
+    cumulative.activations_b = header.limiter_cumulative_activations_b;
+    cumulative.activations_either = header.limiter_cumulative_activations_either;
+    cumulative.activations_both = header.limiter_cumulative_activations_both;
+    cumulative.delta_mass_a = header.limiter_cumulative_delta_mass_a;
+    cumulative.delta_mass_b = header.limiter_cumulative_delta_mass_b;
+    cumulative.delta_mass_diff = header.limiter_cumulative_delta_mass_diff;
+    cumulative.sum_abs_delta_a = header.limiter_cumulative_sum_abs_delta_a;
+    cumulative.sum_abs_delta_b = header.limiter_cumulative_sum_abs_delta_b;
+    cumulative.sum_square_delta_a = header.limiter_cumulative_sum_square_delta_a;
+    cumulative.sum_square_delta_b = header.limiter_cumulative_sum_square_delta_b;
+    cumulative.max_abs_delta_a = header.limiter_cumulative_max_abs_delta_a;
+    cumulative.max_abs_delta_b = header.limiter_cumulative_max_abs_delta_b;
+    cumulative.positive_correction_a = header.limiter_cumulative_positive_correction_a;
+    cumulative.negative_correction_a = header.limiter_cumulative_negative_correction_a;
+    cumulative.positive_correction_b = header.limiter_cumulative_positive_correction_b;
+    cumulative.negative_correction_b = header.limiter_cumulative_negative_correction_b;
+}
+
 [[nodiscard]] std::uint64_t checkpoint_payload_checksum_common(
     const lbm::LatticeMemory<FluidLattice, Real>& fluid,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
@@ -1588,6 +1804,8 @@ void checksum_vector(std::uint64_t& checksum, const std::vector<T>& values) {
     checksum_value(checksum, state.previous_statistics_step);
     checksum_value(checksum, state.initial_mean_z);
     checksum_value(checksum, state.initial_mean_rho);
+    checksum_limiter_diagnostics(checksum, state.limiter_interval);
+    checksum_limiter_diagnostics(checksum, state.limiter_cumulative);
     checksum_value(checksum, fluid.current_buffer_index());
     checksum_value(checksum, species_a.current_buffer_index());
     checksum_value(checksum, species_b.current_buffer_index());
@@ -1701,6 +1919,10 @@ void read_vector(std::ifstream& stream, std::vector<T>& values) {
     header.previous_statistics_step = state.previous_statistics_step;
     header.initial_mean_z = state.initial_mean_z;
     header.initial_mean_rho = state.initial_mean_rho;
+    store_limiter_diagnostics(
+        header,
+        state.limiter_interval,
+        state.limiter_cumulative);
     const PerturbationDiagnostics& pert = perturbation.diagnostics;
     header.perturb_number_of_modes = pert.number_of_modes;
     header.perturb_enabled = pert.enabled ? 1U : 0U;
@@ -1778,8 +2000,15 @@ void validate_checkpoint_header(const Config& config, const CheckpointHeader& he
     if (!std::equal(magic.begin(), magic.end(), std::begin(header.magic))) {
         throw std::runtime_error("checkpoint magic identifier does not match LB-Cube double-shear checkpoints");
     }
-    if (header.version != checkpoint_current_format_version &&
-        header.version != checkpoint_legacy_full_ping_pong_format_version) {
+    if (header.version != checkpoint_current_format_version) {
+        if (header.version == checkpoint_legacy_compact_no_limiter_format_version ||
+            header.version == checkpoint_legacy_full_ping_pong_format_version) {
+            throw std::runtime_error(
+                std::format(
+                    "checkpoint format version {} does not contain limiter diagnostic restart state; restart from a version {} checkpoint",
+                    header.version,
+                    checkpoint_current_format_version));
+        }
         throw std::runtime_error(
             std::format("unsupported checkpoint format version {}", header.version));
     }
@@ -1845,6 +2074,8 @@ void validate_checkpoint_header(const Config& config, const CheckpointHeader& he
     int previous_statistics_step,
     Real initial_mean_z,
     Real initial_mean_rho,
+    const lbm::ScalarLimiterDiagnostics<Real>& limiter_interval,
+    const lbm::ScalarLimiterDiagnostics<Real>& limiter_cumulative,
     const lbm::LatticeMemory<FluidLattice, Real>& fluid,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_a,
     const lbm::LatticeMemory<ScalarLattice, Real>& species_b) {
@@ -1862,6 +2093,8 @@ void validate_checkpoint_header(const Config& config, const CheckpointHeader& he
     state.previous_statistics_step = previous_statistics_step;
     state.initial_mean_z = initial_mean_z;
     state.initial_mean_rho = initial_mean_rho;
+    state.limiter_interval = limiter_interval;
+    state.limiter_cumulative = limiter_cumulative;
     const CheckpointHeader header =
         make_checkpoint_header(config, perturbation, fluid, species_a, species_b, state);
 
@@ -1976,6 +2209,10 @@ void validate_checkpoint_header(const Config& config, const CheckpointHeader& he
         static_cast<int>(header.previous_statistics_step);
     state.initial_mean_z = header.initial_mean_z;
     state.initial_mean_rho = header.initial_mean_rho;
+    restore_limiter_diagnostics(
+        header,
+        state.limiter_interval,
+        state.limiter_cumulative);
     state.source_path = config.restart_from;
 
     const std::uint64_t checksum =
@@ -5742,6 +5979,9 @@ void append_statistics(
     Real kinetic_energy_decay_rate,
     const ScalarDiagnostics& scalar,
     const ScalarBudgetDiagnostics& scalar_budget,
+    const lbm::ScalarLimiterDiagnostics<Real>& limiter_interval,
+    const lbm::ScalarLimiterDiagnostics<Real>& limiter_cumulative,
+    int limiter_interval_steps,
     Real initial_mean_z,
     Real initial_mean_rho) {
     const ResolutionDiagnostics resolution = compute_resolution_diagnostics(config, flow);
@@ -5749,6 +5989,19 @@ void append_statistics(
     const Real relative_mass_drift =
         initial_mean_rho != Real{} ? (flow.mean_rho - initial_mean_rho) / initial_mean_rho
                                    : Real{};
+    const std::size_t cells = cell_count(config);
+    const Real limiter_fraction_a =
+        limiter_fraction(limiter_interval.activations_a, cells, limiter_interval_steps);
+    const Real limiter_fraction_b =
+        limiter_fraction(limiter_interval.activations_b, cells, limiter_interval_steps);
+    const Real limiter_fraction_either =
+        limiter_fraction(limiter_interval.activations_either, cells, limiter_interval_steps);
+    const Real limiter_fraction_both =
+        limiter_fraction(limiter_interval.activations_both, cells, limiter_interval_steps);
+    const Real limiter_interval_delta_mean_z =
+        limiter_delta_mean_z(config, limiter_interval);
+    const Real limiter_cumulative_delta_mean_z =
+        limiter_delta_mean_z(config, limiter_cumulative);
 
     const auto write_real = [&statistics](Real value) {
         statistics << ',' << std::format("{:.17g}", static_cast<double>(value));
@@ -5829,6 +6082,32 @@ void append_statistics(
     write_real(flow.mach_max);
     write_real(mean_z_drift);
     write_real(relative_mass_drift);
+    statistics << ',' << limiter_interval.activations_a;
+    statistics << ',' << limiter_interval.activations_b;
+    statistics << ',' << limiter_interval.activations_either;
+    statistics << ',' << limiter_interval.activations_both;
+    write_real(limiter_fraction_a);
+    write_real(limiter_fraction_b);
+    write_real(limiter_fraction_either);
+    write_real(limiter_fraction_both);
+    write_real(limiter_interval.delta_mass_a);
+    write_real(limiter_interval.delta_mass_b);
+    write_real(limiter_interval.delta_mass_diff);
+    write_real(limiter_cumulative.delta_mass_a);
+    write_real(limiter_cumulative.delta_mass_b);
+    write_real(limiter_cumulative.delta_mass_diff);
+    write_real(limiter_interval_delta_mean_z);
+    write_real(limiter_cumulative_delta_mean_z);
+    write_real(limiter_mean_abs_delta(limiter_interval, true));
+    write_real(limiter_mean_abs_delta(limiter_interval, false));
+    write_real(limiter_rms_delta(limiter_interval, true));
+    write_real(limiter_rms_delta(limiter_interval, false));
+    write_real(limiter_interval.max_abs_delta_a);
+    write_real(limiter_interval.max_abs_delta_b);
+    write_real(limiter_interval.positive_correction_a);
+    write_real(limiter_interval.negative_correction_a);
+    write_real(limiter_interval.positive_correction_b);
+    write_real(limiter_interval.negative_correction_b);
     statistics << std::endl;
     statistics.flush();
 }
@@ -5892,7 +6171,28 @@ void run_simulation(const Config& config) {
             << "reaction_effective_volume_fraction,corr_R_chiZ,"
             << "tau_eta,tau_eta_star,Da_eta,"
             << "mean_rho,min_rho,max_rho,rho_rms_fluct,Mach_max,"
-            << "mean_Z_drift,relative_mass_drift"
+            << "mean_Z_drift,relative_mass_drift,"
+            << "limiter_activations_A,limiter_activations_B,"
+            << "limiter_activations_either,limiter_activations_both,"
+            << "limiter_fraction_A,limiter_fraction_B,"
+            << "limiter_fraction_either,limiter_fraction_both,"
+            << "limiter_delta_mass_A,limiter_delta_mass_B,"
+            << "limiter_delta_mass_diff,"
+            << "limiter_cumulative_delta_mass_A,"
+            << "limiter_cumulative_delta_mass_B,"
+            << "limiter_cumulative_delta_mass_diff,"
+            << "limiter_delta_mean_Z,"
+            << "limiter_cumulative_delta_mean_Z,"
+            << "limiter_mean_abs_delta_C_A,"
+            << "limiter_mean_abs_delta_C_B,"
+            << "limiter_rms_delta_C_A,"
+            << "limiter_rms_delta_C_B,"
+            << "limiter_max_abs_delta_C_A,"
+            << "limiter_max_abs_delta_C_B,"
+            << "limiter_positive_correction_A,"
+            << "limiter_negative_correction_A,"
+            << "limiter_positive_correction_B,"
+            << "limiter_negative_correction_B"
             << std::endl;
         statistics.flush();
     }
@@ -5944,6 +6244,13 @@ void run_simulation(const Config& config) {
         restart_state.enabled ? restart_state.initial_mean_z : scalar.mean_z;
     const Real initial_mean_rho =
         restart_state.enabled ? restart_state.initial_mean_rho : flow.mean_rho;
+    lbm::ScalarLimiterDiagnostics<Real> limiter_interval =
+        restart_state.enabled ? restart_state.limiter_interval
+                              : lbm::ScalarLimiterDiagnostics<Real>{};
+    lbm::ScalarLimiterDiagnostics<Real> limiter_cumulative =
+        restart_state.enabled ? restart_state.limiter_cumulative
+                              : lbm::ScalarLimiterDiagnostics<Real>{};
+    Real latest_limiter_fraction_either{};
 
     if (restart_state.enabled) {
         std::cout << "Restarted from " << restart_state.source_path.string()
@@ -5971,6 +6278,9 @@ void run_simulation(const Config& config) {
             latest_kinetic_energy_decay_rate,
             scalar,
             scalar_budget,
+            limiter_interval,
+            limiter_cumulative,
+            0,
             initial_mean_z,
             initial_mean_rho);
         if (config.vtk_freq > 0) {
@@ -6017,13 +6327,16 @@ void run_simulation(const Config& config) {
 
     for (int step = first_step; step <= config.steps; ++step) {
         lbm::step_cpu<FluidLattice, Real, lbm::CollisionType::RLBM>(fluid, omega_f);
-        lbm::step_reaction_AB<FluidLattice, ScalarLattice, Real>(
-            fluid,
-            species_a,
-            species_b,
-            omega_s,
-            config.k_react,
-            config.c0);
+        const lbm::ScalarLimiterDiagnostics<Real> limiter_step =
+            lbm::step_reaction_AB<FluidLattice, ScalarLattice, Real>(
+                fluid,
+                species_a,
+                species_b,
+                omega_s,
+                config.k_react,
+                config.c0);
+        add_limiter_diagnostics(limiter_interval, limiter_step);
+        add_limiter_diagnostics(limiter_cumulative, limiter_step);
 
         if (step % config.stat_freq == 0) {
             flow = compute_flow_diagnostics(config, fluid);
@@ -6043,6 +6356,12 @@ void run_simulation(const Config& config) {
                 previous_var_z,
                 step,
                 scalar);
+            const int limiter_interval_steps = step - previous_statistics_step;
+            latest_limiter_fraction_either =
+                limiter_fraction(
+                    limiter_interval.activations_either,
+                    cell_count(config),
+                    limiter_interval_steps);
             append_statistics(
                 statistics,
                 config,
@@ -6052,10 +6371,14 @@ void run_simulation(const Config& config) {
                 latest_kinetic_energy_decay_rate,
                 scalar,
                 scalar_budget,
+                limiter_interval,
+                limiter_cumulative,
+                limiter_interval_steps,
                 initial_mean_z,
                 initial_mean_rho);
             previous_var_z = scalar.var_z;
             previous_statistics_step = step;
+            limiter_interval = {};
 
         }
 
@@ -6071,7 +6394,7 @@ void run_simulation(const Config& config) {
                 compute_resolution_diagnostics(config, flow);
 
             std::cout << std::format(
-                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} theta: {:.6g} dZ: {:.6g} ReTheta: {:.6g} Mach: {:.6g} dE/dt: {:.6g} MLUPS: {:.6g}\n",
+                "Step [{} / {}] Umax: {:.6g} Ek: {:.6g} Eperp: {:.6g} Efluc: {:.6g} Enst: {:.6g} eps: {:.6g} chiZ: {:.6g} budget: {:.6g} lim: {:.6g} tauMix*: {:.6g} DaMix: {:.6g} dx/etaB: {:.6g} theta: {:.6g} dZ: {:.6g} ReTheta: {:.6g} Mach: {:.6g} dE/dt: {:.6g} MLUPS: {:.6g}\n",
                 step,
                 config.steps,
                 static_cast<double>(flow.u_max),
@@ -6082,6 +6405,7 @@ void run_simulation(const Config& config) {
                 static_cast<double>(flow.epsilon),
                 static_cast<double>(scalar.mean_chi_z),
                 static_cast<double>(scalar_budget.budget_ratio),
+                static_cast<double>(latest_limiter_fraction_either),
                 static_cast<double>(scalar.tau_mix_star),
                 static_cast<double>(scalar.da_mix),
                 static_cast<double>(resolution.dx_over_eta_b),
@@ -6141,6 +6465,8 @@ void run_simulation(const Config& config) {
                 previous_statistics_step,
                 initial_mean_z,
                 initial_mean_rho,
+                limiter_interval,
+                limiter_cumulative,
                 fluid,
                 species_a,
                 species_b);

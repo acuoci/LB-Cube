@@ -96,6 +96,19 @@ __host__ __device__ inline Real clamp_scalar_concentration(
 }
 
 /**
+ * @brief Local before/after record for scalar boundedness limiting.
+ *
+ * The limiter itself remains responsible only for enforcing admissible local
+ * concentrations. This lightweight record lets host-side timestep loops measure
+ * the correction without changing the clipping rule or population reset.
+ */
+template <std::floating_point Real>
+struct ScalarLimiterApplication {
+    Real concentration_before{};
+    Real concentration_after{};
+};
+
+/**
  * @brief Hermite projection prefactor for lattices with `c_s^2 = 1/3`.
  *
  * Regularized reconstruction uses `1 / (2 c_s^4)`. For D2Q9, D3Q19, and D3Q27,
@@ -739,11 +752,16 @@ __host__ __device__ inline void enforce_scalar_concentration_bounds(
     std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)>& scalar_pops,
     const Eigen::Matrix<Real, ScalarLattice::D, 1>& fluid_velocity,
     Real lower_bound = Real{},
-    Real upper_bound = Real{1}) {
+    Real upper_bound = Real{1},
+    ScalarLimiterApplication<Real>* limiter_application = nullptr) {
     const Real concentration = compute_concentration<ScalarLattice, Real>(scalar_pops);
 
     const Real bounded_concentration =
         clamp_scalar_concentration<Real>(concentration, lower_bound, upper_bound);
+    if (limiter_application != nullptr) {
+        limiter_application->concentration_before = concentration;
+        limiter_application->concentration_after = bounded_concentration;
+    }
     const bool needs_limiting = bounded_concentration != concentration;
 
     if (!needs_limiting) {
@@ -824,7 +842,8 @@ __host__ __device__ inline void collide_scalar_max_dissipation(
     Real omega_s,
     Real source_term,
     Real lower_bound = Real{},
-    Real upper_bound = Real{1}) {
+    Real upper_bound = Real{1},
+    ScalarLimiterApplication<Real>* limiter_application = nullptr) {
     const Real concentration = compute_concentration<ScalarLattice, Real>(scalar_pops);
     std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> equilibrium{};
     std::array<Real, static_cast<std::size_t>(ScalarLattice::Q)> nonequilibrium{};
@@ -857,7 +876,8 @@ __host__ __device__ inline void collide_scalar_max_dissipation(
         scalar_pops,
         fluid_velocity,
         lower_bound,
-        upper_bound);
+        upper_bound,
+        limiter_application);
 }
 
 /**

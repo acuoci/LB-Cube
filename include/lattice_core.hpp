@@ -10,9 +10,13 @@
  * buffer.
  */
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <concepts>
+#include <cmath>
+#include <limits>
 #include <type_traits>
 
 #include "lattice_memory.hpp"
@@ -42,6 +46,33 @@ enum class CollisionType {
 };
 #endif
 
+/**
+ * @brief Reductions describing scalar boundedness-limiter activity.
+ *
+ * The fields are additive over timesteps, so production drivers can accumulate
+ * interval and cumulative statistics without storing any per-cell diagnostics.
+ */
+template <std::floating_point Real>
+struct ScalarLimiterDiagnostics {
+    std::uint64_t activations_a{};
+    std::uint64_t activations_b{};
+    std::uint64_t activations_either{};
+    std::uint64_t activations_both{};
+    Real delta_mass_a{};
+    Real delta_mass_b{};
+    Real delta_mass_diff{};
+    Real sum_abs_delta_a{};
+    Real sum_abs_delta_b{};
+    Real sum_square_delta_a{};
+    Real sum_square_delta_b{};
+    Real max_abs_delta_a{};
+    Real max_abs_delta_b{};
+    Real positive_correction_a{};
+    Real negative_correction_a{};
+    Real positive_correction_b{};
+    Real negative_correction_b{};
+};
+
 namespace detail {
 
 /**
@@ -54,6 +85,53 @@ namespace detail {
  */
 template <typename Lattice>
 inline constexpr bool always_false_v = false;
+
+template <std::floating_point Real>
+inline void accumulate_limiter_application(
+    const ScalarLimiterApplication<Real>& application,
+    Real upper_bound,
+    std::uint64_t& activations,
+    Real& delta_mass,
+    Real& sum_abs_delta,
+    Real& sum_square_delta,
+    Real& max_abs_delta,
+    Real& positive_correction,
+    Real& negative_correction,
+    bool& activated) {
+    const bool before_finite = is_finite(application.concentration_before);
+    const bool after_finite = is_finite(application.concentration_after);
+    const Real delta =
+        before_finite && after_finite
+            ? application.concentration_after - application.concentration_before
+            : Real{};
+    const Real abs_delta = std::abs(delta);
+    const Real scale = std::max(
+        {Real{1},
+         before_finite ? std::abs(application.concentration_before) : Real{},
+         after_finite ? std::abs(application.concentration_after) : Real{},
+         std::abs(upper_bound)});
+    const Real threshold = Real{32} * std::numeric_limits<Real>::epsilon() * scale;
+    activated = !before_finite || !after_finite || abs_delta > threshold;
+
+    if (!activated) {
+        return;
+    }
+
+    ++activations;
+    if (before_finite && after_finite) {
+        delta_mass += delta;
+        sum_abs_delta += abs_delta;
+        sum_square_delta += delta * delta;
+        max_abs_delta = std::max(max_abs_delta, abs_delta);
+        if (delta >= Real{}) {
+            positive_correction += delta;
+        } else {
+            negative_correction += delta;
+        }
+    } else {
+        max_abs_delta = std::numeric_limits<Real>::infinity();
+    }
+}
 
 /**
  * @brief Compute a wrapped upstream coordinate for pull streaming.
@@ -364,7 +442,7 @@ template <
     IsLatticeModel FluidLattice,
     IsLatticeModel ScalarLattice,
     std::floating_point Real>
-inline void step_reaction_AB(
+inline ScalarLimiterDiagnostics<Real> step_reaction_AB(
     const LatticeMemory<FluidLattice, Real>& fluid_mem,
     LatticeMemory<ScalarLattice, Real>& species_a_mem,
     LatticeMemory<ScalarLattice, Real>& species_b_mem,
@@ -379,11 +457,33 @@ inline void step_reaction_AB(
     auto b_current = species_b_mem.get_current_view();
     auto b_next = species_b_mem.get_next_view();
 
+    std::uint64_t activations_a{};
+    std::uint64_t activations_b{};
+    std::uint64_t activations_either{};
+    std::uint64_t activations_both{};
+    Real delta_mass_a{};
+    Real delta_mass_b{};
+    Real sum_abs_delta_a{};
+    Real sum_abs_delta_b{};
+    Real sum_square_delta_a{};
+    Real sum_square_delta_b{};
+    Real max_abs_delta_a{};
+    Real max_abs_delta_b{};
+    Real positive_correction_a{};
+    Real negative_correction_a{};
+    Real positive_correction_b{};
+    Real negative_correction_b{};
+
     if constexpr (ScalarLattice::D == 2) {
         const std::size_t y_extent = a_current.extent(1);
         const std::size_t x_extent = a_current.extent(2);
 
-        #pragma omp parallel for collapse(2) schedule(static)
+        #pragma omp parallel for collapse(2) schedule(static) \
+            reduction(+: activations_a, activations_b, activations_either, activations_both, \
+                         delta_mass_a, delta_mass_b, sum_abs_delta_a, sum_abs_delta_b, \
+                         sum_square_delta_a, sum_square_delta_b, positive_correction_a, \
+                         negative_correction_a, positive_correction_b, negative_correction_b) \
+            reduction(max: max_abs_delta_a, max_abs_delta_b)
         for (std::size_t y = 0; y < y_extent; ++y) {
             for (std::size_t x = 0; x < x_extent; ++x) {
                 std::array<Real, static_cast<std::size_t>(FluidLattice::Q)> fluid_pops{};
@@ -425,20 +525,55 @@ inline void step_reaction_AB(
                 const Real reaction_source =
                     compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
+                ScalarLimiterApplication<Real> limiter_a{};
+                ScalarLimiterApplication<Real> limiter_b{};
                 collide_scalar_max_dissipation<ScalarLattice, Real>(
                     a_pops,
                     fluid_macro.velocity,
                     omega_c,
                     reaction_source,
                     Real{},
-                    concentration_upper_bound);
+                    concentration_upper_bound,
+                    &limiter_a);
                 collide_scalar_max_dissipation<ScalarLattice, Real>(
                     b_pops,
                     fluid_macro.velocity,
                     omega_c,
                     reaction_source,
                     Real{},
-                    concentration_upper_bound);
+                    concentration_upper_bound,
+                    &limiter_b);
+
+                bool a_activated{};
+                bool b_activated{};
+                detail::accumulate_limiter_application<Real>(
+                    limiter_a,
+                    concentration_upper_bound,
+                    activations_a,
+                    delta_mass_a,
+                    sum_abs_delta_a,
+                    sum_square_delta_a,
+                    max_abs_delta_a,
+                    positive_correction_a,
+                    negative_correction_a,
+                    a_activated);
+                detail::accumulate_limiter_application<Real>(
+                    limiter_b,
+                    concentration_upper_bound,
+                    activations_b,
+                    delta_mass_b,
+                    sum_abs_delta_b,
+                    sum_square_delta_b,
+                    max_abs_delta_b,
+                    positive_correction_b,
+                    negative_correction_b,
+                    b_activated);
+                if (a_activated || b_activated) {
+                    ++activations_either;
+                }
+                if (a_activated && b_activated) {
+                    ++activations_both;
+                }
 
                 for (int i = 0; i < ScalarLattice::Q; ++i) {
                     const auto q = static_cast<std::size_t>(i);
@@ -452,7 +587,12 @@ inline void step_reaction_AB(
         const std::size_t y_extent = a_current.extent(2);
         const std::size_t x_extent = a_current.extent(3);
 
-        #pragma omp parallel for collapse(3) schedule(static)
+        #pragma omp parallel for collapse(3) schedule(static) \
+            reduction(+: activations_a, activations_b, activations_either, activations_both, \
+                         delta_mass_a, delta_mass_b, sum_abs_delta_a, sum_abs_delta_b, \
+                         sum_square_delta_a, sum_square_delta_b, positive_correction_a, \
+                         negative_correction_a, positive_correction_b, negative_correction_b) \
+            reduction(max: max_abs_delta_a, max_abs_delta_b)
         for (std::size_t z = 0; z < z_extent; ++z) {
             for (std::size_t y = 0; y < y_extent; ++y) {
                 for (std::size_t x = 0; x < x_extent; ++x) {
@@ -497,20 +637,55 @@ inline void step_reaction_AB(
                     const Real reaction_source =
                         compute_reaction_ab_source<Real>(concentration_a, concentration_b, k_react);
 
+                    ScalarLimiterApplication<Real> limiter_a{};
+                    ScalarLimiterApplication<Real> limiter_b{};
                     collide_scalar_max_dissipation<ScalarLattice, Real>(
                         a_pops,
                         fluid_macro.velocity,
                         omega_c,
                         reaction_source,
                         Real{},
-                        concentration_upper_bound);
+                        concentration_upper_bound,
+                        &limiter_a);
                     collide_scalar_max_dissipation<ScalarLattice, Real>(
                         b_pops,
                         fluid_macro.velocity,
                         omega_c,
                         reaction_source,
                         Real{},
-                        concentration_upper_bound);
+                        concentration_upper_bound,
+                        &limiter_b);
+
+                    bool a_activated{};
+                    bool b_activated{};
+                    detail::accumulate_limiter_application<Real>(
+                        limiter_a,
+                        concentration_upper_bound,
+                        activations_a,
+                        delta_mass_a,
+                        sum_abs_delta_a,
+                        sum_square_delta_a,
+                        max_abs_delta_a,
+                        positive_correction_a,
+                        negative_correction_a,
+                        a_activated);
+                    detail::accumulate_limiter_application<Real>(
+                        limiter_b,
+                        concentration_upper_bound,
+                        activations_b,
+                        delta_mass_b,
+                        sum_abs_delta_b,
+                        sum_square_delta_b,
+                        max_abs_delta_b,
+                        positive_correction_b,
+                        negative_correction_b,
+                        b_activated);
+                    if (a_activated || b_activated) {
+                        ++activations_either;
+                    }
+                    if (a_activated && b_activated) {
+                        ++activations_both;
+                    }
 
                     for (int i = 0; i < ScalarLattice::Q; ++i) {
                         const auto q = static_cast<std::size_t>(i);
@@ -524,6 +699,25 @@ inline void step_reaction_AB(
 
     species_a_mem.swap_buffers();
     species_b_mem.swap_buffers();
+
+    return {
+        activations_a,
+        activations_b,
+        activations_either,
+        activations_both,
+        delta_mass_a,
+        delta_mass_b,
+        delta_mass_a - delta_mass_b,
+        sum_abs_delta_a,
+        sum_abs_delta_b,
+        sum_square_delta_a,
+        sum_square_delta_b,
+        max_abs_delta_a,
+        max_abs_delta_b,
+        positive_correction_a,
+        negative_correction_a,
+        positive_correction_b,
+        negative_correction_b};
 }
 
 } // namespace lbm

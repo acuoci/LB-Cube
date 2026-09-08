@@ -627,13 +627,13 @@ Checkpoint files use names such as:
 checkpoint_00006400.bin
 ```
 
-Each checkpoint is written after a fully completed time step. Current checkpoints use format version 2 and store only the active population buffer for:
+Each checkpoint is written after a fully completed time step. Current checkpoints use format version 3 and store only the active population buffer for:
 
 - `D3Q27` fluid populations
 - `D3Q7` species `A` populations
 - `D3Q7` species `B` populations
 
-The inactive ping-pong buffers are scratch storage and are completely overwritten by the next out-of-place LBM step. They are therefore reconstructed as ordinary allocated write buffers on restart rather than serialized. The checkpoint also stores the active ping-pong buffer indices, current completed step, initial diagnostic reference means, previous statistics state, previous kinetic-energy state, and compatibility metadata. Product `C` is not stored because it is reconstructed diagnostically from `A` and `B`. Legacy format-version-1 checkpoints that stored both ping-pong buffers can still be read for restart compatibility; new checkpoints are always written in the compact version-2 format.
+The inactive ping-pong buffers are scratch storage and are completely overwritten by the next out-of-place LBM step. They are therefore reconstructed as ordinary allocated write buffers on restart rather than serialized. The checkpoint also stores the active ping-pong buffer indices, current completed step, initial diagnostic reference means, previous statistics state, previous kinetic-energy state, scalar limiter interval/cumulative diagnostic state, and compatibility metadata. Product `C` is not stored because it is reconstructed diagnostically from `A` and `B`. New checkpoints are always written in the compact version-3 format; older version-1/version-2 checkpoints do not contain the limiter diagnostic restart state and are rejected with a clear compatibility error.
 
 Checkpoint writes are atomic-style:
 
@@ -651,7 +651,7 @@ For HPC batch queues, `--max_walltime` enables a portable graceful exit that doe
 elapsed_walltime + estimated_checkpoint_write_time + walltime_safety_margin >= max_walltime
 ```
 
-Before the first checkpoint, `estimated_checkpoint_write_time` is initialized from the compact version-2 checkpoint size and `--checkpoint_assumed_bandwidth`, with a minimum floor of 1 second. After successful checkpoint writes, the estimate is refined conservatively as the larger of the initial estimate and `1.25 * max_measured_checkpoint_write_time`. When the condition is met before the requested final step, the code writes a normal atomic checkpoint for the completed step, applies the usual `--checkpoint_keep` retention policy, reports the checkpoint filename, and exits with return code `0`. This forced checkpoint is independent of `--checkpoint_freq` and `--checkpoint_walltime`; normal completion at `--steps` does not force an extra checkpoint.
+Before the first checkpoint, `estimated_checkpoint_write_time` is initialized from the compact version-3 checkpoint size and `--checkpoint_assumed_bandwidth`, with a minimum floor of 1 second. After successful checkpoint writes, the estimate is refined conservatively as the larger of the initial estimate and `1.25 * max_measured_checkpoint_write_time`. When the condition is met before the requested final step, the code writes a normal atomic checkpoint for the completed step, applies the usual `--checkpoint_keep` retention policy, reports the checkpoint filename, and exits with return code `0`. This forced checkpoint is independent of `--checkpoint_freq` and `--checkpoint_walltime`; normal completion at `--steps` does not force an extra checkpoint.
 
 ### VTK
 
